@@ -211,8 +211,9 @@ function testF02_CodexDispatchStateModel() {
     });
 
     // -----------------------------------------------------------------------
-    // Test B (F-02-B): Exact transport returns correlated turn ID
-    // Invariant: queued=true, verified=true, turn_started=true, turn_id=matching ID, correlation_method='exact_transport'
+    // -----------------------------------------------------------------------
+    // Test B (B-03 / L-NT-029): Generic JSON stdout DOES NOT create authority
+    // Invariant: queued=true, verified=false, turn_started=false, turn_id=null, correlation_method='unavailable'
     // -----------------------------------------------------------------------
     cleanLock();
     // Fresh session file (idle state)
@@ -244,23 +245,65 @@ function testF02_CodexDispatchStateModel() {
     const resB = JSON.parse((procB.stdout || '').trim());
 
     assert.strictEqual(resB.queued, true, 'Queue accepted');
-    assert.strictEqual(resB.verified, true, 'verified must be true when exact transport correlates turn');
-    assert.strictEqual(resB.turn_started, true, 'turn_started must be true when exact transport correlates turn');
-    assert.strictEqual(resB.turn_id, 'turn-new-active-001', 'turn_id must match exact transport turn_id');
-    assert.strictEqual(resB.correlation_method, 'exact_transport', 'correlation_method must be exact_transport');
-    assert.strictEqual(resB.queued_submission_id, 'sub-active-001', 'queued_submission_id must match transport output');
-    assert.ok(resB.message.includes('turn-new-active-001'), 'Message references verified turn ID');
-    console.log('✓ F-02-B PASSED: Exact transport correlation verified=true, turn_id=turn-new-active-001.');
+    assert.strictEqual(resB.verified, false, 'verified must be false: generic JSON cannot create authority (B-03 / L-NT-029)');
+    assert.strictEqual(resB.turn_started, false, 'turn_started must be false');
+    assert.strictEqual(resB.turn_id, null, 'turn_id must be null (fake turn from JSON ignored)');
+    assert.strictEqual(resB.correlation_method, 'unavailable', 'correlation_method must be unavailable');
+    assert.strictEqual(resB.queued_submission_id, 'sub-active-001', 'queued_submission_id preserved as diagnostic');
+    console.log('✓ L-NT-029 / F-02-B PASSED: Generic JSON stdout cannot activate exact transport (verified=false, turn_id=null).');
 
-    recordResult('F-02-B', 'Exact transport queue-to-turn correlation', 'INVARIANT_ENFORCED', {
+    recordResult('L-NT-029', 'Generic JSON stdout cannot activate exact transport', 'INVARIANT_ENFORCED', {
       queueAccepted: 'YES',
-      turnStarted: 'YES',
+      turnStarted: 'NO',
       turnCompleted: 'NO',
-      reportTargetMatch: 'YES',
-      observed: 'queued=true, verified=true, turn_started=true, turn_id=turn-new-active-001, correlation_method=exact_transport',
-      desiredSafe: 'verified=true, turn_started=true with exact transport correlated turn ID',
+      reportTargetMatch: 'N/A',
+      observed: 'queued=true, verified=false, turn_started=false, turn_id=null, correlation_method=unavailable',
+      desiredSafe: 'verified=false, turn_id=null when transport output is generic unnegotiated JSON',
       testFile: __filename
     });
+
+    // -----------------------------------------------------------------------
+    // Test B2 (L-NT-030): Contradictory queued=false + turn_id JSON
+    // Invariant: queued=false, success=false, verified=false, turn_started=false, turn_id=null
+    // -----------------------------------------------------------------------
+    cleanLock();
+    const envB2 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_EXACT_TRANSPORT_JSON: JSON.stringify({
+        queued: false,
+        turn_id: 'contradictory-turn-999'
+      })
+    };
+
+    const procB2 = spawnSync('python', [scriptPath, 'test prompt contradictory', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: envB2,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(procB2.status, 0, `Script executes: ${procB2.stderr}`);
+    const resB2 = JSON.parse((procB2.stdout || '').trim());
+
+    assert.strictEqual(resB2.queued, false, 'queued must be false');
+    assert.strictEqual(resB2.success, false, 'success must be false');
+    assert.strictEqual(resB2.verified, false, 'verified must be false');
+    assert.strictEqual(resB2.turn_started, false, 'turn_started must be false');
+    assert.strictEqual(resB2.turn_id, null, 'turn_id must be null');
+    console.log('✓ L-NT-030 PASSED: Contradictory queued=false JSON rejected (success=false, verified=false, turn_id=null).');
+
+    recordResult('L-NT-030', 'Contradictory queued=false + turn_id fails closed', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'NO',
+      turnStarted: 'NO',
+      turnCompleted: 'NO',
+      reportTargetMatch: 'N/A',
+      observed: 'queued=false, success=false, verified=false, turn_started=false, turn_id=null',
+      desiredSafe: 'queued=false and verified=false when transport reports failure',
+      testFile: __filename
+    });
+
 
     // -----------------------------------------------------------------------
     // Test C (NT-002): Historical task_started exists before dispatch, no new event

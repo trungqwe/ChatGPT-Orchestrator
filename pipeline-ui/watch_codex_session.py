@@ -67,26 +67,28 @@ def find_session_rollout_by_id(session_id):
                 continue
     return None
 
-def extract_latest_codex_report(project_keyword="AI_Multi_Task"):
-    files = find_project_rollouts(project_keyword)
-    if not files:
+def extract_latest_report_from_rollout_file(file_path, session_id=None):
+    """Extract latest report strictly from a specific rollout file (B-05 session-bound helper)."""
+    if not file_path or not os.path.exists(file_path):
         return {
             "success": False,
-            "error": f"Không tìm thấy file rollout nào cho dự án '{project_keyword}'"
+            "error": f"File rollout không tồn tại: {file_path}"
         }
 
-    latest_file, session_id = files[0]
+    detected_session_id = session_id
     last_message = ""
     duration_ms = 0
     turn_id = ""
 
     try:
-        with open(latest_file, 'r', encoding='utf-8', errors='ignore') as fp:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
             for line in fp:
                 try:
                     data = json.loads(line)
                     t = data.get('type')
                     p = data.get('payload', {})
+                    if not detected_session_id and isinstance(p, dict) and p.get('id'):
+                        detected_session_id = p.get('id')
                     if t == 'event_msg' and isinstance(p, dict) and p.get('type') == 'task_complete':
                         last_message = p.get('last_agent_message', '')
                         duration_ms = p.get('duration_ms', 0)
@@ -105,8 +107,8 @@ def extract_latest_codex_report(project_keyword="AI_Multi_Task"):
         is_valid = isinstance(last_message, str) and bool(last_message.strip())
         return {
             "success": is_valid,
-            "session_file": latest_file,
-            "session_id": session_id,
+            "session_file": file_path,
+            "session_id": detected_session_id,
             "turn_id": turn_id,
             "duration_ms": duration_ms,
             "report_text": last_message if is_valid else None,
@@ -114,6 +116,18 @@ def extract_latest_codex_report(project_keyword="AI_Multi_Task"):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+def extract_latest_codex_report(project_keyword="AI_Multi_Task"):
+    files = find_project_rollouts(project_keyword)
+    if not files:
+        return {
+            "success": False,
+            "error": f"Không tìm thấy file rollout nào cho dự án '{project_keyword}'"
+        }
+
+    latest_file, session_id = files[0]
+    return extract_latest_report_from_rollout_file(latest_file, session_id)
+
 
 def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline_turn_id=None, target_turn_id=None, session_id=None, poll_interval=0.5):
     """
@@ -289,24 +303,79 @@ def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline
                                 }
                         elif pt == 'error':
                             err_tid = p.get('turn_id')
-                            return {
-                                "success": False,
-                                "verified": False,
-                                "turn_failed": True,
-                                "turn_id": err_tid,
-                                "target_turn_id": target_turn_id,
-                                "session_file": target_file,
-                                "session_id": session_id,
-                                "report_text": None,
-                                "error": p.get('message') or 'Codex runtime error'
-                            }
+                            if target_turn_id:
+                                if err_tid == target_turn_id:
+                                    # Matching error (Section 18 / L-NT-032): exact target failure provenance
+                                    return {
+                                        "success": False,
+                                        "verified": False,
+                                        "turn_failed": True,
+                                        "turn_id": target_turn_id,
+                                        "target_turn_id": target_turn_id,
+                                        "session_file": target_file,
+                                        "session_id": session_id,
+                                        "report_text": None,
+                                        "error": p.get('message') or f"Codex runtime error in target turn '{target_turn_id}'"
+                                    }
+                                elif not err_tid:
+                                    # Error without turn_id (Section 19 / L-NT-033): unknown scope, do NOT claim target turn failed
+                                    return {
+                                        "success": False,
+                                        "verified": False,
+                                        "turn_failed": False,
+                                        "watch_failed": True,
+                                        "error_scope": "session_or_unknown",
+                                        "target_turn_id": target_turn_id,
+                                        "turn_id": None,
+                                        "session_file": target_file,
+                                        "session_id": session_id,
+                                        "report_text": None,
+                                        "error": p.get('message') or "Codex runtime error without turn ID (session-level or unknown provenance)"
+                                    }
+                                else:
+                                    # Wrong-turn error (Section 17 / L-NT-031): err_tid != target_turn_id
+                                    # Ignore unrelated turn error and continue watching for target_turn_id!
+                                    continue
+                            else:
+                                if baseline_turn_id and err_tid == baseline_turn_id:
+                                    continue
+                                if not err_tid:
+                                    return {
+                                        "success": False,
+                                        "verified": False,
+                                        "turn_failed": False,
+                                        "watch_failed": True,
+                                        "error_scope": "session_or_unknown",
+                                        "target_turn_id": None,
+                                        "turn_id": None,
+                                        "session_file": target_file,
+                                        "session_id": session_id,
+                                        "report_text": None,
+                                        "error": p.get('message') or "Codex runtime error without turn ID"
+                                    }
+                                return {
+                                    "success": False,
+                                    "verified": False,
+                                    "turn_failed": True,
+                                    "turn_id": err_tid,
+                                    "target_turn_id": None,
+                                    "session_file": target_file,
+                                    "session_id": session_id,
+                                    "report_text": None,
+                                    "error": p.get('message') or 'Codex runtime error'
+                                }
                 except Exception:
                     continue
         except Exception:
             pass
 
     # Timeout reached: DO NOT return stale report as success (Fix F-03 / NT-003)
-    diag = extract_latest_codex_report(project_keyword)
+    # B-05 / Section 23-26: When session_id is specified, diagnostic MUST remain strictly session-bound.
+    if target_file and os.path.exists(target_file):
+        diag = extract_latest_report_from_rollout_file(target_file, session_id)
+    else:
+        diag = extract_latest_codex_report(project_keyword)
+
     diag_report = None
     if diag.get("success"):
         diag_report = {

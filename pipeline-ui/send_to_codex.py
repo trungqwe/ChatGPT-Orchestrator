@@ -134,6 +134,8 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
     - Pre-flight busy check (Chống Push Mù).
     - Post-flight queue verification (Chống Thất Lạc Lệnh).
     """
+    # Section 12: dispatch_id and client_user_message_id are Orchestrator-owned
+    # local diagnostics only, NOT proof of Codex queue->turn correlation.
     dispatch_id = str(uuid.uuid4())
     client_user_message_id = f"orchestrator:{dispatch_id}"
 
@@ -216,6 +218,8 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
             return result
 
         # 4. Post-flight Verification: Inspect transport output
+        # Active legacy adapter: codex_cli_queue (supports_exact_turn_correlation = False)
+        # CRITICAL (B-03): Generic JSON stdout must NEVER manufacture exact_transport authority.
         queue_output = proc.stdout.strip()
         parsed_transport_json = None
 
@@ -228,17 +232,26 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
                 except Exception:
                     continue
 
-        exact_turn_id = None
         exact_sub_id = None
 
         if parsed_transport_json and isinstance(parsed_transport_json, dict):
-            exact_turn_id = parsed_transport_json.get("turn_id")
-            if not exact_turn_id and isinstance(parsed_transport_json.get("turn"), dict):
-                exact_turn_id = parsed_transport_json["turn"].get("id")
+            # Generic JSON stdout must not manufacture exact_transport authority (B-03 / L-NT-029).
+            # If queued is explicitly false, fail closed immediately (L-NT-030).
+            is_queued = parsed_transport_json.get("queued", True)
+            if not is_queued:
+                result["queued"] = False
+                result["success"] = False
+                result["verified"] = False
+                result["turn_started"] = False
+                result["turn_id"] = None
+                result["correlation_method"] = "unavailable"
+                result["error"] = "Hàng đợi từ chối lệnh (queued=false trong JSON stdout)"
+                return result
+
+            result["queued"] = True
             exact_sub_id = parsed_transport_json.get("queued_submission_id") or parsed_transport_json.get("submission_id") or parsed_transport_json.get("id")
             if parsed_transport_json.get("client_user_message_id"):
                 result["client_user_message_id"] = parsed_transport_json.get("client_user_message_id")
-            result["queued"] = bool(parsed_transport_json.get("queued", True))
         else:
             if "Queued message" in queue_output or "for thread" in queue_output:
                 result["queued"] = True
@@ -259,8 +272,8 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
             result["queued_submission_id"] = str(exact_sub_id)
 
         # 5. Diagnostic observation: observe whether a new task_started appeared in rollout
-        # CRITICAL (B-01): Heuristic observation of rollout lines is strictly DIAGNOSTIC.
-        # It NEVER authorizes verified=true. Exact correlation must come from the transport.
+        # CRITICAL (B-01 / Section 15): Heuristic observation of rollout lines is strictly DIAGNOSTIC.
+        # It NEVER authorizes verified=true or turn_started=true.
         observed_post_dispatch_turn_id = None
         verify_start = time.time()
         while time.time() - verify_start < 1.0:
@@ -288,24 +301,17 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
 
         result["observed_post_dispatch_turn_id"] = observed_post_dispatch_turn_id
 
-        # 6. Decision Tree (Section 9): Path A vs Path B
-        if exact_turn_id:
-            # Path A: Exact transport correlation confirmed
-            result["success"] = True
-            result["verified"] = True
-            result["turn_started"] = True
-            result["turn_id"] = str(exact_turn_id)
-            result["correlation_method"] = "exact_transport"
-            result["message"] = f"Đã nạp chỉ đạo vào phiên Codex [{session_id[:8]}] và xác thực turn '{exact_turn_id}' qua exact_transport."
-        else:
-            # Path B: Local installed transport cannot return exact correlation (codex-cli 0.154.0)
-            # Fail-closed: message was queued, but exact resulting turn cannot be proven.
-            result["success"] = True
-            result["verified"] = False
-            result["turn_started"] = False
-            result["turn_id"] = None
-            result["correlation_method"] = "unavailable"
-            result["message"] = f"Lệnh đã nạp vào hàng đợi Codex [{session_id[:8]}] nhưng transport cục bộ không hỗ trợ exact turn correlation (fail-closed)"
+        # 6. Active Legacy Transport Contract: codex_cli_queue
+        # supports_exact_turn_correlation = False.
+        # Queue acceptance is confirmed, but exact resulting turn cannot be proven via CLI (fail-closed).
+        # verified=false, turn_started=false, turn_id=null, correlation_method='unavailable'.
+        result["success"] = True
+        result["queued"] = True
+        result["verified"] = False
+        result["turn_started"] = False
+        result["turn_id"] = None
+        result["correlation_method"] = "unavailable"
+        result["message"] = f"Lệnh đã nạp vào hàng đợi Codex [{session_id[:8]}] nhưng transport cục bộ không hỗ trợ exact turn correlation (fail-closed)"
 
         return result
 
