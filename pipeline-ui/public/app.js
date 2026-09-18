@@ -20,7 +20,9 @@ const state = {
   activeExchangeHistory: [],
   lastDirectivePrompt: null,
   isClosedLoopRunning: false,
-  isObserving: false
+  isObserving: false,
+  workerEngine: 'gemini',
+  workerEngineManuallyChanged: false
 };
 
 // Toast Notification
@@ -137,6 +139,15 @@ async function loadStatus() {
       aoOutput.textContent = JSON.stringify(data.aoDaemon.details, null, 2);
     } else {
       aoOutput.textContent = `Daemon status: ${data.aoDaemon ? data.aoDaemon.status : 'offline'}`;
+    }
+  }
+
+  // Sync workerEngine from server if not manually changed
+  if (data.workerEngine && !state.workerEngineManuallyChanged) {
+    state.workerEngine = data.workerEngine;
+    const workerSel = document.getElementById('select-worker-engine');
+    if (workerSel && workerSel.value !== data.workerEngine) {
+      workerSel.value = data.workerEngine;
     }
   }
 }
@@ -634,16 +645,20 @@ function renderExchangeStream(history) {
       container.appendChild(rowUser);
     }
 
-    // 3. Left Bubble: Antigravity Agent (Worker Report) - only if worker reported
+    // 3. Left Bubble: Worker Report (Codex Extension or Antigravity Agent)
     if (workerContent && workerContent.trim()) {
+      const isCodexWorker = item.workerEngine === 'codex' || workerMsg.role === 'codex' || (workerMsg.workerName && workerMsg.workerName.includes('Codex'));
+      const workerAvatar = isCodexWorker ? '💠' : '⚡';
+      const workerName = isCodexWorker ? 'OpenAI Codex Extension' : 'Antigravity Agent';
+
       const rowAgent = document.createElement('div');
       rowAgent.className = 'chat-bubble-row row-agent exchange-turn';
       rowAgent.innerHTML = `
-        <div class="chat-bubble bubble-agent">
+        <div class="chat-bubble bubble-agent" ${isCodexWorker ? 'style="border-left: 3px solid #10a37f;"' : ''}>
           <div class="bubble-header">
             <div class="bubble-sender-group">
-              <span class="bubble-avatar avatar-agent">⚡</span>
-              <span class="bubble-name">Antigravity Agent</span>
+              <span class="bubble-avatar avatar-agent" ${isCodexWorker ? 'style="background: rgba(16, 163, 127, 0.2); color: #10a37f;"' : ''}>${workerAvatar}</span>
+              <span class="bubble-name">${workerName}</span>
               <span class="bubble-role role-worker">Worker</span>
             </div>
             <span class="bubble-time">${timeStr}</span>
@@ -2220,6 +2235,101 @@ document.addEventListener('DOMContentLoaded', () => {
       state.lastDispatchedPrompt = dispatchedDirective;
     }
 
+    // Branch: If workerEngine is Codex Extension, wait for task_complete rollout event
+    if (state.workerEngine === 'codex') {
+      if (statusText) statusText.textContent = '🟢 Vòng lặp tự động: Đã nạp chỉ đạo vào OpenAI Codex Extension. Đang chờ Codex xử lý...';
+      if (loopStatus) {
+        loopStatus.textContent = 'Codex Đang Xử Lý';
+        loopStatus.className = 'status-badge badge-amber pulse-glow';
+      }
+
+      try {
+        const reportData = await apiPost('/api/worker/wait-report', {
+          projectId,
+          workerEngine: 'codex',
+          timeoutSecs: 180
+        });
+
+        if (reportData && reportData.success && reportData.report_text) {
+          if (loopStatus) {
+            loopStatus.textContent = 'Codex Hoàn Thành';
+            loopStatus.className = 'status-badge badge-cyan';
+          }
+          showToast('✅ OpenAI Codex Extension đã thực thi xong! Tự động gửi báo cáo sang ChatGPT Web audit...', 'success');
+
+          const container = document.getElementById('exchange-stream-container');
+          const emptyState = document.getElementById('stream-empty-state');
+          if (emptyState) emptyState.classList.add('hidden');
+
+          const reportText = reportData.report_text;
+          const timeStr = new Date().toLocaleTimeString();
+
+          if (container) {
+            const rowAgent = document.createElement('div');
+            rowAgent.className = 'chat-bubble-row row-agent exchange-turn';
+            rowAgent.innerHTML = `
+              <div class="chat-bubble bubble-agent" style="border-left: 3px solid #10a37f;">
+                <div class="bubble-header">
+                  <div class="bubble-sender-group">
+                    <span class="bubble-avatar" style="background: rgba(16, 163, 127, 0.2); color: #10a37f; width:28px; height:28px; display:inline-flex; align-items:center; justify-content:center; border-radius:50%;">💠</span>
+                    <span class="bubble-name">OpenAI Codex Extension</span>
+                    <span class="bubble-role role-worker">Worker</span>
+                  </div>
+                  <span class="bubble-time">${timeStr}</span>
+                </div>
+                <div class="bubble-body">
+                  <div class="chat-markdown-content">
+                    ${formatChatMarkdown(reportText)}
+                  </div>
+                </div>
+              </div>
+            `;
+            container.appendChild(rowAgent);
+
+            const thinkingRow = document.createElement('div');
+            thinkingRow.className = 'chat-bubble-row row-chatgpt exchange-turn';
+            thinkingRow.id = 'chatgpt-active-thinking-bubble';
+            thinkingRow.innerHTML = `
+              <div class="chat-bubble bubble-chatgpt bubble-thinking">
+                <div class="bubble-header">
+                  <div class="bubble-header-left">
+                    <span class="bubble-time">Đang audit...</span>
+                  </div>
+                  <div class="bubble-sender-group">
+                    <span class="bubble-role role-architect">Architect</span>
+                    <span class="bubble-name">ChatGPT Web</span>
+                    <span class="bubble-avatar avatar-chatgpt">🧠</span>
+                  </div>
+                </div>
+                <div class="bubble-body">
+                  <div style="display:flex; align-items:center; gap:0.5rem; color:#c084fc; font-size:0.82rem; padding: 0.3rem 0;">
+                    <div class="thinking-dots"><span></span><span></span><span></span></div>
+                    <span>Đang thẩm định Báo Cáo từ Codex để ra chỉ đạo tiếp theo...</span>
+                  </div>
+                </div>
+              </div>
+            `;
+            container.appendChild(thinkingRow);
+            container.scrollTop = container.scrollHeight;
+          }
+
+          setTimeout(async () => {
+            await triggerAuditAndDirect('');
+          }, 1200);
+          return;
+        } else {
+          showToast(`⚠️ Không nhận được báo cáo từ Codex: ${reportData?.error || 'Hết thời gian chờ'}`, 'error');
+          if (statusText) statusText.textContent = `Lỗi: ${reportData?.error || 'Codex không phản hồi'}`;
+          stopClosedLoop();
+          return;
+        }
+      } catch (err) {
+        console.error('Codex wait-report error:', err);
+        stopClosedLoop();
+        return;
+      }
+    }
+
     let baselineStepCount = initialBaselineSteps;
     if (baselineStepCount === null || baselineStepCount === undefined) {
       if (state.lastKnownStepCount !== null && state.lastKnownStepCount !== undefined && state.lastKnownStepCount > 0) {
@@ -2434,6 +2544,7 @@ document.addEventListener('DOMContentLoaded', () => {
         antigravitySessionId: agySessionId,
         userPrompt: userPromptText,
         model: chatgptModel,
+        workerEngine: state.workerEngine || 'gemini',
         mode: 'auto'
       });
 
@@ -2512,6 +2623,19 @@ document.addEventListener('DOMContentLoaded', () => {
     btnStopLoop.addEventListener('click', () => {
       stopClosedLoop();
       showToast('🛑 Đã dừng vòng lặp tự động.', 'info');
+    });
+  }
+
+  // Worker Engine Switcher (Gemini vs OpenAI Codex Extension)
+  const selWorkerEngine = document.getElementById('select-worker-engine');
+  if (selWorkerEngine) {
+    selWorkerEngine.value = state.workerEngine || 'gemini';
+    selWorkerEngine.addEventListener('change', async (e) => {
+      const newEngine = e.target.value;
+      state.workerEngine = newEngine;
+      state.workerEngineManuallyChanged = true;
+      await apiPost('/api/worker/engine', { workerEngine: newEngine });
+      showToast(`Đã chuyển Worker thực thi sang: ${newEngine === 'codex' ? 'OpenAI Codex Extension' : 'Gemini (Mặc định)'}`, 'success');
     });
   }
 

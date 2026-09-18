@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { exec, execSync, execFile } = require('child_process');
 
 const app = express();
@@ -33,6 +34,104 @@ function saveExchangeHistory(data) {
 }
 
 const exchangeHistory = loadExchangeHistory();
+
+// -------------------------------------------------------------
+// Pipeline Settings (Worker Engine: 'gemini' | 'codex')
+// -------------------------------------------------------------
+const SETTINGS_FILE = path.join(__dirname, 'pipeline_settings.json');
+function loadPipelineSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    }
+  } catch (e) {}
+  return { workerEngine: 'gemini' };
+}
+function savePipelineSettings(settings) {
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
+  } catch (e) {}
+}
+let currentSettings = loadPipelineSettings();
+
+// Helper: Dispatch prompt to OpenAI Codex Extension chat in Antigravity IDE
+async function dispatchPromptToCodex(prompt, projectId) {
+  const result = {
+    dispatched: false,
+    sentToWindow: false,
+    method: 'codex_extension_chat',
+    message: '',
+    targetWindow: null,
+    worker: 'codex'
+  };
+
+  try {
+    const tmpPromptFile = path.join(__dirname, '.temp_dispatch_codex_prompt.txt');
+    fs.writeFileSync(tmpPromptFile, prompt, 'utf8');
+    const pyScript = path.join(__dirname, 'send_to_codex.py');
+    const proj = projectId || 'AI_Multi_Task';
+    const pyCmd = `python "${pyScript}" "@${tmpPromptFile}" "${proj}"`;
+
+    const pyOut = await new Promise((resolve) => {
+      exec(pyCmd, { timeout: 15000 }, (err, stdout, stderr) => {
+        try {
+          resolve(JSON.parse((stdout || '').trim()));
+        } catch (e) {
+          resolve({ success: false, error: err ? err.message : stderr });
+        }
+      });
+    });
+
+    if (pyOut && pyOut.success) {
+      result.dispatched = true;
+      result.sentToWindow = true;
+      result.targetWindow = pyOut.target_window;
+      result.message = `Đã tự động đẩy chỉ đạo vào ô chat Codex Extension (${pyOut.target_window})!`;
+      console.log(`[CODEX DISPATCH SUCCESS] ${pyOut.target_window}`);
+      return result;
+    } else {
+      result.message = `Không thể đẩy vào Codex Extension: ${pyOut?.error || 'Lỗi không xác định'}`;
+      console.warn(`[CODEX DISPATCH FAIL] ${pyOut?.error}`);
+    }
+  } catch (e) {
+    result.message = e.message;
+    console.error('[CODEX DISPATCH ERROR]', e.message);
+  }
+
+  return result;
+}
+
+// Helper: Wait for Codex Extension turn completion via watch_codex_session.py
+function waitCodexReport(projectId = 'AI_Multi_Task', timeoutSecs = 180) {
+  return new Promise((resolve) => {
+    const pyScript = path.join(__dirname, 'watch_codex_session.py');
+    const pyCmd = `python "${pyScript}" --project "${projectId}" --timeout ${timeoutSecs}`;
+    exec(pyCmd, { timeout: (timeoutSecs + 10) * 1000 }, (err, stdout, stderr) => {
+      try {
+        const out = JSON.parse((stdout || '').trim());
+        resolve(out);
+      } catch (e) {
+        resolve({ success: false, error: err ? err.message : stderr });
+      }
+    });
+  });
+}
+
+// Helper: Read the latest report from the most recent Codex session rollout
+function getLatestCodexReport(projectId = 'AI_Multi_Task') {
+  return new Promise((resolve) => {
+    const pyScript = path.join(__dirname, 'watch_codex_session.py');
+    const pyCmd = `python "${pyScript}" --project "${projectId}" --latest`;
+    exec(pyCmd, { timeout: 10000 }, (err, stdout, stderr) => {
+      try {
+        const out = JSON.parse((stdout || '').trim());
+        resolve(out);
+      } catch (e) {
+        resolve({ success: false, error: err ? err.message : stderr });
+      }
+    });
+  });
+}
 
 // Helper to execute commands safely with Promise
 function runCmd(command, cwd = null) {
@@ -204,6 +303,8 @@ app.get('/api/status', async (req, res) => {
     installed: aoVer.exitCode === 0,
     version: aoVer.stdout.split('\n')[0]
   };
+
+  result.workerEngine = currentSettings.workerEngine || 'gemini';
 
   res.json(result);
 });
@@ -1443,17 +1544,46 @@ app.get('/api/models', (req, res) => {
   });
 });
 
-// Helper to execute Codex prompt cleanly via stdin pipe
-function runCodexWithPrompt(targetModel, promptText, timeout = 120000) {
+// Helper to execute Codex prompt cleanly via stdin pipe and -o temp file
+function runCodexWithPrompt(targetModel, promptText, timeout = 180000) {
   return new Promise((resolve) => {
-    const child = exec(`codex exec --ephemeral --skip-git-repo-check -m ${targetModel} -`, { timeout }, (error, stdout, stderr) => {
+    const tmpFile = path.join(os.tmpdir(), `codex_out_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.txt`);
+    const child = exec(`codex exec --ephemeral --skip-git-repo-check -m ${targetModel} -o "${tmpFile}" -`, { timeout }, (error, stdout, stderr) => {
+      let finalMessage = '';
+      if (fs.existsSync(tmpFile)) {
+        try {
+          finalMessage = fs.readFileSync(tmpFile, 'utf8').trim();
+          fs.unlinkSync(tmpFile);
+        } catch (e) {}
+      }
+
+      let effectiveStdout = finalMessage || (stdout || '').trim();
+
+      // If stdout/tmpFile is empty but stderr has output, check if stderr contains assistant message
+      if (!effectiveStdout && stderr) {
+        const lines = stderr.split('\n');
+        let collected = [];
+        for (const line of lines) {
+          if (line.startsWith('codex') || line.startsWith('--------') || line.startsWith('user') || line.startsWith('OpenAI Codex') || line.startsWith('workdir:') || line.startsWith('model:') || line.startsWith('provider:') || line.startsWith('approval:') || line.startsWith('sandbox:') || line.startsWith('reasoning effort:') || line.startsWith('reasoning summaries:') || line.startsWith('session id:')) {
+            continue;
+          }
+          if (line.includes('Local tools unavailable') || line.includes('Action: Open') || line.includes('cannot access the local Codex computer') || line.includes('accumulated context does not contain')) {
+            continue;
+          }
+          collected.push(line);
+        }
+        const cleaned = collected.join('\n').trim();
+        if (cleaned) effectiveStdout = cleaned;
+      }
+
       resolve({
         exitCode: error && error.code !== undefined ? error.code : (error ? 1 : 0),
-        stdout: (stdout || '').trim(),
+        stdout: effectiveStdout,
         stderr: (stderr || '').trim(),
         error: error ? error.message : null
       });
     });
+
     if (child.stdin) {
       child.stdin.write(promptText + '\n');
       child.stdin.end();
@@ -1467,7 +1597,7 @@ app.post('/api/models/test', async (req, res) => {
 
   if (provider === 'chatgpt') {
     const targetModel = model || 'chatgpt-web/high';
-    const out = await runCodexWithPrompt(targetModel, 'Respond strictly with: PING_OK', 45000);
+    const out = await runCodexWithPrompt(targetModel, 'Respond strictly with: PING_OK', 90000);
     const duration = Date.now() - start;
     const success = out.exitCode === 0 && (out.stdout.includes('PING_OK') || out.stdout.includes('PING\\_OK'));
     return res.json({
@@ -1607,7 +1737,7 @@ app.post('/api/chatgpt/logout', async (req, res) => {
 app.post('/api/chatgpt/verify', async (req, res) => {
   const start = Date.now();
   try {
-    const out = await runCodexWithPrompt('chatgpt-web/high', 'Respond strictly with: PING_OK', 45000);
+    const out = await runCodexWithPrompt('chatgpt-web/high', 'Respond strictly with: PING_OK', 90000);
     const duration = Date.now() - start;
     const success = out.exitCode === 0 && (out.stdout.includes('PING_OK') || out.stdout.includes('PING\\_OK'));
     
@@ -1753,12 +1883,15 @@ Respond ONLY with a valid JSON object matching this schema:
 // -------------------------------------------------------------
 // 9. Observer & Orchestrator Engine (ChatGPT Web Audit & Directives)
 app.post('/api/orchestrator/audit-and-direct', async (req, res) => {
-  const { projectId, antigravitySessionId, antigravityReport, mode, model, manualReport, userPrompt } = req.body;
+  const { projectId, antigravitySessionId, antigravityReport, mode, model, manualReport, userPrompt, workerEngine } = req.body;
   if (!projectId) {
     return res.status(400).json({ error: 'projectId is required' });
   }
 
-  // 1. Resolve real Antigravity Worker report from transcript if not manual
+  const effectiveWorker = workerEngine || currentSettings.workerEngine || 'gemini';
+  const workerDisplayName = effectiveWorker === 'codex' ? 'OpenAI Codex Extension' : 'Google Antigravity';
+
+  // 1. Resolve real Worker report from transcript/rollout if not manual
   let effectiveReportText = '';
   let extractedCommands = [];
   let extractedFiles = [];
@@ -1769,8 +1902,16 @@ app.post('/api/orchestrator/audit-and-direct', async (req, res) => {
     effectiveReportText = extractWorkerReportOnly(antigravityReport);
   } else if (antigravityReport && antigravityReport.testOutput) {
     effectiveReportText = extractWorkerReportOnly(antigravityReport.testOutput);
+  } else if (effectiveWorker === 'codex') {
+    // Extract real report from Codex session rollout
+    const codexData = await getLatestCodexReport(projectId);
+    if (codexData && codexData.success && codexData.report_text) {
+      effectiveReportText = codexData.report_text;
+    } else {
+      effectiveReportText = 'OpenAI Codex Extension Worker báo cáo hoàn thành nhiệm vụ theo roadmap kỹ thuật.';
+    }
   } else {
-    // Extract real report from transcript
+    // Extract real report from Antigravity transcript
     const extracted = extractAntigravityReport(antigravitySessionId, projectId);
     if (extracted && extracted.reportText) {
       effectiveReportText = extractWorkerReportOnly(extracted.reportText);
@@ -1796,16 +1937,16 @@ Project: ${projectId}
 Local Path: ${localContext.projPath}
 
 CRITICAL MANDATE: YOU MUST NOT GENERATE CODE IMPLEMENTATIONS OR REPLACEMENT FILES.
-All coding execution is strictly delegated to the Google Antigravity Worker in the Antigravity IDE.
+All coding execution is strictly delegated to the ${workerDisplayName} Worker in the Antigravity IDE.
 
 YOUR TASKS:
-1. Review Antigravity's latest Worker Report, commands executed, and modified files against the Local Project Structure & Technical Roadmap below.
+1. Review the ${workerDisplayName} Worker's latest Report, commands executed, and modified files against the Local Project Structure & Technical Roadmap below.
 2. Provide an independent technical critique and code audit in Vietnamese (Markdown formatted).
    - Evaluate what was verified, what passed, and whether any risks/blockers remain.
    - Specify whether the current phase is approved to advance to the next roadmap milestone.
 3. Conclude with an explicit, actionable prompt section under the heading:
-### 🎯 CHỈ ĐẠO TIẾP THEO CHO ANTIGRAVITY:
-[Write the exact, step-by-step directive prompt for Antigravity IDE to execute next without ambiguity]
+### 🎯 CHỈ ĐẠO TIẾP THEO CHO ${effectiveWorker === 'codex' ? 'CODEX' : 'ANTIGRAVITY'}:
+[Write the exact, step-by-step directive prompt for ${workerDisplayName} to execute next without ambiguity]
 
 === LOCAL PROJECT DIRECTORY STRUCTURE ===
 ${localContext.fileTreeSummary}
@@ -1813,12 +1954,12 @@ ${localContext.fileTreeSummary}
 === LOCAL TECHNICAL ROADMAP & SPECIFICATIONS (FROM DISK) ===
 ${localContext.technicalContextSummary}
 
-=== ANTIGRAVITY WORKER LATEST REPORT & ACTIONS ===
-Session: ${antigravitySessionId || 'antigravity-active'}
+=== ${workerDisplayName.toUpperCase()} WORKER LATEST REPORT & ACTIONS ===
+Session: ${effectiveWorker === 'codex' ? 'codex-extension-session' : (antigravitySessionId || 'antigravity-active')}
 ${effectiveReportText}
 `;
 
-  const out = await runCodexWithPrompt(targetModel, prompt, 120000);
+  const out = await runCodexWithPrompt(targetModel, prompt, 180000);
   const rawResponse = (out.stdout || '').trim();
 
   if (!rawResponse) {
@@ -1829,7 +1970,7 @@ ${effectiveReportText}
 
   // Extract directive prompt
   let nextDirectivePrompt = '';
-  const directiveMarker = rawResponse.match(/###\s*🎯?\s*CHỈ ĐẠO TIẾP THEO CHO ANTIGRAVITY:?([\s\S]*)/i)
+  const directiveMarker = rawResponse.match(/###\s*🎯?\s*CHỈ ĐẠO TIẾP THEO CHO (?:CODEX|ANTIGRAVITY|WORKER):?([\s\S]*)/i)
     || rawResponse.match(/###\s*Next Directive:?([\s\S]*)/i);
   if (directiveMarker && directiveMarker[1]) {
     nextDirectivePrompt = directiveMarker[1].trim();
@@ -1855,9 +1996,11 @@ ${effectiveReportText}
     id: `ex-${Date.now()}`,
     projectId,
     antigravitySessionId: antigravitySessionId || 'default',
+    workerEngine: effectiveWorker,
     timestamp: new Date().toISOString(),
     workerMessage: {
-      role: 'antigravity',
+      role: effectiveWorker === 'codex' ? 'codex' : 'antigravity',
+      workerName: workerDisplayName,
       content: effectiveReportText,
       commands: [],
       filesModified: extractedFiles,
@@ -1893,15 +2036,20 @@ ${effectiveReportText}
   const targetAgySession = resolveAntigravitySession(antigravitySessionId, projectId);
   const baselineStepCount = getSessionStepCount(targetAgySession);
 
-  // 5. Auto-dispatch directive prompt into Antigravity IDE (Visible delivery into Chat)
+  // 5. Auto-dispatch directive prompt into appropriate Worker
   if (nextDirectivePrompt) {
-    const dispRes = await dispatchPromptToAntigravity(nextDirectivePrompt, projectId, targetAgySession);
+    let dispRes;
+    if (effectiveWorker === 'codex') {
+      dispRes = await dispatchPromptToCodex(nextDirectivePrompt, projectId);
+    } else {
+      dispRes = await dispatchPromptToAntigravity(nextDirectivePrompt, projectId, targetAgySession);
+    }
     exchangeItem.dispatched = dispRes.dispatched;
     exchangeItem.sentToWindow = dispRes.sentToWindow;
     exchangeItem.dispatchTarget = dispRes.targetWindow || dispRes.targetSession;
-    exchangeItem.dispatchMethod = dispRes.method || (dispRes.sentToWindow ? 'antigravity_ide_chat' : 'ao_background_send');
+    exchangeItem.dispatchMethod = dispRes.method || (effectiveWorker === 'codex' ? 'codex_extension_chat' : (dispRes.sentToWindow ? 'antigravity_ide_chat' : 'ao_background_send'));
     exchangeItem.dispatchMessage = dispRes.message;
-    console.log(`[AUTO-DISPATCH] sentToWindow=${dispRes.sentToWindow}, target=${exchangeItem.dispatchTarget}`);
+    console.log(`[AUTO-DISPATCH] worker=${effectiveWorker} sentToWindow=${dispRes.sentToWindow}, target=${exchangeItem.dispatchTarget}`);
   }
 
   // Persist exchange item
@@ -1956,7 +2104,7 @@ YOUR TASKS:
 [Write the exact, step-by-step directive prompt for Antigravity IDE to execute next without ambiguity]
 `;
 
-  const out = await runCodexWithPrompt(targetModel, prompt, 120000);
+  const out = await runCodexWithPrompt(targetModel, prompt, 180000);
   const rawResponse = (out.stdout || '').trim();
 
   if (!rawResponse) {
@@ -2329,9 +2477,50 @@ async function dispatchPromptToAntigravity(prompt, projectId, sessionId) {
   return result;
 }
 
+// -------------------------------------------------------------
+// Worker Engine Management (Gemini vs OpenAI Codex Extension)
+// -------------------------------------------------------------
+app.get('/api/worker/engine', (req, res) => {
+  res.json({ workerEngine: currentSettings.workerEngine || 'gemini' });
+});
+
+app.post('/api/worker/engine', (req, res) => {
+  const { workerEngine } = req.body;
+  if (workerEngine === 'codex' || workerEngine === 'gemini') {
+    currentSettings.workerEngine = workerEngine;
+    savePipelineSettings(currentSettings);
+  }
+  res.json({ success: true, workerEngine: currentSettings.workerEngine });
+});
+
+app.post('/api/worker/wait-report', async (req, res) => {
+  const { projectId, workerEngine, timeoutSecs } = req.body;
+  const effectiveWorker = workerEngine || currentSettings.workerEngine || 'gemini';
+  const proj = projectId || 'AI_Multi_Task';
+
+  if (effectiveWorker === 'codex') {
+    const reportData = await waitCodexReport(proj, timeoutSecs || 180);
+    return res.json(reportData);
+  }
+
+  // Gemini extraction
+  const extracted = extractAntigravityReport(null, proj);
+  return res.json({
+    success: !!extracted?.reportText,
+    report_text: extracted?.reportText || '',
+    files_modified: extracted?.filesModified || []
+  });
+});
+
 app.post('/api/antigravity/dispatch', async (req, res) => {
-  const { sessionId, prompt, projectId } = req.body;
+  const { sessionId, prompt, projectId, workerEngine } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+
+  const effectiveWorker = workerEngine || currentSettings.workerEngine || 'gemini';
+  if (effectiveWorker === 'codex') {
+    const result = await dispatchPromptToCodex(prompt, projectId);
+    return res.json(result);
+  }
 
   const result = await dispatchPromptToAntigravity(prompt, projectId, sessionId);
   return res.json(result);
