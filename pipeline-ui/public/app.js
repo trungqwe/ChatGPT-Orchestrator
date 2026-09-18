@@ -744,17 +744,17 @@ async function pollAgentLiveSteps() {
 
   const currentSess = state.selectedAgySession;
   if (!currentSess || currentSess === 'new') {
-    if (badge) badge.textContent = '0 Bước';
+    if (badge) badge.textContent = '0 Mốc';
     return;
   }
 
   const data = await apiGet(`/api/antigravity/session-steps/${currentSess}?projectId=${state.selectedProject || ''}`);
   if (!data || !data.steps || data.steps.length === 0) {
-    if (badge) badge.textContent = '0 Bước';
+    if (badge) badge.textContent = '0 Mốc';
     return;
   }
 
-  if (badge) badge.textContent = `${data.steps.length} Bước`;
+  if (badge) badge.textContent = `${data.steps.length} Mốc`;
 
   const emptyState = document.getElementById('log-empty-state');
   if (emptyState) emptyState.classList.add('hidden');
@@ -766,16 +766,22 @@ async function pollAgentLiveSteps() {
     row.className = `log-stream-row ${st.isError ? 'log-err' : ''}`;
 
     let tagClass = 'tag-agent';
-    let tagText = 'Agent';
+    let tagText = 'GEMINI';
     if (st.isError) {
       tagClass = 'tag-err';
-      tagText = 'Lỗi';
+      tagText = 'LỖI';
     } else if (st.role === 'user') {
       tagClass = 'tag-user';
-      tagText = 'User';
+      tagText = 'USER';
+    } else if (st.role === 'report') {
+      tagClass = 'tag-report';
+      tagText = 'BÁO CÁO';
+    } else if (st.role === 'chatgpt') {
+      tagClass = 'tag-chatgpt';
+      tagText = 'CHATGPT';
     } else if (st.role === 'system') {
       tagClass = 'tag-sys';
-      tagText = 'CMD';
+      tagText = 'HỆ THỐNG';
     }
 
     row.innerHTML = `

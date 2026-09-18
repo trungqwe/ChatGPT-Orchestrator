@@ -1872,7 +1872,7 @@ YOUR TASKS:
   });
 });
 
-// Endpoint: Real-time steps probe for Live Agent Activity Log (Clean & Focused)
+// Endpoint: Real-time milestones probe for Live Activity Log (High-level lifecycle milestones only)
 app.get('/api/antigravity/session-steps/:sessionId', (req, res) => {
   const sessionId = req.params.sessionId;
   const projectId = req.query.projectId;
@@ -1886,84 +1886,150 @@ app.get('/api/antigravity/session-steps/:sessionId', (req, res) => {
 
   try {
     const rawLines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
-    const steps = [];
-    const maxScan = 100;
-    const startIndex = Math.max(0, rawLines.length - maxScan);
+    const turns = [];
+    let currentTurn = null;
 
-    for (let i = startIndex; i < rawLines.length; i++) {
+    for (let i = 0; i < rawLines.length; i++) {
       try {
         const item = JSON.parse(rawLines[i]);
-        let summary = '';
-        let role = item.source === 'USER_EXPLICIT' ? 'user' : (item.type === 'RUN_COMMAND' ? 'system' : 'antigravity');
-        let details = '';
-        let isError = false;
-
         if (item.type === 'USER_INPUT') {
-          summary = 'Tiếp nhận chỉ đạo vào IDE';
-          const cleanPrompt = (item.content || '').replace(/<[^>]+>/g, '').trim().split('\n')[0];
-          details = cleanPrompt.slice(0, 80);
-        } else if (item.type === 'PLANNER_RESPONSE' || item.type === 'MODEL') {
-          if (Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
-            const tc = item.tool_calls[0];
-            const name = tc.name || '';
-            const args = tc.args || {};
-
-            if (name === 'replace_file_content' || name === 'multi_replace_file_content') {
-              const file = path.basename(args.TargetFile || 'file');
-              summary = `Sửa file: ${file}`;
-              if (args.Instruction) details = args.Instruction.slice(0, 75);
-            } else if (name === 'write_to_file') {
-              const file = path.basename(args.TargetFile || 'file');
-              summary = `Tạo file: ${file}`;
-              if (args.Description) details = args.Description.slice(0, 75);
-            } else if (name === 'run_command') {
-              summary = `Lệnh: ${(args.CommandLine || '').slice(0, 60)}`;
-            } else {
-              // Routine inspect tools (view_file, grep_search, list_dir, read_url_content) are filtered out
-              // to keep the activity log clean, showing only key actions and errors
-              continue;
-            }
-          } else {
-            const content = (item.content || '').trim();
-            if (content.toLowerCase().includes('error') || content.toLowerCase().includes('lỗi')) {
-              summary = '⚠️ Cảnh báo / Lỗi';
-              details = content.slice(0, 80);
-              isError = true;
-            } else if (item.status === 'DONE' || item.type === 'PLANNER_RESPONSE') {
-              summary = 'Hoàn tất turn thi công';
-              details = content ? content.slice(0, 75) : '';
-            } else {
-              continue;
-            }
+          if (currentTurn) turns.push(currentTurn);
+          currentTurn = {
+            userItem: item,
+            firstActionItem: null,
+            lastActionItem: null,
+            finalItem: null,
+            hasError: false,
+            errorMsg: ''
+          };
+        } else if (currentTurn) {
+          if (item.tool_calls && item.tool_calls.length > 0) {
+            if (!currentTurn.firstActionItem) currentTurn.firstActionItem = item;
+            currentTurn.lastActionItem = item;
+          } else if (item.type === 'RUN_COMMAND') {
+            if (!currentTurn.firstActionItem) currentTurn.firstActionItem = item;
+            currentTurn.lastActionItem = item;
           }
-        } else if (item.type === 'RUN_COMMAND') {
-          const exitCode = item.exit_code ?? 0;
-          if (exitCode !== 0) {
-            isError = true;
-            summary = `⚠️ Lỗi lệnh (Exit ${exitCode})`;
-            details = (item.content || '').slice(0, 80);
-          } else {
-            summary = `Terminal OK (Exit 0)`;
-            details = (item.content || '').slice(0, 60);
+          if (item.status === 'ERROR' || item.type === 'ERROR') {
+            currentTurn.hasError = true;
+            currentTurn.errorMsg = (item.content || '').slice(0, 90);
           }
-        } else {
-          continue;
+          if ((item.type === 'PLANNER_RESPONSE' || item.type === 'MODEL') && item.content && (!item.tool_calls || item.tool_calls.length === 0)) {
+            currentTurn.finalItem = item;
+          }
         }
-
-        steps.push({
-          stepIndex: item.step_index ?? i,
-          timestamp: item.created_at || new Date().toISOString(),
-          type: item.type,
-          role,
-          isError,
-          summary,
-          details
-        });
       } catch (e) {}
     }
+    if (currentTurn) turns.push(currentTurn);
 
-    const cleanSteps = steps.slice(-25);
-    res.json({ success: true, sessionId: targetSessionId, totalSteps: cleanSteps.length, steps: cleanSteps });
+    const milestones = [];
+    turns.forEach((t, idx) => {
+      const promptText = (t.userItem.content || '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/^[#*`\s]+/gm, '')
+        .trim()
+        .split('\n')[0]
+        .slice(0, 85);
+      const turnLabel = turns.length > 1 ? ` (Lượt ${idx + 1})` : '';
+
+      // 1. Tiếp nhận chỉ đạo
+      milestones.push({
+        timestamp: t.userItem.created_at || new Date().toISOString(),
+        role: 'user',
+        summary: `Tiếp nhận chỉ đạo${turnLabel}`,
+        details: promptText
+      });
+
+      // 2. Gemini bắt đầu làm việc
+      const startTs = t.firstActionItem ? t.firstActionItem.created_at : t.userItem.created_at;
+      milestones.push({
+        timestamp: startTs || new Date().toISOString(),
+        role: 'gemini',
+        summary: `Gemini bắt đầu làm việc${turnLabel}`,
+        details: 'Đang phân tích yêu cầu và tiến hành thi công...'
+      });
+
+      // 3 & 4. Đã xong & Đã báo cáo
+      if (t.finalItem) {
+        const finishTs = t.lastActionItem ? t.lastActionItem.created_at : t.finalItem.created_at;
+        milestones.push({
+          timestamp: finishTs || t.finalItem.created_at || new Date().toISOString(),
+          role: 'gemini',
+          summary: `Gemini đã hoàn tất thi công${turnLabel}`,
+          details: 'Đã hoàn thành các bước xử lý trong lượt'
+        });
+
+        let reportSnippet = (t.finalItem.content || '')
+          .replace(/<[^>]+>/g, '')
+          .replace(/[#*`]/g, '')
+          .trim()
+          .split('\n')[0];
+        if (reportSnippet.length > 90) reportSnippet = reportSnippet.slice(0, 90) + '...';
+
+        milestones.push({
+          timestamp: t.finalItem.created_at || new Date().toISOString(),
+          role: 'report',
+          summary: `Gemini đã báo cáo kết quả${turnLabel}`,
+          details: reportSnippet || 'Đã xuất báo cáo chuyển giao'
+        });
+      } else {
+        milestones.push({
+          timestamp: t.lastActionItem ? t.lastActionItem.created_at : new Date().toISOString(),
+          role: 'gemini',
+          summary: `Gemini đang thi công${turnLabel}...`,
+          details: 'Đang thực thi các tác vụ trong Antigravity IDE'
+        });
+      }
+
+      if (t.hasError) {
+        milestones.push({
+          timestamp: t.lastActionItem ? t.lastActionItem.created_at : new Date().toISOString(),
+          role: 'error',
+          isError: true,
+          summary: `⚠️ Cảnh báo lỗi thi công`,
+          details: t.errorMsg
+        });
+      }
+    });
+
+    // Also include orchestrator closed-loop events if available
+    if (projectId && exchangeHistory[projectId] && Array.isArray(exchangeHistory[projectId])) {
+      const pHistory = exchangeHistory[projectId];
+      pHistory.forEach((ex, exIdx) => {
+        if (ex.antigravitySessionId === targetSessionId || (!ex.antigravitySessionId && exIdx < 3)) {
+          if (ex.workerReport && ex.timestamp) {
+            milestones.push({
+              timestamp: ex.timestamp,
+              role: 'chatgpt',
+              summary: 'Đã chuyển báo cáo sang ChatGPT Web',
+              details: 'Thẩm định và đánh giá tiến độ roadmap'
+            });
+          }
+          if (ex.chatgptMessage && ex.chatgptMessage.directivePrompt) {
+            const dirSnippet = ex.chatgptMessage.directivePrompt.trim().split('\n')[0].slice(0, 85);
+            milestones.push({
+              timestamp: ex.timestamp,
+              role: 'chatgpt',
+              summary: 'ChatGPT Web đã chỉ đạo bước tiếp theo',
+              details: dirSnippet
+            });
+          }
+        }
+      });
+    }
+
+    // Sort chronologically
+    milestones.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    // Keep most recent 25 milestones
+    const cleanMilestones = milestones.slice(-25);
+
+    res.json({
+      success: true,
+      sessionId: targetSessionId,
+      totalSteps: cleanMilestones.length,
+      steps: cleanMilestones
+    });
   } catch (e) {
     res.json({ steps: [] });
   }
