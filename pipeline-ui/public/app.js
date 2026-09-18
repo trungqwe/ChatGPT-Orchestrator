@@ -231,12 +231,14 @@ async function loadProjects() {
 
   // Set initial selected project for Observer & Orchestrator
   if (globalProjSelect) {
-    let targetProj = state.selectedProject;
+    const savedProj = localStorage.getItem('orchestrator_selected_project');
+    let targetProj = savedProj || state.selectedProject;
     if (!targetProj || !state.projects.find(p => p.id === targetProj)) {
-      const preferred = state.projects.find(p => p.id === 'calc-engine') || state.projects[0];
+      const preferred = state.projects.find(p => p.id === 'ai_task_manager' || p.id === 'AI_Task_Manager') || state.projects[0];
       targetProj = preferred ? preferred.id : null;
     }
     if (targetProj) {
+      localStorage.setItem('orchestrator_selected_project', targetProj);
       globalProjSelect.value = targetProj;
       onProjectSelected(targetProj);
     }
@@ -313,6 +315,7 @@ async function loadModelCatalogs() {
 // -------------------------------------------------------------
 async function onProjectSelected(projectId) {
   state.selectedProject = projectId;
+  localStorage.setItem('orchestrator_selected_project', projectId);
 
   // Update topbar select if mismatched
   const projSelect = document.getElementById('global-project-select');
@@ -339,6 +342,11 @@ async function loadAntigravitySessions(projectId) {
 
   const res = await apiGet('/api/antigravity/conversations');
   agySelect.innerHTML = '';
+
+  const badgeNavSess = document.getElementById('badge-nav-sessions-count');
+  if (badgeNavSess && res && res.conversations) {
+    badgeNavSess.textContent = res.conversations.length;
+  }
 
   // Option 1: Create New Session
   const newOpt = document.createElement('option');
@@ -391,23 +399,32 @@ async function loadAntigravitySessions(projectId) {
     }
   }
 
-  // Set default selection to Current worker session if available
-  const currentItem = res?.conversations?.find(c => c.status === 'current');
-  if (!state.selectedAgySession || state.selectedAgySession === 'auto' || state.selectedAgySession === 'eb04834e-f388-4dd3-afd7-4001e7fa3da5') {
-    state.selectedAgySession = currentItem ? currentItem.id : (res?.conversations?.[0]?.id || 'new');
-  }
+  // Preserve 'new' session if currently chosen
+  if (state.selectedAgySession === 'new') {
+    agySelect.value = 'new';
+  } else {
+    // Set default selection to Current worker session if available
+    const currentItem = res?.conversations?.find(c => c.status === 'current');
+    if (!state.selectedAgySession || state.selectedAgySession === 'auto' || state.selectedAgySession === 'eb04834e-f388-4dd3-afd7-4001e7fa3da5') {
+      state.selectedAgySession = currentItem ? currentItem.id : (res?.conversations?.[0]?.id || 'new');
+    }
 
-  if (state.selectedAgySession) {
-    agySelect.value = state.selectedAgySession;
-  }
-  if (!agySelect.value && currentItem) {
-    agySelect.value = currentItem.id;
-    state.selectedAgySession = currentItem.id;
+    if (state.selectedAgySession) {
+      agySelect.value = state.selectedAgySession;
+    }
+    if (!agySelect.value && currentItem) {
+      agySelect.value = currentItem.id;
+      state.selectedAgySession = currentItem.id;
+    }
   }
 
   const dispSess = document.getElementById('disp-active-session');
   if (dispSess) {
-    dispSess.textContent = agySelect.options[agySelect.selectedIndex]?.text || agySelect.value;
+    if (state.selectedAgySession === 'new') {
+      dispSess.textContent = '✨ Phiên Chat Mới (Chờ nhận lệnh...)';
+    } else {
+      dispSess.textContent = agySelect.options[agySelect.selectedIndex]?.text || agySelect.value;
+    }
   }
 }
 
@@ -560,40 +577,66 @@ function renderExchangeStream(history) {
 
     // 1. Turn divider
     const turnDivider = document.createElement('div');
-    turnDivider.className = 'chat-turn-divider';
+    turnDivider.className = 'chat-turn-divider exchange-turn';
     turnDivider.innerHTML = `<span>Trao Đổi #${items.length - index} • ${timeStr}</span>`;
     container.appendChild(turnDivider);
 
-    // 2. Left Bubble: Antigravity Agent (Worker)
-    const rowAgent = document.createElement('div');
-    rowAgent.className = 'chat-bubble-row row-agent';
-    rowAgent.innerHTML = `
-      <div class="chat-bubble bubble-agent">
-        <div class="bubble-header">
-          <div class="bubble-sender-group">
-            <span class="bubble-avatar avatar-agent">⚡</span>
-            <span class="bubble-name">Antigravity Agent</span>
-            <span class="bubble-role role-worker">Worker</span>
+    // 2. User Bubble (if this turn originated from direct User instruction)
+    if (item.userMessage && item.userMessage.content) {
+      const rowUser = document.createElement('div');
+      rowUser.className = 'chat-bubble-row row-user exchange-turn';
+      rowUser.innerHTML = `
+        <div class="chat-bubble bubble-user">
+          <div class="bubble-header">
+            <div class="bubble-sender-group">
+              <span class="bubble-avatar avatar-user">👤</span>
+              <span class="bubble-name">Chỉ Đạo Từ User</span>
+              <span class="bubble-role role-user">User Direct</span>
+            </div>
+            <span class="bubble-time">${timeStr}</span>
           </div>
-          <span class="bubble-time">${timeStr}</span>
-        </div>
-        <div class="bubble-body">
-          ${filesModified && filesModified.length > 0 ? `
-            <div class="chat-meta-chips">
-              <span class="meta-label">File:</span>
-              ${filesModified.map(f => `<span class="chip-file">📄 ${escapeHtml(f)}</span>`).join(' ')}
-            </div>` : ''}
-          <div class="chat-markdown-content">
-            ${formatChatMarkdown(workerContent)}
+          <div class="bubble-body">
+            <div class="chat-markdown-content">
+              ${formatChatMarkdown(item.userMessage.content)}
+            </div>
           </div>
         </div>
-      </div>
-    `;
-    container.appendChild(rowAgent);
+      `;
+      container.appendChild(rowUser);
+    }
+
+    // 3. Left Bubble: Antigravity Agent (Worker Report) - only if worker reported
+    if (workerContent && workerContent.trim()) {
+      const rowAgent = document.createElement('div');
+      rowAgent.className = 'chat-bubble-row row-agent exchange-turn';
+      rowAgent.innerHTML = `
+        <div class="chat-bubble bubble-agent">
+          <div class="bubble-header">
+            <div class="bubble-sender-group">
+              <span class="bubble-avatar avatar-agent">⚡</span>
+              <span class="bubble-name">Antigravity Agent</span>
+              <span class="bubble-role role-worker">Worker</span>
+            </div>
+            <span class="bubble-time">${timeStr}</span>
+          </div>
+          <div class="bubble-body">
+            ${filesModified && filesModified.length > 0 ? `
+              <div class="chat-meta-chips">
+                <span class="meta-label">File:</span>
+                ${filesModified.map(f => `<span class="chip-file">📄 ${escapeHtml(f)}</span>`).join(' ')}
+              </div>` : ''}
+            <div class="chat-markdown-content">
+              ${formatChatMarkdown(workerContent)}
+            </div>
+          </div>
+        </div>
+      `;
+      container.appendChild(rowAgent);
+    }
 
     // 3. Right Bubble: ChatGPT Web (Lead Architect & Auditor)
     const rowGpt = document.createElement('div');
-    rowGpt.className = 'chat-bubble-row row-chatgpt';
+    rowGpt.className = 'chat-bubble-row row-chatgpt exchange-turn';
     rowGpt.innerHTML = `
       <div class="chat-bubble bubble-chatgpt">
         <div class="bubble-header">
@@ -689,10 +732,270 @@ function renderExchangeStream(history) {
   container.scrollTop = container.scrollHeight;
 }
 
+// -------------------------------------------------------------
+// Real-time Agent Live Steps Poller (Right Column)
+// -------------------------------------------------------------
+async function pollAgentLiveSteps() {
+  const container = document.getElementById('agent-live-steps-container');
+  const badge = document.getElementById('badge-live-steps-count');
+  if (!container) return;
+
+  const currentSess = state.selectedAgySession;
+  if (!currentSess || currentSess === 'new') {
+    if (badge) badge.textContent = '0 Bước';
+    return;
+  }
+
+  const data = await apiGet(`/api/antigravity/session-steps/${currentSess}?projectId=${state.selectedProject || ''}`);
+  if (!data || !data.steps || data.steps.length === 0) {
+    if (badge) badge.textContent = '0 Bước';
+    return;
+  }
+
+  if (badge) badge.textContent = `${data.totalSteps || data.steps.length} Bước`;
+
+  const emptyState = document.getElementById('log-empty-state');
+  if (emptyState) emptyState.classList.add('hidden');
+
+  container.innerHTML = '';
+  data.steps.forEach(st => {
+    const timeStr = st.timestamp ? new Date(st.timestamp).toLocaleTimeString() : '';
+    const item = document.createElement('div');
+    item.className = `step-log-item step-${st.role}`;
+
+    let roleBadgeClass = 'badge-cyan';
+    let roleText = 'Agent';
+    if (st.role === 'user') {
+      roleBadgeClass = 'badge-purple';
+      roleText = 'User';
+    } else if (st.role === 'system') {
+      roleBadgeClass = 'badge-emerald';
+      roleText = 'Terminal';
+    }
+
+    item.innerHTML = `
+      <div class="step-log-header">
+        <span class="step-role-badge ${roleBadgeClass}">${roleText}</span>
+        <span class="step-time">${timeStr}</span>
+        <span class="step-badge-status ${st.status === 'DONE' ? 'text-emerald' : 'text-amber'}">${escapeHtml(st.status)}</span>
+      </div>
+      <div class="step-summary">${escapeHtml(st.summary)}</div>
+      ${st.details ? `<div class="step-details">${escapeHtml(st.details)}</div>` : ''}
+    `;
+    container.appendChild(item);
+  });
+
+  // Auto scroll to bottom
+  container.scrollTop = container.scrollHeight;
+}
 
 // -------------------------------------------------------------
-// Sessions & Filtering
+// Quản Lý Phiên Làm Việc (Work Sessions Tab)
 // -------------------------------------------------------------
+async function loadWorkSessionsTab() {
+  const container = document.getElementById('sessions-list-container');
+  if (!container) return;
+
+  container.innerHTML = '<div class="text-muted" style="padding:1.5rem; text-align:center;">Đang tải danh sách các phiên làm việc...</div>';
+  
+  const res = await apiGet('/api/antigravity/conversations');
+  if (!res || !res.conversations || res.conversations.length === 0) {
+    container.innerHTML = `
+      <div class="stream-empty-state" style="padding:2rem;">
+        <span class="empty-dot"></span>
+        <span class="empty-hint">Chưa có phiên làm việc nào được ghi nhận. Bấm "+ Tạo Phiên Chat Mới" để bắt đầu phiên đầu tiên.</span>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = '';
+  res.conversations.forEach(s => {
+    const isCurrent = s.id === state.selectedAgySession;
+    const card = document.createElement('div');
+    card.className = `session-row-card ${isCurrent ? 'active-session' : ''}`;
+    
+    let statusClass = 'badge-cyan';
+    let statusLabel = 'Đã Lưu';
+    if (s.status === 'running') {
+      statusClass = 'badge-amber';
+      statusLabel = 'Đang Chạy';
+    } else if (s.status === 'current') {
+      statusClass = 'badge-emerald';
+      statusLabel = 'Hiện Tại';
+    }
+
+    card.innerHTML = `
+      <div class="session-row-info">
+        <div class="session-icon-col">
+          <span class="bubble-avatar ${s.status === 'running' ? 'avatar-agent' : 'avatar-chatgpt'}" style="width:34px; height:34px; font-size:1rem;">
+            ${s.status === 'running' ? '⚡' : '💬'}
+          </span>
+        </div>
+        <div class="session-title-col">
+          <div class="session-row-title">${escapeHtml(s.title || 'Phiên Chat Antigravity')}</div>
+          <div class="session-row-meta">
+            <span class="meta-tag project-tag" title="Thư mục làm việc">📁 ${escapeHtml(s.workspace || state.selectedProject || 'Mặc định')}</span>
+            <span class="meta-tag time-tag">🕒 ${escapeHtml(s.relativeTime || '')}</span>
+            <span class="meta-tag id-tag">ID: <code>${escapeHtml(s.id.slice(0, 8))}...</code></span>
+            <span class="badge ${statusClass}">${statusLabel}</span>
+          </div>
+        </div>
+      </div>
+      <div class="session-row-actions">
+        <button class="btn btn-primary btn-sm btn-enter-session" data-id="${s.id}" data-title="${escapeHtml(s.title)}" data-ws="${escapeHtml(s.workspace || '')}">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+          <span>Vào Phiên</span>
+        </button>
+        <button class="btn btn-secondary btn-sm btn-delete-session btn-danger-subtle" data-id="${s.id}" title="Xoá lịch sử phiên này">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          <span>Xoá</span>
+        </button>
+      </div>
+    `;
+
+    // Click "Vào Phiên"
+    card.querySelector('.btn-enter-session').addEventListener('click', () => {
+      enterWorkSession(s);
+    });
+
+    // Click "Xoá"
+    card.querySelector('.btn-delete-session').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Bạn có chắc chắn muốn xoá phiên làm việc "${s.title}" (${s.id.slice(0,8)}) khỏi danh sách?`)) return;
+      await apiDelete(`/api/antigravity/sessions/${s.id}?projectId=${state.selectedProject || ''}`);
+      card.remove();
+      showToast(`Đã xoá phiên: ${s.title}!`, 'success');
+      loadAntigravitySessions(state.selectedProject);
+    });
+
+    container.appendChild(card);
+  });
+}
+
+function enterWorkSession(session) {
+  state.selectedAgySession = session.id;
+  
+  // If session workspace matches a project, switch to it
+  if (session.workspace) {
+    const matched = state.projects.find(p => 
+      p.id.toLowerCase() === session.workspace.toLowerCase() || 
+      p.name.toLowerCase() === session.workspace.toLowerCase()
+    );
+    if (matched && matched.id !== state.selectedProject) {
+      onProjectSelected(matched.id);
+    }
+  }
+
+  // Update top dropdown and label
+  const agySel = document.getElementById('global-antigravity-session-select');
+  if (agySel) agySel.value = session.id;
+  const dispSess = document.getElementById('disp-active-session');
+  if (dispSess) dispSess.textContent = session.title;
+
+  // Switch to Observer tab
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === 'observer'));
+  state.activeTab = 'observer';
+  switchMainView('observer');
+
+  if (state.selectedProject) {
+    loadExchangeStream(state.selectedProject);
+    pollAgentLiveSteps();
+  }
+  showToast(`Đã chuyển vào phiên: ${session.title}`, 'success');
+}
+
+// -------------------------------------------------------------
+// New Session Creation & Dynamic Title Synchronizer
+// -------------------------------------------------------------
+function handleNewSessionSelected() {
+  state.selectedAgySession = 'new';
+  state.lastKnownStepCount = 0;
+  
+  const agySel = document.getElementById('global-antigravity-session-select');
+  if (agySel) agySel.value = 'new';
+
+  const dispSess = document.getElementById('disp-active-session');
+  if (dispSess) dispSess.textContent = '✨ Phiên Chat Mới (Chờ nhận lệnh...)';
+
+  // Clear chat exchange container with clear empty card
+  const container = document.getElementById('exchange-stream-container');
+  if (container) {
+    container.innerHTML = `
+      <div class="stream-empty-state" id="stream-empty-state" style="padding: 2.5rem 1.5rem; text-align:center;">
+        <span class="empty-dot" style="background:#a855f7; box-shadow:0 0 12px #a855f7;"></span>
+        <h4 style="color:#e2e8f0; font-size:1.05rem; margin-bottom:0.4rem; font-weight:700;">✨ Phiên Chat Mới Sẵn Sàng</h4>
+        <p class="empty-hint" style="max-width:560px; margin:0 auto; line-height:1.5;">
+          Gõ yêu cầu / chỉ đạo vào khung chat bên dưới để gửi cho <strong>Kiến Trúc Sư ChatGPT Web</strong>. 
+          ChatGPT sẽ trực tiếp đọc cấu trúc dự án & tài liệu kỹ thuật trên máy local để giao việc cho Worker Gemini trong Antigravity IDE. 
+          Tên phiên chat sẽ được <strong>tự động đồng bộ</strong> khi Antigravity tiếp nhận lệnh!
+        </p>
+      </div>
+    `;
+  }
+
+  // Clear live steps
+  const stepsContainer = document.getElementById('agent-live-steps-container');
+  if (stepsContainer) {
+    stepsContainer.innerHTML = `
+      <div class="log-empty-state" id="log-empty-state">
+        <span>✨ Phiên mới sẵn sàng. Chờ bước thi công từ Agent...</span>
+      </div>
+    `;
+  }
+  const badgeSteps = document.getElementById('badge-live-steps-count');
+  if (badgeSteps) badgeSteps.textContent = '0 Bước';
+
+  // Stop any running observer
+  stopObservingAntigravity();
+  showToast('✨ Đã mở phiên chat mới. Hãy gửi lệnh đầu tiên!', 'success');
+}
+
+let sessionNameSyncInterval = null;
+
+function startSessionNameSyncPoller(startTime = Date.now()) {
+  if (sessionNameSyncInterval) clearInterval(sessionNameSyncInterval);
+  let pollAttempts = 0;
+  const maxAttempts = 35; // 35 * 2.5s = ~88 seconds
+
+  sessionNameSyncInterval = setInterval(async () => {
+    pollAttempts++;
+    if (pollAttempts > maxAttempts || (state.selectedAgySession !== 'new' && !state.selectedAgySession)) {
+      clearInterval(sessionNameSyncInterval);
+      sessionNameSyncInterval = null;
+      return;
+    }
+
+    try {
+      const res = await apiGet('/api/antigravity/conversations');
+      if (!res || !res.conversations || res.conversations.length === 0) return;
+
+      // Find the newest running or current conversation
+      const runningOrCurrent = res.conversations.find(c => c.status === 'running' || c.status === 'current') || res.conversations[0];
+
+      if (runningOrCurrent && runningOrCurrent.id && runningOrCurrent.id !== 'eb04834e-f388-4dd3-afd7-4001e7fa3da5') {
+        const title = runningOrCurrent.title;
+        if (title && !title.includes('(Chờ nhận lệnh)') && title !== 'Phiên Chat Mới') {
+          clearInterval(sessionNameSyncInterval);
+          sessionNameSyncInterval = null;
+
+          state.selectedAgySession = runningOrCurrent.id;
+
+          // Reload dropdown options and select this new session
+          await loadAntigravitySessions(state.selectedProject);
+          const agySel = document.getElementById('global-antigravity-session-select');
+          if (agySel) agySel.value = runningOrCurrent.id;
+
+          const dispSess = document.getElementById('disp-active-session');
+          if (dispSess) dispSess.textContent = title;
+
+          showToast(`✨ Đã đồng bộ tên phiên chat: "${title}"!`, 'success');
+          pollAgentLiveSteps();
+        }
+      }
+    } catch (e) {}
+  }, 2500);
+}
 async function loadSessions() {
   const query = new URLSearchParams();
   if (state.filters.role !== 'all') query.set('role', state.filters.role);
@@ -723,8 +1026,9 @@ async function loadSessions() {
   const bWorker = document.getElementById('badge-worker-count');
   if (bWorker) bWorker.textContent = workerCount;
 
-  // Render Table Rows
+  // Render Table Rows if element exists
   const tbody = document.getElementById('sessions-tbody');
+  if (!tbody) return;
   if (state.sessions.length === 0) {
     tbody.innerHTML = `<tr><td colspan="7" class="loading-cell">Không tìm thấy session nào phù hợp với bộ lọc.</td></tr>`;
     return;
@@ -1007,11 +1311,14 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSessions().catch(e => console.error('loadSessions error:', e));
   loadStatus().catch(e => console.error('loadStatus error:', e));
 
-  // Auto-polling every 3 seconds
+  // Auto-polling every 2.5 seconds
   setInterval(() => {
     loadSessions();
     loadStatus();
-  }, 3000);
+    if (state.activeTab === 'observer') {
+      pollAgentLiveSteps();
+    }
+  }, 2500);
 
   // Navigation Tabs
   document.querySelectorAll('.nav-item').forEach(item => {
@@ -1024,6 +1331,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (tab === 'settings') {
         switchMainView('settings');
         loadChatGPTConfigAndCodexModels();
+      } else if (tab === 'sessions') {
+        switchMainView('sessions');
+        loadWorkSessionsTab();
       } else {
         switchMainView(tab);
       }
@@ -1031,13 +1341,32 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  // Buttons inside Quản Lý Phiên Làm Việc view
+  const btnCreateSessionTab = document.getElementById('btn-create-session-tab');
+  if (btnCreateSessionTab) {
+    btnCreateSessionTab.addEventListener('click', () => {
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === 'observer'));
+      state.activeTab = 'observer';
+      switchMainView('observer');
+      handleNewSessionSelected();
+    });
+  }
+
+  const btnRefreshSessionsTab = document.getElementById('btn-refresh-sessions-tab');
+  if (btnRefreshSessionsTab) {
+    btnRefreshSessionsTab.addEventListener('click', () => {
+      loadWorkSessionsTab();
+      showToast('Đã làm mới danh sách phiên làm việc!');
+    });
+  }
+
   function switchMainView(viewId) {
     document.querySelectorAll('.tab-view').forEach(v => {
       v.classList.toggle('active', v.id === `view-${viewId}`);
     });
     const statsGrid = document.querySelector('.stats-grid');
     if (statsGrid) {
-      statsGrid.style.display = (viewId === 'observer' || viewId === 'settings') ? 'none' : 'grid';
+      statsGrid.style.display = (viewId === 'observer' || viewId === 'settings' || viewId === 'sessions') ? 'none' : 'grid';
     }
     const mainContent = document.querySelector('.main-content');
     if (mainContent) {
@@ -1670,10 +1999,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const globalAgySelect = document.getElementById('global-antigravity-session-select');
   if (globalAgySelect) {
     globalAgySelect.addEventListener('change', (e) => {
-      state.selectedAgySession = e.target.value;
-      const dispSess = document.getElementById('disp-active-session');
-      if (dispSess) {
-        dispSess.textContent = e.target.options[e.target.selectedIndex]?.text || e.target.value;
+      const val = e.target.value;
+      if (val === 'new') {
+        handleNewSessionSelected();
+      } else {
+        state.selectedAgySession = val;
+        const dispSess = document.getElementById('disp-active-session');
+        if (dispSess) {
+          dispSess.textContent = e.target.options[e.target.selectedIndex]?.text || e.target.value;
+        }
+        if (state.selectedProject) {
+          loadExchangeStream(state.selectedProject);
+        }
+        pollAgentLiveSteps();
       }
     });
   }
@@ -1803,18 +2141,74 @@ document.addEventListener('DOMContentLoaded', () => {
             state.isObserving = false;
             state.lastKnownStepCount = s.totalSteps;
 
-            if (statusText) statusText.textContent = '✅ Antigravity đã hoàn thành trên IDE! Đang tự động lấy Báo Cáo Cuối gửi ChatGPT Web audit...';
+            if (statusText) statusText.textContent = '✅ Antigravity đã hoàn thành trên IDE! Đang gửi báo cáo sang ChatGPT Web audit...';
             if (loopStatus) {
               loopStatus.textContent = 'Thẩm Định Báo Cáo';
               loopStatus.className = 'status-badge badge-cyan';
             }
             showToast('✅ Antigravity đã sửa code xong! Tự động gửi báo cáo sang ChatGPT Web audit...', 'success');
 
-            // Automatically trigger audit with latest worker report after 1.2s if closed loop is active
+            // Optimistic UI: Immediately render Gemini Report Bubble
+            const container = document.getElementById('exchange-stream-container');
+            const emptyState = document.getElementById('stream-empty-state');
+            if (emptyState) emptyState.classList.add('hidden');
+
+            const reportText = s.report || 'Antigravity Worker báo cáo hoàn thành nhiệm vụ theo yêu cầu.';
+            const timeStr = new Date().toLocaleTimeString();
+
+            if (container) {
+              const rowAgent = document.createElement('div');
+              rowAgent.className = 'chat-bubble-row row-agent exchange-turn';
+              rowAgent.innerHTML = `
+                <div class="chat-bubble bubble-agent">
+                  <div class="bubble-header">
+                    <div class="bubble-sender-group">
+                      <span class="bubble-avatar avatar-agent">⚡</span>
+                      <span class="bubble-name">Antigravity Agent</span>
+                      <span class="bubble-role role-worker">Worker</span>
+                    </div>
+                    <span class="bubble-time">${timeStr}</span>
+                  </div>
+                  <div class="bubble-body">
+                    <div class="chat-markdown-content">
+                      ${formatChatMarkdown(reportText)}
+                    </div>
+                  </div>
+                </div>
+              `;
+              container.appendChild(rowAgent);
+
+              // Optimistic UI: Immediately render ChatGPT Thinking Bubble
+              const thinkingRow = document.createElement('div');
+              thinkingRow.className = 'chat-bubble-row row-chatgpt exchange-turn';
+              thinkingRow.id = 'chatgpt-active-thinking-bubble';
+              thinkingRow.innerHTML = `
+                <div class="chat-bubble bubble-chatgpt bubble-thinking">
+                  <div class="bubble-header">
+                    <div class="bubble-header-left">
+                      <span class="bubble-time">Đang audit...</span>
+                    </div>
+                    <div class="bubble-sender-group">
+                      <span class="bubble-role role-architect">Architect</span>
+                      <span class="bubble-name">ChatGPT Web</span>
+                      <span class="bubble-avatar avatar-chatgpt">🧠</span>
+                    </div>
+                  </div>
+                  <div class="bubble-body">
+                    <div style="display:flex; align-items:center; gap:0.5rem; color:#c084fc; font-size:0.82rem; padding: 0.3rem 0;">
+                      <div class="thinking-dots"><span></span><span></span><span></span></div>
+                      <span>Đang thẩm định Báo Cáo Cuối & Handoff từ Worker để ra chỉ đạo tiếp theo...</span>
+                    </div>
+                  </div>
+                </div>
+              `;
+              container.appendChild(thinkingRow);
+              container.scrollTop = container.scrollHeight;
+            }
+
+            // Automatically trigger audit with latest worker report after 1.2s
             setTimeout(async () => {
-              if (state.isClosedLoopRunning === true) {
-                await triggerAuditAndDirect('');
-              }
+              await triggerAuditAndDirect('');
             }, 1200);
           }
         } else {
@@ -1910,6 +2304,10 @@ document.addEventListener('DOMContentLoaded', () => {
         mode: 'auto'
       });
 
+      // Remove active thinking bubble before rendering or reloading
+      const thinkEl = document.getElementById('chatgpt-active-thinking-bubble');
+      if (thinkEl) thinkEl.remove();
+
       if (res && res.error) {
         showToast(`Lỗi thẩm định: ${res.error}`, 'error');
         if (statusText) statusText.textContent = `Lỗi: ${res.error}`;
@@ -1951,6 +2349,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
     } catch (err) {
+      const thinkEl = document.getElementById('chatgpt-active-thinking-bubble');
+      if (thinkEl) thinkEl.remove();
       showToast(`Lỗi kết nối: ${err.message}`, 'error');
       if (statusText) statusText.textContent = 'Lỗi kết nối tới máy chủ.';
       stopClosedLoop();
@@ -2056,10 +2456,205 @@ document.addEventListener('DOMContentLoaded', () => {
   const chatTextarea = document.getElementById('chat-input-textarea');
   const btnChatSend = document.getElementById('btn-chat-send');
 
-  function handleSendChatMessage() {
+  async function handleSendChatMessage() {
     const text = chatTextarea ? chatTextarea.value.trim() : '';
+    if (!text) return;
     if (chatTextarea) chatTextarea.value = '';
-    triggerAuditAndDirect(text);
+
+    const projectId = state.selectedProject;
+    if (!projectId) {
+      showToast('Vui lòng chọn một dự án trước!', 'error');
+      return;
+    }
+
+    const container = document.getElementById('exchange-stream-container');
+    const emptyState = document.getElementById('stream-empty-state');
+    if (emptyState) emptyState.classList.add('hidden');
+
+    const timeStr = new Date().toLocaleTimeString();
+
+    // 1. Optimistic UI: Immediately render User Message Bubble
+    const userRow = document.createElement('div');
+    userRow.className = 'chat-bubble-row row-user exchange-turn';
+    userRow.innerHTML = `
+      <div class="chat-bubble bubble-user">
+        <div class="bubble-header">
+          <div class="bubble-sender-group">
+            <span class="bubble-avatar avatar-user">👤</span>
+            <span class="bubble-name">Chỉ Đạo Từ User</span>
+            <span class="bubble-role role-user">User Direct</span>
+          </div>
+          <span class="bubble-time">${timeStr}</span>
+        </div>
+        <div class="bubble-body">
+          <div class="chat-markdown-content">${formatChatMarkdown(text)}</div>
+        </div>
+      </div>
+    `;
+    if (container) {
+      container.appendChild(userRow);
+    }
+
+    // 2. Optimistic UI: Immediately render ChatGPT Thinking Bubble
+    const thinkingRow = document.createElement('div');
+    thinkingRow.className = 'chat-bubble-row row-chatgpt exchange-turn';
+    thinkingRow.id = 'chatgpt-active-thinking-bubble';
+    thinkingRow.innerHTML = `
+      <div class="chat-bubble bubble-chatgpt bubble-thinking">
+        <div class="bubble-header">
+          <div class="bubble-header-left">
+            <span class="bubble-time">Đang xử lý...</span>
+          </div>
+          <div class="bubble-sender-group">
+            <span class="bubble-role role-architect">Architect</span>
+            <span class="bubble-name">ChatGPT Web</span>
+            <span class="bubble-avatar avatar-chatgpt">🧠</span>
+          </div>
+        </div>
+        <div class="bubble-body">
+          <div style="display:flex; align-items:center; gap:0.5rem; color:#c084fc; font-size:0.82rem; padding: 0.3rem 0;">
+            <div class="thinking-dots"><span></span><span></span><span></span></div>
+            <span>Đang đọc cấu trúc dự án & file kỹ thuật local trên đĩa, suy luận chỉ đạo cho Antigravity...</span>
+          </div>
+        </div>
+      </div>
+    `;
+    if (container) {
+      container.appendChild(thinkingRow);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    const agySessionId = document.getElementById('global-antigravity-session-select')?.value || state.selectedAgySession || 'auto';
+    const chatgptModel = document.getElementById('select-codex-imported-models')?.value || document.getElementById('select-model-chatgpt')?.value || 'chatgpt-web/high';
+    const statusText = document.getElementById('chat-status-text');
+    const btnSend = document.getElementById('btn-chat-send');
+    if (btnSend) btnSend.disabled = true;
+    if (statusText) statusText.textContent = '🧠 ChatGPT Web đang thẩm định file local & lên kế hoạch chỉ đạo...';
+
+    // If starting from a new session, launch dynamic name synchronizer
+    const isNew = agySessionId === 'new' || state.selectedAgySession === 'new';
+    if (isNew) {
+      startSessionNameSyncPoller();
+    }
+
+    try {
+      const res = await apiPost('/api/orchestrator/user-directive', {
+        projectId,
+        antigravitySessionId: agySessionId,
+        userPrompt: text,
+        model: chatgptModel
+      });
+
+      // Remove thinking bubble
+      const thinkEl = document.getElementById('chatgpt-active-thinking-bubble');
+      if (thinkEl) thinkEl.remove();
+
+      if (res && res.error) {
+        showToast(`Lỗi ChatGPT: ${res.error}`, 'error');
+        if (statusText) statusText.textContent = `Lỗi: ${res.error}`;
+      } else {
+        showToast('✓ ChatGPT Web đã chỉ đạo và nạp lệnh vào Antigravity IDE!', 'success');
+        
+        // Append ChatGPT response bubble
+        const item = res.item || {};
+        const gptMsg = item.chatgptMessage || {};
+        const gptContent = gptMsg.content || '';
+        const directivePrompt = gptMsg.directivePrompt || '';
+        const verdict = gptMsg.verdict || 'CONTINUE_PHASE';
+
+        let verdictClass = 'verdict-badge-blue';
+        let verdictLabel = 'Đã Chỉ Đạo';
+        if (verdict === 'ROADMAP_COMPLETE') {
+          verdictClass = 'verdict-badge-green';
+          verdictLabel = '🎉 Hoàn Thành';
+        } else if (verdict === 'NEXT_PHASE') {
+          verdictClass = 'verdict-badge-green';
+          verdictLabel = '✅ Chuyển Phase';
+        } else if (verdict === 'FIX') {
+          verdictClass = 'verdict-badge-red';
+          verdictLabel = '⚠️ Sửa Lỗi';
+        }
+
+        const gptRow = document.createElement('div');
+        gptRow.className = 'chat-bubble-row row-chatgpt exchange-turn';
+        gptRow.innerHTML = `
+          <div class="chat-bubble bubble-chatgpt">
+            <div class="bubble-header">
+              <div class="bubble-header-left">
+                <span class="verdict-pill ${verdictClass}">${escapeHtml(verdictLabel)}</span>
+                <span class="bubble-time">${new Date().toLocaleTimeString()}</span>
+              </div>
+              <div class="bubble-sender-group">
+                <span class="bubble-role role-architect">Auditor</span>
+                <span class="bubble-name">ChatGPT Web</span>
+                <span class="bubble-avatar avatar-chatgpt">🧠</span>
+              </div>
+            </div>
+            <div class="bubble-body">
+              <div class="chat-markdown-content">
+                ${formatChatMarkdown(gptContent)}
+              </div>
+              ${directivePrompt ? `
+                <div class="bubble-directive-box">
+                  <div class="directive-box-header">
+                    <div class="directive-box-title">
+                      <span class="directive-icon">🎯</span>
+                      <strong>Chỉ Đạo Tiếp Theo:</strong>
+                    </div>
+                    <div class="directive-box-actions">
+                      <button class="btn btn-secondary btn-xs btn-copy-dir" title="Sao chép prompt">📋 Copy</button>
+                      <button class="btn btn-success btn-xs btn-dispatch-dir" title="Nạp trực tiếp vào khung chat Antigravity IDE">⚡ Nạp Vào IDE</button>
+                    </div>
+                  </div>
+                  <pre class="directive-content-code">${escapeHtml(directivePrompt)}</pre>
+                </div>` : ''}
+            </div>
+          </div>
+        `;
+
+        // Wire buttons inside gptRow
+        const copyBtn = gptRow.querySelector('.btn-copy-dir');
+        if (copyBtn) {
+          copyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(directivePrompt);
+            showToast('Đã sao chép prompt chỉ đạo!');
+          });
+        }
+        const dispatchBtn = gptRow.querySelector('.btn-dispatch-dir');
+        if (dispatchBtn) {
+          dispatchBtn.addEventListener('click', async () => {
+            await apiPost('/api/antigravity/dispatch', {
+              sessionId: state.selectedAgySession || 'auto',
+              prompt: directivePrompt,
+              projectId: state.selectedProject
+            });
+            showToast('⚡ Đã nạp lại chỉ đạo vào IDE!', 'success');
+            startObservingAntigravity(directivePrompt);
+          });
+        }
+
+        if (container) {
+          container.appendChild(gptRow);
+          container.scrollTop = container.scrollHeight;
+        }
+
+        if (res.targetSessionId && state.selectedAgySession === 'new') {
+          state.selectedAgySession = res.targetSessionId;
+        }
+
+        if (directivePrompt) {
+          state.lastDispatchedPrompt = directivePrompt;
+          startObservingAntigravity(directivePrompt, res.baselineStepCount);
+        }
+        pollAgentLiveSteps();
+      }
+    } catch (err) {
+      const thinkEl = document.getElementById('chatgpt-active-thinking-bubble');
+      if (thinkEl) thinkEl.remove();
+      showToast(`Lỗi kết nối: ${err.message}`, 'error');
+    } finally {
+      if (btnSend) btnSend.disabled = false;
+    }
   }
 
   if (btnChatSend) {

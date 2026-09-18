@@ -368,6 +368,86 @@ function extractWorkerReportOnly(text) {
 // -------------------------------------------------------------
 // Dynamic Antigravity Worker Session Resolution
 // -------------------------------------------------------------
+// Dynamic Antigravity Worker Session Resolution & Local Context
+// -------------------------------------------------------------
+function getProjectLocalContext(projectId) {
+  let projPath = null;
+  const projects = getUserProjects();
+  const found = projects.find(p => p.id === projectId || (p.name && p.name.toLowerCase() === (projectId || '').toLowerCase()));
+  if (found && found.path) projPath = found.path;
+
+  if (!projPath) {
+    if (projectId === 'calc-engine') projPath = path.join(__dirname, '..', 'calc-engine');
+    else if (projectId === 'ai-auto-video-creator') projPath = 'D:\\AI Auto Video Creator';
+    else if (projectId === 'ai_task_manager') projPath = 'D:\\TU_CODE\\AI_Task_Manager';
+    else if (projectId === 'ai_multi_task') projPath = 'D:\\TU_CODE\\AI_Multi_Task';
+    else projPath = path.join(__dirname, '..', projectId);
+  }
+
+  let fileTreeSummary = '';
+  let technicalContextSummary = '';
+
+  if (projPath && fs.existsSync(projPath)) {
+    // 1. Build local directory tree (top level and 2nd level)
+    try {
+      const entries = fs.readdirSync(projPath, { withFileTypes: true });
+      const treeItems = [];
+      for (const ent of entries) {
+        if (ent.name.startsWith('.') || ent.name === 'node_modules' || ent.name === '__pycache__' || ent.name === '.git') continue;
+        if (ent.isDirectory()) {
+          treeItems.push(`📁 ${ent.name}/`);
+          try {
+            const subEntries = fs.readdirSync(path.join(projPath, ent.name), { withFileTypes: true });
+            for (const sub of subEntries.slice(0, 15)) {
+              if (!sub.name.startsWith('.')) {
+                treeItems.push(`   └── ${sub.isDirectory() ? '📁 ' : '📄 '}${sub.name}`);
+              }
+            }
+          } catch (e) {}
+        } else {
+          treeItems.push(`📄 ${ent.name}`);
+        }
+      }
+      fileTreeSummary = treeItems.join('\n');
+    } catch (e) {}
+
+    // 2. Read technical documents from root and docs/ folders
+    const docFiles = [];
+    const searchDirs = [projPath, path.join(projPath, 'docs'), path.join(projPath, 'doc')];
+    const targetFileNames = [
+      'ROADMAP.md', '10_ROADMAP.md', '12_CURRENT_STATE.md', '00_PROJECT_CHARTER.md',
+      '01_SYSTEM_CONTEXT.md', '02_WORKFLOW.md', '03_ARCHITECTURE.md', '04_PROTOCOLS.md',
+      '05_STATE_MACHINE.md', '06_BRIDGE_CONTRACT.md', '07_AGENT_CONTRACT.md', '08_AUDIT_CONTRACT.md',
+      '09_TEST_PLAN.md', 'HANDOFF.md', 'README.md', 'spec.md', 'SPEC.md', 'AGENTS.md', 'package.json'
+    ];
+
+    for (const dir of searchDirs) {
+      if (!fs.existsSync(dir)) continue;
+      try {
+        const filesInDir = fs.readdirSync(dir);
+        for (const fn of filesInDir) {
+          if (targetFileNames.includes(fn) || targetFileNames.includes(fn.toUpperCase())) {
+            const fp = path.join(dir, fn);
+            try {
+              const relPath = path.relative(projPath, fp);
+              const content = fs.readFileSync(fp, 'utf8').slice(0, 4500);
+              docFiles.push(`#### [File: ${relPath}]\n${content}`);
+            } catch (e) {}
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (docFiles.length > 0) technicalContextSummary = docFiles.join('\n\n');
+  }
+
+  return {
+    projPath: projPath || 'Unknown path',
+    fileTreeSummary: fileTreeSummary || 'Không thể liệt kê thư mục dự án.',
+    technicalContextSummary: technicalContextSummary || 'Chưa tìm thấy tài liệu ROADMAP.md hoặc thư mục docs/ trên đĩa.'
+  };
+}
+
 function resolveAntigravitySession(sessionId, projectId) {
   // If explicitly given a valid UUID that is not the orchestrator
   if (sessionId && sessionId !== 'auto' && sessionId !== 'default' && sessionId !== 'new' && sessionId !== 'current') {
@@ -401,23 +481,44 @@ function resolveAntigravitySession(sessionId, projectId) {
 
   if (projectId) {
     const projects = getUserProjects();
-    const found = projects.find(p => p.id === projectId);
+    const found = projects.find(p => p.id === projectId || (p.name && p.name.toLowerCase() === projectId.toLowerCase()));
     const projName = (found ? found.name : projectId).toLowerCase();
     const cleanId = projectId.toLowerCase();
+    const projPath = found?.path ? found.path.toLowerCase() : '';
 
+    // Pass 1: scan deep in transcript for matching project name or path
     for (const cand of candidates) {
       try {
         const stat = fs.statSync(cand.path);
+        const readSize = Math.min(stat.size, 65536);
         const fd = fs.openSync(cand.path, 'r');
-        const buf = Buffer.alloc(Math.min(stat.size, 16384));
+        const buf = Buffer.alloc(readSize);
         fs.readSync(fd, buf, 0, buf.length, Math.max(0, stat.size - buf.length));
         fs.closeSync(fd);
         const text = buf.toString('utf8').toLowerCase();
-        if (text.includes(projName) || text.includes(cleanId)) {
+        if (text.includes(projName) || text.includes(cleanId) || (projPath && text.includes(projPath))) {
           return cand.cid;
         }
       } catch (e) {}
     }
+
+    // Pass 2: map known workspaces
+    const knownWorkspaceMap = {
+      '40caab22-8b6d-41c8-b7bc-cd41daa28b21': 'ai_task_manager',
+      '6d6845f5-7836-479a-bf37-a95f44eb417c': 'ai_task_manager',
+      'c4cbb9a8-4a91-44bc-a270-32a99cc13ac2': 'calc-engine',
+      '126614b2-2068-4c00-a35e-3d3d0958115d': 'ai_multi_task'
+    };
+    for (const cand of candidates) {
+      if (knownWorkspaceMap[cand.cid] === cleanId || knownWorkspaceMap[cand.cid] === projName) {
+        return cand.cid;
+      }
+    }
+
+    // NEVER return calc-engine when user chose another project!
+    // Return a new session ID for this project instead of cross-contaminating!
+    const crypto = require('crypto');
+    return crypto.randomUUID();
   }
 
   return candidates[0].cid;
@@ -662,13 +763,14 @@ app.get('/api/projects/:id/technical-context', async (req, res) => {
   const technicalFiles = [];
   const targetNames = [
     'ROADMAP.md', 'HANDOFF.md', 'README.md', 'spec.md', 'SPEC.md',
-    'architecture.md', 'ARCHITECTURE.md', 'TODO.md', 'package.json'
+    'architecture.md', 'ARCHITECTURE.md', 'TODO.md', 'package.json', 'AGENTS.md'
   ];
 
   if (fs.existsSync(projPath)) {
+    // 1. Root target files
     for (const fName of targetNames) {
       const fPath = path.join(projPath, fName);
-      if (fs.existsSync(fPath)) {
+      if (fs.existsSync(fPath) && fs.statSync(fPath).isFile()) {
         try {
           const content = fs.readFileSync(fPath, 'utf8');
           technicalFiles.push({
@@ -678,6 +780,31 @@ app.get('/api/projects/:id/technical-context', async (req, res) => {
             summary: content.slice(0, 400) + (content.length > 400 ? '...' : ''),
             content: content.slice(0, 15000)
           });
+        } catch (e) {}
+      }
+    }
+
+    // 2. Scan docs, documentation, specs subdirectories
+    for (const subDir of ['docs', 'documentation', 'specs']) {
+      const dirPath = path.join(projPath, subDir);
+      if (fs.existsSync(dirPath) && fs.statSync(dirPath).isDirectory()) {
+        try {
+          const subFiles = fs.readdirSync(dirPath);
+          for (const sf of subFiles) {
+            if (sf.toLowerCase().endsWith('.md')) {
+              const sfPath = path.join(dirPath, sf);
+              try {
+                const content = fs.readFileSync(sfPath, 'utf8');
+                technicalFiles.push({
+                  name: `${subDir}/${sf}`,
+                  path: sfPath,
+                  sizeBytes: Buffer.byteLength(content),
+                  summary: content.slice(0, 400) + (content.length > 400 ? '...' : ''),
+                  content: content.slice(0, 15000)
+                });
+              } catch (e) {}
+            }
+          }
         } catch (e) {}
       }
     }
@@ -1465,41 +1592,19 @@ app.post('/api/orchestrator/audit-and-direct', async (req, res) => {
 
   const targetModel = model || 'chatgpt-web/high';
 
-  // 2. Gather technical context / roadmap files
-  const rows = await querySqlite(`SELECT path, display_name FROM projects WHERE id = ?`, [projectId]);
-  let projPath = (rows && rows[0] && rows[0].path) ? rows[0].path : null;
-  if (!projPath) {
-    const userProjects = getUserProjects();
-    const found = userProjects.find(p => p.id === projectId);
-    projPath = found ? found.path : null;
-  }
-  if (!projPath) {
-    if (projectId === 'calc-engine') projPath = path.join(__dirname, '..', 'calc-engine');
-    else if (projectId === 'ai-auto-video-creator') projPath = 'D:\\AI Auto Video Creator';
-    else projPath = path.join(__dirname, '..', projectId);
-  }
-
-  let technicalContextSummary = 'No technical roadmap files found on disk.';
-  if (fs.existsSync(projPath)) {
-    const files = [];
-    for (const fn of ['ROADMAP.md', 'HANDOFF.md', 'README.md', 'spec.md', 'SPEC.md', 'package.json']) {
-      const p = path.join(projPath, fn);
-      if (fs.existsSync(p)) {
-        try {
-          files.push(`### File: ${fn}\n${fs.readFileSync(p, 'utf8').slice(0, 4000)}`);
-        } catch (e) {}
-      }
-    }
-    if (files.length > 0) technicalContextSummary = files.join('\n\n');
-  }
+  // 2. Gather local technical context and project structure from disk
+  const localContext = getProjectLocalContext(projectId);
 
   // 3. Prompt ChatGPT Web with strict Architect & Auditor persona
   const prompt = `You are the Senior Technical Architect, Lead Orchestrator & Independent Code Auditor.
+Project: ${projectId}
+Local Path: ${localContext.projPath}
+
 CRITICAL MANDATE: YOU MUST NOT GENERATE CODE IMPLEMENTATIONS OR REPLACEMENT FILES.
 All coding execution is strictly delegated to the Google Antigravity Worker in the Antigravity IDE.
 
 YOUR TASKS:
-1. Review Antigravity's latest Worker Report, commands executed, and modified files against the Project Roadmap & Technical Specifications below.
+1. Review Antigravity's latest Worker Report, commands executed, and modified files against the Local Project Structure & Technical Roadmap below.
 2. Provide an independent technical critique and code audit in Vietnamese (Markdown formatted).
    - Evaluate what was verified, what passed, and whether any risks/blockers remain.
    - Specify whether the current phase is approved to advance to the next roadmap milestone.
@@ -1507,8 +1612,11 @@ YOUR TASKS:
 ### 🎯 CHỈ ĐẠO TIẾP THEO CHO ANTIGRAVITY:
 [Write the exact, step-by-step directive prompt for Antigravity IDE to execute next without ambiguity]
 
-=== PROJECT TECHNICAL ROADMAP & SPECIFICATIONS ===
-${technicalContextSummary}
+=== LOCAL PROJECT DIRECTORY STRUCTURE ===
+${localContext.fileTreeSummary}
+
+=== LOCAL TECHNICAL ROADMAP & SPECIFICATIONS (FROM DISK) ===
+${localContext.technicalContextSummary}
 
 === ANTIGRAVITY WORKER LATEST REPORT & ACTIONS ===
 Session: ${antigravitySessionId || 'antigravity-active'}
@@ -1590,7 +1698,7 @@ ${effectiveReportText}
   const targetAgySession = resolveAntigravitySession(antigravitySessionId, projectId);
   const baselineStepCount = getSessionStepCount(targetAgySession);
 
-  // 5. Auto-dispatch directive prompt into Antigravity IDE (Visible delivery into Chat + AO sync)
+  // 5. Auto-dispatch directive prompt into Antigravity IDE (Visible delivery into Chat)
   if (nextDirectivePrompt) {
     const dispRes = await dispatchPromptToAntigravity(nextDirectivePrompt, projectId, targetAgySession);
     exchangeItem.dispatched = dispRes.dispatched;
@@ -1612,6 +1720,194 @@ ${effectiveReportText}
     baselineStepCount,
     rawOutput: out.stdout
   });
+});
+
+// Endpoint: User manual directive to ChatGPT Web (Senior Architect)
+app.post('/api/orchestrator/user-directive', async (req, res) => {
+  const { projectId, antigravitySessionId, userPrompt, model } = req.body;
+  if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+  if (!userPrompt || !userPrompt.trim()) return res.status(400).json({ error: 'userPrompt is required' });
+
+  const targetModel = model || 'chatgpt-web/high';
+  const targetAgySession = resolveAntigravitySession(antigravitySessionId, projectId);
+  const baselineStepCount = getSessionStepCount(targetAgySession);
+
+  // Gather local project structure & documents directly from disk
+  const localContext = getProjectLocalContext(projectId);
+
+  const prompt = `You are the Senior Technical Architect & Lead Orchestrator for the local software project on this machine.
+Project: ${projectId}
+Local Directory Path: ${localContext.projPath}
+
+CRITICAL MANDATE:
+- All actual code implementation and editing is strictly delegated to the Google Antigravity Worker (Gemini) in the Antigravity IDE.
+- Your role is to understand the local project requirements and architecture, audit the code, and give clear, step-by-step directives to the Antigravity Worker.
+- Do NOT generate full replacement source files. Provide architectural guidance and concrete directives.
+
+=== LOCAL PROJECT DIRECTORY STRUCTURE ===
+${localContext.fileTreeSummary}
+
+=== LOCAL TECHNICAL SPECIFICATIONS & ROADMAP (FROM DISK) ===
+${localContext.technicalContextSummary}
+
+=== USER DIRECTIVE / REQUEST TO ARCHITECT ===
+${userPrompt.trim()}
+
+YOUR TASKS:
+1. Analyze the user's directive against the local project architecture and roadmap.
+2. Provide your architectural evaluation in Vietnamese (Markdown formatted).
+3. Conclude with an explicit, actionable task for the Antigravity Worker in the IDE under the heading:
+### 🎯 CHỈ ĐẠO TIẾP THEO CHO ANTIGRAVITY:
+[Write the exact, step-by-step directive prompt for Antigravity IDE to execute next without ambiguity]
+`;
+
+  const out = await runCodexWithPrompt(targetModel, prompt, 120000);
+  const rawResponse = (out.stdout || '').trim();
+
+  if (!rawResponse) {
+    return res.status(500).json({
+      error: out.stderr || 'ChatGPT Web không phản hồi hoặc phiên kết nối bị gián đoạn. Vui lòng kiểm tra lại tab Cấu Hình.'
+    });
+  }
+
+  // Extract directive prompt
+  let nextDirectivePrompt = '';
+  const directiveMarker = rawResponse.match(/###\s*🎯?\s*CHỈ ĐẠO TIẾP THEO CHO ANTIGRAVITY:?([\s\S]*)/i)
+    || rawResponse.match(/###\s*Next Directive:?([\s\S]*)/i);
+  if (directiveMarker && directiveMarker[1]) {
+    nextDirectivePrompt = directiveMarker[1].trim();
+  } else {
+    const paragraphs = rawResponse.split('\n\n').filter(p => p.trim());
+    nextDirectivePrompt = paragraphs[paragraphs.length - 1] || rawResponse;
+  }
+
+  // Determine verdict
+  let verdict = 'CONTINUE_PHASE';
+  const lowerResp = rawResponse.toLowerCase();
+  if (lowerResp.includes('roadmap hoàn thành') || lowerResp.includes('roadmap_complete') || lowerResp.includes('hoàn thành toàn bộ')) {
+    verdict = 'ROADMAP_COMPLETE';
+  } else if (lowerResp.includes('lỗi') || lowerResp.includes('thất bại') || lowerResp.includes('sửa') || lowerResp.includes('verdict: fix')) {
+    verdict = 'FIX';
+  } else if (lowerResp.includes('chuyển sang giai đoạn') || lowerResp.includes('next phase') || lowerResp.includes('hoàn thành giai đoạn')) {
+    verdict = 'NEXT_PHASE';
+  }
+
+  const exchangeItem = {
+    id: `ex-${Date.now()}`,
+    projectId,
+    antigravitySessionId: targetAgySession || 'default',
+    timestamp: new Date().toISOString(),
+    userMessage: {
+      role: 'user',
+      content: userPrompt.trim(),
+      timestamp: new Date().toISOString()
+    },
+    chatgptMessage: {
+      role: 'chatgpt',
+      content: rawResponse,
+      directivePrompt: nextDirectivePrompt,
+      verdict,
+      model: targetModel,
+      timestamp: new Date().toISOString()
+    },
+    dispatched: false
+  };
+
+  // Dispatch into Antigravity IDE
+  if (nextDirectivePrompt) {
+    const dispRes = await dispatchPromptToAntigravity(nextDirectivePrompt, projectId, targetAgySession);
+    exchangeItem.dispatched = dispRes.dispatched;
+    exchangeItem.sentToWindow = dispRes.sentToWindow;
+    exchangeItem.dispatchTarget = dispRes.targetWindow || dispRes.targetSession;
+    exchangeItem.dispatchMethod = dispRes.method || (dispRes.sentToWindow ? 'antigravity_ide_chat' : 'ao_background_send');
+    exchangeItem.dispatchMessage = dispRes.message;
+  }
+
+  if (!exchangeHistory[projectId]) exchangeHistory[projectId] = [];
+  exchangeHistory[projectId].unshift(exchangeItem);
+  saveExchangeHistory(exchangeHistory);
+
+  res.json({
+    item: exchangeItem,
+    targetSessionId: targetAgySession,
+    baselineStepCount,
+    rawOutput: out.stdout
+  });
+});
+
+// Endpoint: Real-time steps probe for Live Agent Interaction Log
+app.get('/api/antigravity/session-steps/:sessionId', (req, res) => {
+  const sessionId = req.params.sessionId;
+  const projectId = req.query.projectId;
+  const targetSessionId = resolveAntigravitySession(sessionId, projectId);
+  if (!targetSessionId) return res.json({ steps: [] });
+
+  const logDir = path.join('C:\\Users\\Admin\\.gemini\\antigravity-ide\\brain', targetSessionId, '.system_generated', 'logs');
+  let transcriptPath = path.join(logDir, 'transcript.jsonl');
+  if (!fs.existsSync(transcriptPath)) transcriptPath = path.join(logDir, 'transcript_full.jsonl');
+  if (!fs.existsSync(transcriptPath)) return res.json({ steps: [] });
+
+  try {
+    const rawLines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
+    const steps = [];
+    const maxSteps = 40;
+    const startIndex = Math.max(0, rawLines.length - maxSteps);
+
+    for (let i = startIndex; i < rawLines.length; i++) {
+      try {
+        const item = JSON.parse(rawLines[i]);
+        let summary = '';
+        let role = item.source === 'USER_EXPLICIT' ? 'user' : (item.type === 'RUN_COMMAND' ? 'system' : 'antigravity');
+        let details = '';
+
+        if (item.type === 'USER_INPUT') {
+          summary = 'Tiếp nhận chỉ đạo / prompt vào IDE';
+          details = (item.content || '').replace(/<[^>]+>/g, '').trim().slice(0, 160);
+        } else if (item.type === 'PLANNER_RESPONSE' || item.type === 'MODEL') {
+          if (Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
+            const tc = item.tool_calls[0];
+            summary = `Gọi công cụ thi công: ${tc.name}`;
+            details = JSON.stringify(tc.args || {}).slice(0, 160);
+          } else {
+            summary = item.status === 'DONE' ? 'Hoàn tất turn & Xuất Báo Cáo' : 'Lập kế hoạch thi công';
+            details = (item.content || '').trim().slice(0, 160);
+          }
+        } else if (item.type === 'RUN_COMMAND') {
+          summary = `Thực thi lệnh terminal (Exit: ${item.exit_code ?? 0})`;
+          details = (item.content || '').slice(0, 160);
+        }
+
+        steps.push({
+          stepIndex: item.step_index ?? i,
+          timestamp: item.created_at || new Date().toISOString(),
+          type: item.type,
+          role,
+          status: item.status || 'DONE',
+          summary,
+          details
+        });
+      } catch (e) {}
+    }
+
+    res.json({ success: true, sessionId: targetSessionId, totalSteps: rawLines.length, steps });
+  } catch (e) {
+    res.json({ steps: [] });
+  }
+});
+
+// Endpoint: Delete Session & Exchange History
+app.delete('/api/antigravity/sessions/:id', (req, res) => {
+  const sessId = req.params.id;
+  const projectId = req.query.projectId;
+
+  if (projectId && exchangeHistory[projectId]) {
+    exchangeHistory[projectId] = exchangeHistory[projectId].filter(
+      item => item.antigravitySessionId !== sessId && item.id !== sessId
+    );
+    saveExchangeHistory(exchangeHistory);
+  }
+
+  res.json({ success: true, message: `Đã xoá phiên ${sessId}` });
 });
 
 app.get('/api/orchestrator/exchange-stream/:projectId', (req, res) => {
