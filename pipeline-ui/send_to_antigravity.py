@@ -3,11 +3,25 @@ import json
 import os
 import subprocess
 import time
+import re
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
+
+def normalize_project_keyword(project_keyword):
+    """
+    Deterministic normalization for project keywords:
+    - Input: string (e.g. 'AI_Multi_Task', 'Hello World', 'ABC!@#XYZ', 'foo-bar')
+    - Lowercase
+    - Replace any character not in [a-z0-9_-] with '_'
+    - Fallback for empty or invalid input: 'ai_multi_task'
+    """
+    if not project_keyword or not isinstance(project_keyword, str) or not project_keyword.strip():
+        return "ai_multi_task"
+    cleaned = re.sub(r'[^a-z0-9_-]', '_', project_keyword.lower().strip())
+    return cleaned if cleaned else "ai_multi_task"
 
 LOCK_FILE = os.path.join(os.path.dirname(__file__), '.dispatch.lock')
 
@@ -58,8 +72,8 @@ def dispatch_prompt_to_antigravity_bg(prompt_text, project_keyword="AI_Multi_Tas
 
     try:
         # Determine target session (default: ai_multi_task-1)
-        clean_proj = project_keyword.lower().replace(/[^a-z0-9_-]/, '_') if hasattr(project_keyword, 'replace') else 'ai_multi_task'
-        target_session = f"{clean_proj}-1" if clean_proj else "ai_multi_task-1"
+        clean_proj = normalize_project_keyword(project_keyword)
+        target_session = f"{clean_proj}-1"
 
         CREATE_NO_WINDOW = 0x08000000
         cmd = ["ao.exe", "send", "--session", target_session, "--message", prompt_text]

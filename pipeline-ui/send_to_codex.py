@@ -134,7 +134,10 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
     """
     result = {
         "success": False,
+        "queued": False,
         "verified": False,
+        "turn_started": False,
+        "turn_id": None,
         "busy": False,
         "worker": "codex_extension",
         "method": "codex_background_queue",
@@ -170,6 +173,14 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
         baseline_turn_id = get_last_completed_turn_id(rollout_file)
         result["baseline_turn_id"] = baseline_turn_id
 
+        # Record baseline line count before dispatch to ensure new task_started is strictly post-dispatch
+        baseline_line_count = 0
+        try:
+            with open(rollout_file, 'r', encoding='utf-8', errors='ignore') as fp:
+                baseline_line_count = sum(1 for _ in fp)
+        except Exception:
+            baseline_line_count = 0
+
         # 3. Pure Background IPC: Send prompt via codex queue
         CREATE_NO_WINDOW = 0x08000000
         cmd = ["codex", "queue", "--thread", session_id, "--message", prompt_text]
@@ -185,14 +196,26 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
         )
 
         if proc.returncode != 0:
+            result["queued"] = False
+            result["success"] = False
+            result["verified"] = False
+            result["turn_started"] = False
+            result["turn_id"] = None
             result["error"] = f"Lỗi codex queue (exit code {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
             return result
 
         # 4. Post-flight Verification: Verify message was queued
         queue_output = proc.stdout.strip()
         if "Queued message" not in queue_output and "for thread" not in queue_output:
+            result["queued"] = False
+            result["success"] = False
+            result["verified"] = False
+            result["turn_started"] = False
+            result["turn_id"] = None
             result["error"] = f"Không nhận được tín hiệu xác thực hàng đợi: {queue_output}"
             return result
+
+        result["queued"] = True
 
         # 5. Verify turn activation in rollout (wait up to 2.5 seconds for task_started)
         turn_started = False
@@ -202,15 +225,17 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
         while time.time() - verify_start < 2.5:
             try:
                 with open(rollout_file, 'r', encoding='utf-8', errors='ignore') as fp:
-                    last_lines = fp.readlines()[-15:]
-                for line in reversed(last_lines):
+                    all_lines = fp.readlines()
+                new_lines = all_lines[baseline_line_count:] if len(all_lines) >= baseline_line_count else all_lines
+                for line in reversed(new_lines):
                     try:
                         data = json.loads(line)
                         t = data.get('type')
                         p = data.get('payload', {})
                         if t == 'event_msg' and isinstance(p, dict) and p.get('type') == 'task_started':
-                            new_turn_id = p.get('turn_id')
-                            if new_turn_id and new_turn_id != baseline_turn_id:
+                            observed_tid = p.get('turn_id')
+                            if observed_tid and observed_tid != baseline_turn_id:
+                                new_turn_id = observed_tid
                                 turn_started = True
                                 break
                     except Exception:
@@ -221,10 +246,19 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
                 pass
             time.sleep(0.15)
 
-        result["success"] = True
-        result["verified"] = True
-        result["turn_id"] = new_turn_id
-        result["message"] = f"Đã nạp chỉ đạo vào phiên Codex [{session_id[:8]}] ngầm thành công (xác thực: task_started)!"
+        if turn_started and new_turn_id:
+            result["success"] = True
+            result["verified"] = True
+            result["turn_started"] = True
+            result["turn_id"] = new_turn_id
+            result["message"] = f"Đã nạp chỉ đạo vào phiên Codex [{session_id[:8]}] ngầm thành công (xác thực: task_started turn '{new_turn_id}')!"
+        else:
+            result["success"] = True
+            result["verified"] = False
+            result["turn_started"] = False
+            result["turn_id"] = None
+            result["message"] = f"Lệnh đã nạp vào hàng đợi Codex [{session_id[:8]}] nhưng chưa quan sát thấy task_started trong cửa sổ theo dõi"
+
         return result
 
     except subprocess.TimeoutExpired:

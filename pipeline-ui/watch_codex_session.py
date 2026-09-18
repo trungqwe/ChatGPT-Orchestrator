@@ -212,16 +212,26 @@ def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline
         except Exception:
             pass
 
-    # Timeout reached: fallback to latest report if available
-    fallback = extract_latest_codex_report(project_keyword)
-    if fallback.get("success"):
-        fallback["timeout_warning"] = True
-        fallback["elapsed_secs"] = round(time.time() - start_time, 2)
-        return fallback
+    # Timeout reached: DO NOT return stale report as success (Fix F-03 / NT-003)
+    diag = extract_latest_codex_report(project_keyword)
+    diag_report = None
+    if diag.get("success"):
+        diag_report = {
+            "turn_id": diag.get("turn_id"),
+            "report_text": diag.get("report_text"),
+            "session_id": diag.get("session_id")
+        }
 
     return {
         "success": False,
-        "error": f"Hết thời gian chờ ({timeout_secs}s) sự kiện 'task_complete' từ Codex"
+        "verified": False,
+        "target_turn_id": target_turn_id,
+        "turn_id": None,
+        "timed_out": True,
+        "report_text": None,
+        "error": f"Hết thời gian chờ ({timeout_secs}s) sự kiện 'task_complete' cho turn '{target_turn_id or 'unknown'}'",
+        "elapsed_secs": round(time.time() - start_time, 2),
+        "diagnostic_latest_report": diag_report
     }
 
 if __name__ == "__main__":

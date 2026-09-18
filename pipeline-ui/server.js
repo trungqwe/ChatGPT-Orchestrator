@@ -61,8 +61,10 @@ const lastDispatchedCodexTurn = {};
 async function dispatchPromptToCodex(prompt, projectId) {
   const result = {
     dispatched: false,
+    queued: false,
     sentToWindow: false,
     verified: false,
+    turn_started: false,
     busy: false,
     method: 'codex_background_queue',
     message: '',
@@ -83,25 +85,38 @@ async function dispatchPromptToCodex(prompt, projectId) {
         try {
           resolve(JSON.parse((stdout || '').trim()));
         } catch (e) {
-          resolve({ success: false, error: err ? err.message : stderr });
+          resolve({ success: false, queued: false, verified: false, turn_started: false, error: err ? err.message : stderr });
         }
       });
     });
 
-    if (pyOut && pyOut.success) {
+    if (pyOut && (pyOut.queued || pyOut.success)) {
       result.dispatched = true;
-      result.verified = pyOut.verified;
+      result.queued = !!pyOut.queued;
       result.targetWindow = pyOut.target_window;
-      result.targetTurnId = pyOut.turn_id;
       result.baselineTurnId = pyOut.baseline_turn_id;
       result.method = pyOut.method || 'codex_background_queue';
-      result.message = pyOut.message || `Đã nạp chỉ đạo vào phiên Codex ngầm (${pyOut.target_window})!`;
-      lastDispatchedCodexTurn[proj] = {
-        targetTurnId: pyOut.turn_id,
-        baselineTurnId: pyOut.baseline_turn_id,
-        timestamp: Date.now()
-      };
-      console.log(`[CODEX BG DISPATCH SUCCESS] ${pyOut.target_window} turn=${pyOut.turn_id}`);
+
+      // Distinguish queued from verified
+      const isTurnVerified = !!(pyOut.verified && pyOut.turn_started && pyOut.turn_id);
+      result.verified = isTurnVerified;
+      result.turn_started = isTurnVerified;
+      result.targetTurnId = isTurnVerified ? pyOut.turn_id : null;
+
+      if (isTurnVerified) {
+        result.message = pyOut.message || `Đã nạp chỉ đạo vào phiên Codex ngầm (${pyOut.target_window}) và xác thực turn ${pyOut.turn_id}!`;
+        lastDispatchedCodexTurn[proj] = {
+          targetTurnId: pyOut.turn_id,
+          baselineTurnId: pyOut.baseline_turn_id,
+          timestamp: Date.now()
+        };
+        console.log(`[CODEX BG DISPATCH VERIFIED] ${pyOut.target_window} turn=${pyOut.turn_id}`);
+      } else {
+        // Clear any stale tracking to guarantee we NEVER watch an unverified turn
+        delete lastDispatchedCodexTurn[proj];
+        result.message = pyOut.message || `Lệnh đã nạp vào hàng đợi Codex (${pyOut.target_window}) nhưng chưa xác thực được task_started`;
+        console.warn(`[CODEX BG DISPATCH UNVERIFIED] ${pyOut.target_window} queued=true but task_started not observed`);
+      }
       return result;
     } else {
       result.busy = pyOut?.busy || false;
@@ -119,24 +134,39 @@ async function dispatchPromptToCodex(prompt, projectId) {
 // Helper: Wait for Codex Extension turn completion via watch_codex_session.py
 function waitCodexReport(projectId = 'AI_Multi_Task', timeoutSecs = 180, targetTurnId = null) {
   return new Promise((resolve) => {
-    const pyScript = path.join(__dirname, 'watch_codex_session.py');
-    let pyCmd = `python "${pyScript}" --project "${projectId}" --timeout ${timeoutSecs}`;
     const tracked = lastDispatchedCodexTurn[projectId];
     const effectiveTargetTurn = targetTurnId || tracked?.targetTurnId;
-    const effectiveBaseline = tracked?.baselineTurnId;
 
-    if (effectiveTargetTurn) {
-      pyCmd += ` --target-turn "${effectiveTargetTurn}"`;
-    } else if (effectiveBaseline) {
-      pyCmd += ` --baseline-turn "${effectiveBaseline}"`;
+    // Reject waiting without verified target turn ID to prevent stale report attribution
+    if (!effectiveTargetTurn) {
+      return resolve({
+        success: false,
+        verified: false,
+        target_turn_id: null,
+        turn_id: null,
+        timed_out: false,
+        report_text: null,
+        error: 'Cannot wait for Codex report: missing verified target_turn_id (dispatch was not verified or target turn missing)'
+      });
     }
+
+    const pyScript = path.join(__dirname, 'watch_codex_session.py');
+    const pyCmd = `python "${pyScript}" --project "${projectId}" --timeout ${timeoutSecs} --target-turn "${effectiveTargetTurn}"`;
 
     exec(pyCmd, { timeout: (timeoutSecs + 10) * 1000 }, (err, stdout, stderr) => {
       try {
         const out = JSON.parse((stdout || '').trim());
         resolve(out);
       } catch (e) {
-        resolve({ success: false, error: err ? err.message : stderr });
+        resolve({
+          success: false,
+          verified: false,
+          target_turn_id: effectiveTargetTurn,
+          turn_id: null,
+          timed_out: false,
+          report_text: null,
+          error: err ? err.message : stderr
+        });
       }
     });
   });

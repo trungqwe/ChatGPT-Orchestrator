@@ -1,0 +1,723 @@
+/**
+ * Regression & Characterization Test Suite for ChatGPT-Orchestrator Refactor v2
+ * WorkOrder: WO-REFACTOR-002 (WP-01)
+ * Baseline Commit: 8b27a567cc7b058c0782e0370dcc295e1a304a79
+ *
+ * PURPOSE:
+ * 1. Verify that WP-01 fixes for F-01, F-02, F-03 (and NT-001..004) enforce safe invariants.
+ * 2. Verify that F-06, F-10, F-12 defects remain present (deferred to later WPs).
+ *
+ * INVARIANTS ENFORCED:
+ * - Queue Accepted != Turn Observed != Turn Completed != Successful Report
+ * - Exact turn provenance: Turn B results must belong only to Turn B
+ */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const http = require('http');
+const assert = require('node:assert');
+const { spawnSync } = require('child_process');
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
+const PIPELINE_UI_DIR = path.resolve(REPO_ROOT, 'pipeline-ui');
+
+// Track results for final summary
+const results = [];
+
+function recordResult(id, name, status, details) {
+  results.push({
+    id,
+    name,
+    status, // 'INVARIANT_ENFORCED' or 'DEFECT_REPRODUCED'
+    queueAccepted: details.queueAccepted ?? 'N/A',
+    turnStarted: details.turnStarted ?? 'N/A',
+    turnCompleted: details.turnCompleted ?? 'N/A',
+    reportTargetMatch: details.reportTargetMatch ?? 'N/A',
+    observed: details.observed,
+    desiredSafe: details.desiredSafe,
+    testFile: path.relative(REPO_ROOT, details.testFile || __filename)
+  });
+}
+
+// Helper to compile a deterministic mock codex.exe on Windows using built-in csc.exe
+function compileMockCodexExe(targetExePath, defaultOutputMessage) {
+  const csCode = [
+    'using System;',
+    'using System.IO;',
+    'class P {',
+    '  static void Main(string[] args) {',
+    `    Console.WriteLine(@"${defaultOutputMessage.replace(/"/g, '""')}");`,
+    '    string rf = Environment.GetEnvironmentVariable("MOCK_ROLLOUT_FILE");',
+    '    string turn = Environment.GetEnvironmentVariable("MOCK_TASK_STARTED_TURN");',
+    '    if (!string.IsNullOrEmpty(rf) && !string.IsNullOrEmpty(turn) && File.Exists(rf)) {',
+    '      string line = "{\\"type\\":\\"event_msg\\",\\"payload\\":{\\"type\\":\\"task_started\\",\\"turn_id\\":\\"" + turn + "\\"}}";',
+    '      File.AppendAllText(rf, line + Environment.NewLine);',
+    '    }',
+    '  }',
+    '}'
+  ].join('\r\n');
+
+  const csFile = targetExePath.replace(/\.exe$/i, '.cs');
+  fs.writeFileSync(csFile, csCode, 'utf8');
+  const cscPath = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe';
+  const res = spawnSync(cscPath, ['/nologo', `/out:${targetExePath}`, csFile], { encoding: 'utf8' });
+  try { fs.unlinkSync(csFile); } catch (e) {}
+
+  if (res.status !== 0 || !fs.existsSync(targetExePath)) {
+    throw new Error(`Failed to compile mock codex.exe: ${res.stderr || res.stdout}`);
+  }
+}
+
+// --------------------------------------------------------------------------
+// F-01: Antigravity Python Syntax & Project Normalization (WP-01)
+// --------------------------------------------------------------------------
+function testF01_AntigravityPythonSyntax() {
+  console.log('\n[F-01] Testing send_to_antigravity.py syntax compilation & normalization...');
+  const pyScript = path.join(PIPELINE_UI_DIR, 'send_to_antigravity.py');
+  assert.ok(fs.existsSync(pyScript), 'send_to_antigravity.py must exist');
+
+  // 1. py_compile must exit with code 0 (no SyntaxError)
+  const compileProc = spawnSync('python', ['-m', 'py_compile', pyScript], {
+    cwd: REPO_ROOT,
+    timeout: 10000,
+    encoding: 'utf-8'
+  });
+
+  const compileOutput = (compileProc.stderr || '') + (compileProc.stdout || '');
+  assert.strictEqual(compileProc.status, 0, `py_compile must exit 0: ${compileOutput}`);
+  assert.ok(!compileOutput.includes('SyntaxError'), 'send_to_antigravity.py must not contain SyntaxError');
+
+  // 2. Test deterministic normalization cases
+  const normTestScript = `
+import json, sys
+from send_to_antigravity import normalize_project_keyword
+test_cases = [
+    ("AI_Multi_Task", "ai_multi_task"),
+    ("Hello World", "hello_world"),
+    ("ABC!@#XYZ", "abc___xyz"),
+    ("foo-bar", "foo-bar"),
+    ("", "ai_multi_task"),
+    (None, "ai_multi_task")
+]
+results = {}
+for inp, expected in test_cases:
+    actual = normalize_project_keyword(inp)
+    assert actual == expected, f"Expected {expected}, got {actual} for input {inp}"
+    results[str(inp)] = actual
+print(json.dumps({"passed": True, "cases": results}))
+`;
+
+  const normProc = spawnSync('python', ['-c', normTestScript], {
+    cwd: PIPELINE_UI_DIR,
+    timeout: 10000,
+    encoding: 'utf-8'
+  });
+
+  assert.strictEqual(normProc.status, 0, `Normalization test script failed: ${normProc.stderr}`);
+  const normOut = JSON.parse(normProc.stdout.trim());
+  assert.strictEqual(normOut.passed, true, 'All normalization cases must pass');
+
+  console.log('✓ F-01 ENFORCED: send_to_antigravity.py compiles cleanly (exit 0) and normalizes project keywords deterministically.');
+  recordResult('F-01', 'Antigravity Python Syntax & Normalization', 'INVARIANT_ENFORCED', {
+    queueAccepted: 'YES',
+    turnStarted: 'N/A',
+    turnCompleted: 'N/A',
+    reportTargetMatch: 'N/A',
+    observed: 'py_compile exits 0; all normalization test cases match expected contract',
+    desiredSafe: 'py_compile exits 0 with valid Python syntax and deterministic normalization',
+    testFile: __filename
+  });
+}
+
+// --------------------------------------------------------------------------
+// F-02 / NT-001 / NT-002: Codex Dispatch State Model (WP-01)
+// --------------------------------------------------------------------------
+function testF02_CodexDispatchStateModel() {
+  console.log('\n[F-02 / NT-001 / NT-002] Testing send_to_codex.py dispatch verification contract...');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch_f02_'));
+
+  try {
+    const mockCodexExe = path.join(tmpDir, 'codex.exe');
+    compileMockCodexExe(mockCodexExe, 'Queued message msg_test for thread 01a0b53f');
+
+    const today = new Date();
+    const year = today.getFullYear().toString();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const day = String(today.getDate()).padStart(2, '0');
+    const sessDir = path.join(tmpDir, '.codex', 'sessions', year, month, day);
+    fs.mkdirSync(sessDir, { recursive: true });
+
+    const rolloutFile = path.join(sessDir, 'rollout-2026-09-19T00-00-00-01a0b53f.jsonl');
+    const scriptPath = path.join(PIPELINE_UI_DIR, 'send_to_codex.py');
+    const cleanPath = (process.env.PATH || '')
+      .split(path.delimiter)
+      .filter((p) => !p.includes('OpenAI') || !p.includes('Codex'))
+      .join(path.delimiter);
+
+    // Helper to cleanup any residual dispatch locks between sub-tests
+    const cleanLock = () => {
+      try { fs.unlinkSync(path.join(PIPELINE_UI_DIR, '.dispatch_codex.lock')); } catch (e) {}
+    };
+
+    // -----------------------------------------------------------------------
+    // Test A (NT-001): Queue acknowledged, NO task_started observed
+    // Invariant: queued=true, verified=false, turn_started=false, turn_id=null
+    // -----------------------------------------------------------------------
+    cleanLock();
+    fs.writeFileSync(
+      rolloutFile,
+      JSON.stringify({ payload: { id: '01a0b53f', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }) + '\n'
+    );
+
+    const envA = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_ROLLOUT_FILE: rolloutFile,
+      MOCK_TASK_STARTED_TURN: '' // No task_started emitted
+    };
+
+    const procA = spawnSync('python', [scriptPath, 'test prompt text', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: envA,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(procA.status, 0, `Script executes: ${procA.stderr}`);
+    const resA = JSON.parse((procA.stdout || '').trim());
+
+    assert.strictEqual(resA.queued, true, 'Queue accepted');
+    assert.strictEqual(resA.verified, false, 'verified must be false when task_started missing');
+    assert.strictEqual(resA.turn_started, false, 'turn_started must be false when task_started missing');
+    assert.strictEqual(resA.turn_id, null, 'turn_id must be null when task_started missing');
+    assert.ok(!resA.message.includes('xác thực: task_started'), 'Message must not claim false verification');
+    console.log('✓ NT-001 / F-02 Test A PASSED: Queue succeeded but verified=false, turn_started=false, turn_id=null.');
+
+    recordResult('NT-001', 'Queue acknowledged, no turn start', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'YES',
+      turnStarted: 'NO',
+      turnCompleted: 'NO',
+      reportTargetMatch: 'NO',
+      observed: 'queued=true, verified=false, turn_started=false, turn_id=null',
+      desiredSafe: 'verified=false, turn_started=false when task_started is unobserved',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test B: Queue acknowledged, matching task_started observed post-dispatch
+    // Invariant: queued=true, verified=true, turn_started=true, turn_id=matching ID
+    // -----------------------------------------------------------------------
+    cleanLock();
+    // Fresh session file (idle state)
+    fs.writeFileSync(
+      rolloutFile,
+      JSON.stringify({ payload: { id: '01a0b53f', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }) + '\n'
+    );
+
+    const envB = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_ROLLOUT_FILE: rolloutFile,
+      MOCK_TASK_STARTED_TURN: 'turn-new-active-001' // Mock codex queues and activates turn
+    };
+
+    const procB = spawnSync('python', [scriptPath, 'test prompt text 2', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: envB,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(procB.status, 0, `Script executes: ${procB.stderr}`);
+    const resB = JSON.parse((procB.stdout || '').trim());
+
+    assert.strictEqual(resB.queued, true, 'Queue accepted');
+    assert.strictEqual(resB.verified, true, 'verified must be true when matching task_started observed');
+    assert.strictEqual(resB.turn_started, true, 'turn_started must be true when matching task_started observed');
+    assert.strictEqual(resB.turn_id, 'turn-new-active-001', 'turn_id must match observed turn_id');
+    assert.ok(resB.message.includes('turn-new-active-001'), 'Message references verified turn ID');
+    console.log('✓ F-02 Test B PASSED: Matching task_started verified=true, turn_id=turn-new-active-001.');
+
+    recordResult('F-02-B', 'Queue acknowledged, matching turn started', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'YES',
+      turnStarted: 'YES',
+      turnCompleted: 'NO',
+      reportTargetMatch: 'YES',
+      observed: 'queued=true, verified=true, turn_started=true, turn_id=turn-new-active-001',
+      desiredSafe: 'verified=true, turn_started=true with matching observed turn ID',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test C (NT-002): Historical task_started exists before dispatch, no new event
+    // Invariant: verified=false, turn_started=false, turn_id=null
+    // -----------------------------------------------------------------------
+    cleanLock();
+    // Session contains pre-existing completed turn-historical-999
+    fs.writeFileSync(
+      rolloutFile,
+      [
+        JSON.stringify({ payload: { id: '01a0b53f', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'turn-historical-999' }
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-historical-999',
+            duration_ms: 1000,
+            last_agent_message: 'Historical done'
+          }
+        })
+      ].join('\n') + '\n'
+    );
+
+    const envC = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_ROLLOUT_FILE: rolloutFile,
+      MOCK_TASK_STARTED_TURN: '' // No new event post-dispatch
+    };
+
+    const procC = spawnSync('python', [scriptPath, 'test prompt text 3', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: envC,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(procC.status, 0, `Script executes: ${procC.stderr}`);
+    const resC = JSON.parse((procC.stdout || '').trim());
+
+    assert.strictEqual(resC.queued, true, 'Queue accepted');
+    assert.strictEqual(resC.verified, false, 'verified must be false because no new task_started appeared post-dispatch');
+    assert.strictEqual(resC.turn_started, false, 'turn_started must be false');
+    assert.strictEqual(resC.turn_id, null, 'turn_id must be null');
+    console.log('✓ NT-002 / F-02 Test C PASSED: Historical event rejected; verified=false, turn_id=null.');
+
+    recordResult('NT-002', 'Wrong / historical start turn rejected', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'YES',
+      turnStarted: 'NO',
+      turnCompleted: 'NO',
+      reportTargetMatch: 'NO',
+      observed: 'queued=true, verified=false, turn_started=false, turn_id=null (historical start ignored)',
+      desiredSafe: 'verified=false when only pre-dispatch historical events exist',
+      testFile: __filename
+    });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// --------------------------------------------------------------------------
+// F-03 / NT-003 / NT-004: Watcher Exact Turn Provenance (WP-01)
+// --------------------------------------------------------------------------
+function testF03_WatcherExactTurnProvenance() {
+  console.log('\n[F-03 / NT-003 / NT-004] Testing watch_codex_session.py turn provenance & timeout...');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch_f03_'));
+
+  try {
+    const today = new Date();
+    const year = today.getFullYear().toString();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const day = String(today.getDate()).padStart(2, '0');
+    const sessDir = path.join(tmpDir, '.codex', 'sessions', year, month, day);
+    fs.mkdirSync(sessDir, { recursive: true });
+
+    const rolloutFile = path.join(sessDir, 'rollout-stale-test.jsonl');
+    const scriptPath = path.join(PIPELINE_UI_DIR, 'watch_codex_session.py');
+    const env = { ...process.env, USERPROFILE: tmpDir };
+
+    // Initial state: Turn A completed with report
+    const initialLines = [
+      JSON.stringify({ payload: { id: 'sess-stale-01', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          thread_id: 'sess-stale-01',
+          turn_id: 'turn-A-old-12345',
+          duration_ms: 2500,
+          last_agent_message: 'STALE REPORT FROM TURN A'
+        }
+      })
+    ];
+    fs.writeFileSync(rolloutFile, initialLines.join('\n') + '\n');
+
+    // -----------------------------------------------------------------------
+    // Test A (NT-003): Timeout waiting for Turn B when Turn A already exists
+    // Invariant: success=false, verified=false, timed_out=true, report_text=null
+    // (Turn A report MUST NOT be returned as current primary report)
+    // -----------------------------------------------------------------------
+    const procA = spawnSync(
+      'python',
+      [scriptPath, '--project', 'AI_Multi_Task', '--target-turn', 'turn-B-new-99999', '--timeout', '1'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env,
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(procA.status, 0, 'Watcher executes cleanly');
+    const resA = JSON.parse((procA.stdout || '').trim());
+
+    assert.strictEqual(resA.success, false, 'success must be false on timeout');
+    assert.strictEqual(resA.verified, false, 'verified must be false on timeout');
+    assert.strictEqual(resA.timed_out, true, 'timed_out must be true');
+    assert.strictEqual(resA.report_text, null, 'report_text must be null (stale report rejected)');
+    assert.strictEqual(resA.turn_id, null, 'turn_id must be null');
+    assert.ok(resA.diagnostic_latest_report, 'diagnostic_latest_report may be present for debugging');
+    assert.strictEqual(resA.diagnostic_latest_report.turn_id, 'turn-A-old-12345', 'diagnostic identifies old turn');
+    console.log('✓ NT-003 / F-03 Test A PASSED: Timeout on Turn B returns success=false, report_text=null (no stale fallback).');
+
+    recordResult('NT-003', 'Timeout with previous completed report (F-03)', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'NO',
+      turnCompleted: 'NO',
+      reportTargetMatch: 'NO (stale report rejected)',
+      observed: 'success=false, verified=false, timed_out=true, report_text=null',
+      desiredSafe: 'success=false on timeout; old Turn A report never returned as success',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test B (NT-004): Wrong completion turn (Turn A completes while waiting for B)
+    // Invariant: Watcher ignores Turn A and times out -> success=false
+    // -----------------------------------------------------------------------
+    fs.appendFileSync(
+      rolloutFile,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          thread_id: 'sess-stale-01',
+          turn_id: 'turn-A-late-67890',
+          duration_ms: 1000,
+          last_agent_message: 'LATE REPORT FROM TURN A'
+        }
+      }) + '\n'
+    );
+
+    const procB = spawnSync(
+      'python',
+      [scriptPath, '--project', 'AI_Multi_Task', '--target-turn', 'turn-B-new-99999', '--timeout', '1'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env,
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(procB.status, 0, 'Watcher executes cleanly');
+    const resB = JSON.parse((procB.stdout || '').trim());
+    assert.strictEqual(resB.success, false, 'success must be false when only wrong turn completes');
+    assert.strictEqual(resB.report_text, null, 'report_text must be null when wrong turn completes');
+    console.log('✓ NT-004 / F-03 Test B PASSED: Wrong turn completion ignored; watcher timed out safely.');
+
+    recordResult('NT-004', 'Wrong completion turn rejected', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'NO',
+      turnCompleted: 'NO (wrong turn ignored)',
+      reportTargetMatch: 'NO',
+      observed: 'success=false, report_text=null (unmatched turn ignored)',
+      desiredSafe: 'unmatched completion events ignored; failure returned',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test C: Matching Turn B completes
+    // Invariant: success=true, verified=true, turn_id=turn-B-new-99999, report attributed to B
+    // -----------------------------------------------------------------------
+    fs.appendFileSync(
+      rolloutFile,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          thread_id: 'sess-stale-01',
+          turn_id: 'turn-B-new-99999',
+          duration_ms: 3200,
+          last_agent_message: 'TARGET TURN B SUCCESS REPORT'
+        }
+      }) + '\n'
+    );
+
+    const procC = spawnSync(
+      'python',
+      [scriptPath, '--project', 'AI_Multi_Task', '--target-turn', 'turn-B-new-99999', '--timeout', '2'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env,
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(procC.status, 0, 'Watcher executes cleanly');
+    const resC = JSON.parse((procC.stdout || '').trim());
+
+    assert.strictEqual(resC.success, true, 'success must be true when target turn completes');
+    assert.strictEqual(resC.verified, true, 'verified must be true');
+    assert.strictEqual(resC.turn_id, 'turn-B-new-99999', 'turn_id matches target turn');
+    assert.strictEqual(resC.report_text, 'TARGET TURN B SUCCESS REPORT', 'report_text matches target turn');
+    console.log('✓ F-03 Test C PASSED: Matching target Turn B completed successfully with exact report.');
+
+    recordResult('F-03-C', 'Matching target turn completion', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'YES',
+      turnCompleted: 'YES',
+      reportTargetMatch: 'YES',
+      observed: 'success=true, verified=true, turn_id=turn-B-new-99999, report matches Turn B',
+      desiredSafe: 'success=true with exact target turn attribution',
+      testFile: __filename
+    });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// --------------------------------------------------------------------------
+// CHAR-F06: Malformed Auditor Output Defaults to COMPLETE (Deferred to later WP)
+// --------------------------------------------------------------------------
+async function testF06_MalformedAuditorOutputFallback() {
+  console.log('\n[CHAR-F06] Verifying /api/orchestrator/audit malformed output defect is still present (deferred)...');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch_f06_'));
+  let testServer;
+  const TEST_PORT = 4188;
+
+  try {
+    const mockCodexExe = path.join(tmpDir, 'codex.exe');
+    compileMockCodexExe(mockCodexExe, 'Model prose review: I audited the code and it looks fine.');
+
+    const originalPath = process.env.PATH;
+    const cleanPath = (originalPath || '')
+      .split(path.delimiter)
+      .filter((p) => !p.includes('OpenAI') || !p.includes('Codex'))
+      .join(path.delimiter);
+
+    process.env.PATH = `${tmpDir}${path.delimiter}${cleanPath}`;
+
+    const app = require('../../server');
+    await new Promise((resolve) => {
+      testServer = app.listen(TEST_PORT, '127.0.0.1', resolve);
+    });
+
+    const postData = JSON.stringify({
+      workOrder: { workOrderId: 'WO-CHAR-01', title: 'Test WorkOrder' },
+      workerReport: {
+        raw: 'Worker claims all tasks done',
+        testPassed: true,
+        testsRun: true,
+        filesModified: ['src/index.js']
+      },
+      verificationEvidence: {
+        gitDiffStat: '1 file changed',
+        testExecutionResult: 'PASSED'
+      },
+      projectId: 'workspace-test-3'
+    });
+
+    const res = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: TEST_PORT,
+          path: '/api/orchestrator/audit',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          },
+          timeout: 10000
+        },
+        (resp) => {
+          let data = '';
+          resp.on('data', (chunk) => (data += chunk));
+          resp.on('end', () => {
+            try {
+              resolve({ status: resp.statusCode, body: JSON.parse(data) });
+            } catch (e) {
+              resolve({ status: resp.statusCode, raw: data });
+            }
+          });
+        }
+      );
+      req.on('error', reject);
+      req.write(postData);
+      req.end();
+    });
+
+    const defectPresent =
+      res.status === 200 &&
+      res.body &&
+      res.body.auditResult?.verdict === 'COMPLETE';
+
+    assert.strictEqual(defectPresent, true, 'Server must exhibit F-06 defect in current baseline');
+    console.log('✓ F-06 REPRODUCED: /api/orchestrator/audit returned verdict="COMPLETE" on malformed model prose (deferred to later WP).');
+
+    recordResult('F-06', 'Malformed Auditor Output Fallback', 'DEFECT_REPRODUCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'N/A',
+      turnCompleted: 'N/A',
+      reportTargetMatch: 'N/A',
+      observed: 'verdict="COMPLETE" derived from workerReport.testPassed when model JSON parsing failed',
+      desiredSafe: 'status="AUDIT_PROTOCOL_ERROR" and rejection of completion (deferred to structured auditor WP)',
+      testFile: __filename
+    });
+  } finally {
+    if (testServer) {
+      await new Promise((resolve) => testServer.close(resolve));
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// CHAR-F10: Unauthenticated Arbitrary Command Execution (Deferred to WP-02)
+// --------------------------------------------------------------------------
+async function testF10_ArbitraryCommandExecution() {
+  console.log('\n[CHAR-F10] Verifying /api/extract/worktree/:sessionId/test unauthenticated execution defect (deferred to WP-02)...');
+  let testServer;
+  const TEST_PORT = 4189;
+
+  try {
+    const app = require('../../server');
+    await new Promise((resolve) => {
+      testServer = app.listen(TEST_PORT, '127.0.0.1', resolve);
+    });
+
+    const marker = `CHAR_SAFE_MARKER_${Date.now()}`;
+    const testCmd = `node -e "console.log('${marker}')"`;
+    const postData = JSON.stringify({ command: testCmd });
+
+    const res = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: TEST_PORT,
+          path: '/api/extract/worktree/workspace-test-3/test',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          },
+          timeout: 10000
+        },
+        (resp) => {
+          let data = '';
+          resp.on('data', (chunk) => (data += chunk));
+          resp.on('end', () => {
+            try {
+              resolve({ status: resp.statusCode, body: JSON.parse(data) });
+            } catch (e) {
+              resolve({ status: resp.statusCode, raw: data });
+            }
+          });
+        }
+      );
+      req.on('error', reject);
+      req.write(postData);
+      req.end();
+    });
+
+    const defectPresent =
+      res.status === 200 &&
+      res.body?.passed === true &&
+      res.body?.exitCode === 0 &&
+      res.body?.stdout &&
+      res.body.stdout.includes(marker);
+
+    assert.strictEqual(defectPresent, true, 'Server must execute arbitrary command without auth');
+    console.log('✓ F-10 REPRODUCED: Endpoint executed arbitrary shell command without authentication (deferred to WP-02).');
+
+    recordResult('F-10', 'Unauthenticated Arbitrary Command Execution', 'DEFECT_REPRODUCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'N/A',
+      turnCompleted: 'N/A',
+      reportTargetMatch: 'N/A',
+      observed: `HTTP 200 with stdout containing '${marker}' without auth header`,
+      desiredSafe: 'HTTP 401/403 for unauthenticated caller, command restricted to semantic check IDs (deferred to WP-02)',
+      testFile: __filename
+    });
+  } finally {
+    if (testServer) {
+      await new Promise((resolve) => testServer.close(resolve));
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// CHAR-F12: Multi-Round Integration Tests Omitted from Default npm test (Deferred to WP-12)
+// --------------------------------------------------------------------------
+function testF12_PackageJsonNpmTestExclusion() {
+  console.log('\n[CHAR-F12] Verifying package.json scripts.test exclusion of test_codex_3_rounds.js...');
+  const pkgPath = path.join(PIPELINE_UI_DIR, 'package.json');
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+
+  const testScript = pkg.scripts?.test || '';
+  const excludesMultiRound = !testScript.includes('test_codex_3_rounds');
+
+  assert.strictEqual(excludesMultiRound, true, 'npm test does not run test_codex_3_rounds.js');
+  console.log(`✓ F-12 REPRODUCED: "npm test" executes "${testScript}", omitting test_codex_3_rounds.js (deferred to WP-12).`);
+
+  recordResult('F-12', 'Default npm test Excludes Multi-Round Test', 'DEFECT_REPRODUCED', {
+    queueAccepted: 'N/A',
+    turnStarted: 'N/A',
+    turnCompleted: 'N/A',
+    reportTargetMatch: 'N/A',
+    observed: `scripts.test = "${testScript}" (excludes test_codex_3_rounds.js)`,
+    desiredSafe: 'npm test executes all registered regression test suites with defined tiers (deferred to WP-12)',
+    testFile: pkgPath
+  });
+}
+
+// --------------------------------------------------------------------------
+// Main Runner
+// --------------------------------------------------------------------------
+async function main() {
+  console.log('================================================================');
+  console.log('🧪 RUNNING REGRESSION & CHARACTERIZATION TESTS (WO-REFACTOR-002)');
+  console.log('WP-01: Verifying Transport Correctness & Provenance Guarantees');
+  console.log('================================================================');
+
+  try {
+    testF01_AntigravityPythonSyntax();
+    testF02_CodexDispatchStateModel();
+    testF03_WatcherExactTurnProvenance();
+    await testF06_MalformedAuditorOutputFallback();
+    await testF10_ArbitraryCommandExecution();
+    testF12_PackageJsonNpmTestExclusion();
+
+    console.log('\n================================================================');
+    console.log('📊 TEST MATRIX SUMMARY (WO-REFACTOR-002 / WP-01)');
+    console.log('================================================================');
+    console.table(results);
+
+    console.log('\n[SUMMARY] F-01, F-02, F-03, NT-001..NT-004: Invariants fully enforced and verified.');
+    console.log('[SUMMARY] F-06, F-10, F-12: Preserved as baseline defects (deferred to designated WPs).');
+  } catch (err) {
+    console.error('\n❌ TEST RUNNER FAILED:', err);
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  testF01_AntigravityPythonSyntax,
+  testF02_CodexDispatchStateModel,
+  testF03_WatcherExactTurnProvenance,
+  testF06_MalformedAuditorOutputFallback,
+  testF10_ArbitraryCommandExecution,
+  testF12_PackageJsonNpmTestExclusion
+};
