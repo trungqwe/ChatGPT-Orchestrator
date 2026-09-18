@@ -50,7 +50,7 @@
         <nav class="nav-menu">
           <button class="nav-item active" data-tab="observer">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/></svg>
-            <span>Khung Điều Phối & Quan Sát</span>
+            <span>Theo dõi phiên</span>
             <span class="badge badge-cyan">Live Stream</span>
           </button>
           <button class="nav-item" data-tab="sessions">
@@ -65,24 +65,17 @@
         </nav>
 
         <div class="sidebar-footer">
-          <div class="pane-card sidebar-tech-pane">
+          <div class="pane-card sidebar-activity-pane">
             <div class="pane-card-header">
               <div class="pane-title-group">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
-                <span>Lộ Trình & Files Kỹ Thuật</span>
+                <span class="pulse-dot pulse-cyan"></span>
+                <span>Nhật Ký Hoạt Động</span>
               </div>
-              <span class="badge badge-purple" id="badge-tech-files-count">0 Files</span>
+              <span class="badge badge-cyan" id="badge-live-steps-count">0 Bước</span>
             </div>
-            <div class="pane-card-body">
-              <div class="tech-files-list" id="tech-files-list">
-                <div class="text-muted" style="font-size: 0.8rem;">Chọn dự án để xem file...</div>
-              </div>
-              <div class="tech-file-preview-box hidden" id="tech-file-preview-box">
-                <div class="preview-header">
-                  <span id="preview-filename" class="preview-filename">ROADMAP.md</span>
-                  <button id="btn-close-file-preview" class="btn-xs-close">&times;</button>
-                </div>
-                <pre class="preview-content" id="preview-file-content"></pre>
+            <div class="pane-card-body activity-log-stream" id="agent-live-steps-container">
+              <div class="log-empty-state" id="log-empty-state">
+                <span>Đang chờ bước thi công từ Agent...</span>
               </div>
             </div>
           </div>
@@ -215,109 +208,75 @@
           </div>
         </section>
 
-        <!-- Dynamic View: Observer & Orchestrator -->
+        <!-- Dynamic View: Theo Dõi Phiên (Observer & Chat Portal) -->
         <section class="tab-view active" id="view-observer">
-          <!-- Split Workspace: Chat Stream (Left) + Live Step Log (Right) -->
-          <div class="observer-workspace split-chat-workspace">
-            <!-- Left/Center Column: Chat Portal Card -->
-            <div class="observer-chat-col">
-              <div class="chat-portal-card">
-                <!-- Header -->
-                <div class="chat-card-header">
-                  <div class="chat-header-info">
-                    <div class="chat-header-title-row">
-                      <span class="chat-indicator-dot"></span>
-                      <h3 class="chat-header-title">Khung Trao Đổi ChatGPT Web ⇄ Antigravity</h3>
-                      <div class="chat-meta-inline">
-                        <span class="metric-lbl">Dự Án:</span>
-                        <span class="metric-val" id="disp-active-project">-</span>
-                        <span class="meta-divider">•</span>
-                        <span class="metric-lbl">Phiên:</span>
-                        <span class="metric-val" id="disp-active-session">-</span>
-                        <span class="meta-divider">•</span>
-                        <span class="status-badge badge-emerald" id="disp-loop-status">Sẵn Sàng</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- Verification / Retry Alert Banner (Active when delivery needs attention) -->
-                <div id="dispatch-verify-banner" class="dispatch-verify-banner hidden">
-                  <div class="verify-banner-content">
-                    <span class="verify-icon">⚠️</span>
-                    <span id="verify-banner-msg">Chưa phát hiện Agent trên Antigravity IDE bắt đầu thi công...</span>
-                  </div>
-                  <div class="verify-banner-actions">
-                    <button id="btn-verify-retry" class="btn btn-xs btn-primary">🔄 Thử Nạp Lại</button>
-                    <button id="btn-verify-copy" class="btn btn-xs btn-secondary">📋 Copy Prompt</button>
-                    <button id="btn-verify-dismiss" class="btn btn-xs btn-ghost" title="Đóng">&times;</button>
-                  </div>
-                </div>
-
-                <!-- Chat Messages Scroll Container -->
-                <div class="chat-messages-container" id="exchange-stream-container">
-                  <div class="stream-empty-state" id="stream-empty-state">
-                    <span class="empty-dot"></span>
-                    <span class="empty-hint">Chưa có tin nhắn trong phiên trao đổi này. Nhập yêu cầu vào khung chat bên dưới hoặc bấm "⚡ Bắt Đầu Vòng Lặp Tự Động".</span>
-                  </div>
-                </div>
-
-                <!-- Chat Input & Quick Action Area -->
-                <div class="chat-composer-box">
-                  <!-- Fast Action Toolbar -->
-                  <div class="chat-toolbar">
-                    <button id="btn-quick-fire-report" class="btn-chip btn-chip-primary" title="Bắt đầu vòng lặp tự động khép kín: Tự audit -> Tự nạp lệnh vào Antigravity -> Agent sửa code -> Tự lấy báo cáo audit tiếp...">
-                      <span id="txt-loop-btn">⚡ Bắt Đầu Vòng Lặp Tự Động</span>
-                    </button>
-                    <button id="btn-stop-loop" class="btn-chip btn-chip-danger hidden" title="Dừng vòng lặp tự động">
-                      <span>🛑 Dừng Vòng Lặp</span>
-                    </button>
-                    <button id="btn-quick-preview-report" class="btn-chip" title="Xem trước nội dung Worker Report & Handoff">
-                      <span>👁️ Xem Trước Báo Cáo</span>
-                    </button>
-                    <button id="btn-clear-chat-stream" class="btn-chip btn-danger-subtle" title="Chỉ xóa nội dung chat hiển thị trên tool, tuyệt đối không xóa file cứng của Antigravity">
-                      <span>🗑️ Xóa Lịch Sử Chat</span>
-                    </button>
-                    <div class="chat-toolbar-spacer"></div>
-                    <div class="live-sync-indicator" title="Chế độ Live Sync & Điều phối tự động khép kín">
-                      <span class="pulse-dot"></span>
-                      <span id="live-indicator-text">🟢 Vòng Lặp Tự Động Khép Kín</span>
-                    </div>
-                  </div>
-
-                  <!-- Text Input Row -->
-                  <div class="chat-input-wrapper">
-                    <textarea id="chat-input-textarea" class="chat-textarea" rows="2" placeholder="Gõ yêu cầu / chỉ đạo cho ChatGPT Web (Senior Architect)... (Shift+Enter xuống dòng, Enter để gửi)"></textarea>
-                    <button id="btn-chat-send" class="btn-chat-send" title="Gửi sang ChatGPT Web (Enter)">
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
-                    </button>
-                  </div>
-                  
-                  <div class="chat-status-bar" id="chat-status-bar">
-                    <span id="chat-status-text">Sẵn sàng điều phối</span>
+          <div class="chat-portal-card">
+            <!-- Header -->
+            <div class="chat-card-header">
+              <div class="chat-header-info">
+                <div class="chat-header-title-row">
+                  <span class="chat-indicator-dot"></span>
+                  <div class="chat-meta-inline">
+                    <span class="metric-lbl">Dự Án:</span>
+                    <span class="metric-val" id="disp-active-project">-</span>
+                    <span class="meta-divider">•</span>
+                    <span class="metric-lbl">Phiên:</span>
+                    <span class="metric-val" id="disp-active-session">-</span>
+                    <span class="status-badge badge-emerald hidden" id="disp-loop-status"></span>
                   </div>
                 </div>
               </div>
             </div>
 
-            <!-- Right Column: Live Agent Interaction & Step Log -->
-            <div class="observer-log-col">
-              <div class="card live-log-card">
-                <div class="live-log-header">
-                  <div class="log-title-group">
-                    <span class="pulse-dot pulse-cyan"></span>
-                    <span class="log-title">Nhật Ký Tương Tác & Bước Thi Công</span>
-                  </div>
-                  <span class="badge badge-cyan" id="badge-live-steps-count">0 Bước</span>
-                </div>
-                <div class="live-log-sub">
-                  Quan sát thời gian thực các bước chính và bước con giữa ChatGPT Web và Antigravity.
-                </div>
-                <div class="live-log-body" id="agent-live-steps-container">
-                  <div class="log-empty-state" id="log-empty-state">
-                    <span>Đang chờ bước thi công từ các Agent...</span>
-                  </div>
-                </div>
+            <!-- Verification / Retry Alert Banner (Active when delivery needs attention) -->
+            <div id="dispatch-verify-banner" class="dispatch-verify-banner hidden">
+              <div class="verify-banner-content">
+                <span class="verify-icon">⚠️</span>
+                <span id="verify-banner-msg">Chưa phát hiện Agent trên Antigravity IDE bắt đầu thi công...</span>
+              </div>
+              <div class="verify-banner-actions">
+                <button id="btn-verify-retry" class="btn btn-xs btn-primary">🔄 Thử Nạp Lại</button>
+                <button id="btn-verify-copy" class="btn btn-xs btn-secondary">📋 Copy Prompt</button>
+                <button id="btn-verify-dismiss" class="btn btn-xs btn-ghost" title="Đóng">&times;</button>
+              </div>
+            </div>
+
+            <!-- Chat Messages Scroll Container -->
+            <div class="chat-messages-container" id="exchange-stream-container">
+              <div class="stream-empty-state" id="stream-empty-state">
+                <span class="empty-dot"></span>
+                <span class="empty-hint">Chưa có tin nhắn trong phiên trao đổi này. Nhập yêu cầu vào khung chat bên dưới hoặc bấm "⚡ Bắt Đầu Vòng Lặp Tự Động".</span>
+              </div>
+            </div>
+
+            <!-- Chat Input & Quick Action Area -->
+            <div class="chat-composer-box">
+              <!-- Fast Action Toolbar -->
+              <div class="chat-toolbar">
+                <button id="btn-quick-fire-report" class="btn-chip btn-chip-primary" title="Bắt đầu vòng lặp tự động khép kín: Tự audit -> Tự nạp lệnh vào Antigravity -> Agent sửa code -> Tự lấy báo cáo audit tiếp...">
+                  <span id="txt-loop-btn">⚡ Bắt Đầu Vòng Lặp Tự Động</span>
+                </button>
+                <button id="btn-stop-loop" class="btn-chip btn-chip-danger hidden" title="Dừng vòng lặp tự động">
+                  <span>🛑 Dừng Vòng Lặp</span>
+                </button>
+                <button id="btn-quick-preview-report" class="btn-chip" title="Xem trước nội dung Worker Report & Handoff">
+                  <span>👁️ Xem Trước Báo Cáo</span>
+                </button>
+                <button id="btn-clear-chat-stream" class="btn-chip btn-danger-subtle" title="Chỉ xóa nội dung chat hiển thị trên tool, tuyệt đối không xóa file cứng của Antigravity">
+                  <span>🗑️ Xóa Lịch Sử Chat</span>
+                </button>
+              </div>
+
+              <!-- Text Input Row -->
+              <div class="chat-input-wrapper">
+                <textarea id="chat-input-textarea" class="chat-textarea" rows="2" placeholder="Gõ yêu cầu / chỉ đạo cho ChatGPT Web (Senior Architect)... (Shift+Enter xuống dòng, Enter để gửi)"></textarea>
+                <button id="btn-chat-send" class="btn-chat-send" title="Gửi sang ChatGPT Web (Enter)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+                </button>
+              </div>
+              
+              <div class="chat-status-bar" id="chat-status-bar">
+                <span id="chat-status-text">Sẵn sàng điều phối</span>
               </div>
             </div>
           </div>

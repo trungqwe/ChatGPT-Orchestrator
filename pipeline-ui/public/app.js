@@ -718,12 +718,14 @@ function renderExchangeStream(history) {
       if (v === 'ROADMAP_COMPLETE') {
         loopStatus.textContent = 'Hoàn Thành Mục Tiêu';
         loopStatus.className = 'status-badge badge-emerald';
+        loopStatus.classList.remove('hidden');
       } else if (v === 'FIX') {
         loopStatus.textContent = 'Yêu Cầu Sửa Lỗi';
         loopStatus.className = 'status-badge badge-rose';
+        loopStatus.classList.remove('hidden');
       } else {
-        loopStatus.textContent = 'Đang Điều Phối';
-        loopStatus.className = 'status-badge badge-cyan';
+        loopStatus.textContent = '';
+        loopStatus.classList.add('hidden');
       }
     }
   }
@@ -733,7 +735,7 @@ function renderExchangeStream(history) {
 }
 
 // -------------------------------------------------------------
-// Real-time Agent Live Steps Poller (Right Column)
+// Real-time Agent Live Steps Poller (Sidebar Activity Log)
 // -------------------------------------------------------------
 async function pollAgentLiveSteps() {
   const container = document.getElementById('agent-live-steps-container');
@@ -752,37 +754,39 @@ async function pollAgentLiveSteps() {
     return;
   }
 
-  if (badge) badge.textContent = `${data.totalSteps || data.steps.length} Bước`;
+  if (badge) badge.textContent = `${data.steps.length} Bước`;
 
   const emptyState = document.getElementById('log-empty-state');
   if (emptyState) emptyState.classList.add('hidden');
 
   container.innerHTML = '';
   data.steps.forEach(st => {
-    const timeStr = st.timestamp ? new Date(st.timestamp).toLocaleTimeString() : '';
-    const item = document.createElement('div');
-    item.className = `step-log-item step-${st.role}`;
+    const timeStr = st.timestamp ? new Date(st.timestamp).toLocaleTimeString('vi-VN', { hour12: false }) : '';
+    const row = document.createElement('div');
+    row.className = `log-stream-row ${st.isError ? 'log-err' : ''}`;
 
-    let roleBadgeClass = 'badge-cyan';
-    let roleText = 'Agent';
-    if (st.role === 'user') {
-      roleBadgeClass = 'badge-purple';
-      roleText = 'User';
+    let tagClass = 'tag-agent';
+    let tagText = 'Agent';
+    if (st.isError) {
+      tagClass = 'tag-err';
+      tagText = 'Lỗi';
+    } else if (st.role === 'user') {
+      tagClass = 'tag-user';
+      tagText = 'User';
     } else if (st.role === 'system') {
-      roleBadgeClass = 'badge-emerald';
-      roleText = 'Terminal';
+      tagClass = 'tag-sys';
+      tagText = 'CMD';
     }
 
-    item.innerHTML = `
-      <div class="step-log-header">
-        <span class="step-role-badge ${roleBadgeClass}">${roleText}</span>
-        <span class="step-time">${timeStr}</span>
-        <span class="step-badge-status ${st.status === 'DONE' ? 'text-emerald' : 'text-amber'}">${escapeHtml(st.status)}</span>
+    row.innerHTML = `
+      <div class="log-stream-line">
+        <span class="log-ts">${timeStr}</span>
+        <span class="log-tag ${tagClass}">${tagText}</span>
+        <span class="log-msg ${st.isError ? 'text-rose' : ''}">${escapeHtml(st.summary)}</span>
       </div>
-      <div class="step-summary">${escapeHtml(st.summary)}</div>
-      ${st.details ? `<div class="step-details">${escapeHtml(st.details)}</div>` : ''}
+      ${st.details ? `<div class="log-detail-line">${escapeHtml(st.details)}</div>` : ''}
     `;
-    container.appendChild(item);
+    container.appendChild(row);
   });
 
   // Auto scroll to bottom
@@ -1319,6 +1323,17 @@ document.addEventListener('DOMContentLoaded', () => {
       pollAgentLiveSteps();
     }
   }, 2500);
+
+  // Switch Active Main Content View
+  function switchMainView(tabName) {
+    document.querySelectorAll('.tab-view').forEach(view => {
+      view.classList.remove('active');
+    });
+    const targetView = document.getElementById(`view-${tabName}`);
+    if (targetView) {
+      targetView.classList.add('active');
+    }
+  }
 
   // Navigation Tabs
   document.querySelectorAll('.nav-item').forEach(item => {
@@ -2259,8 +2274,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (txtBtn) txtBtn.textContent = '⚡ Bắt Đầu Vòng Lặp Tự Động';
     if (btnStop) btnStop.classList.add('hidden');
     if (loopStatus) {
-      loopStatus.textContent = 'Sẵn Sàng';
-      loopStatus.className = 'status-badge badge-emerald';
+      loopStatus.textContent = '';
+      loopStatus.classList.add('hidden');
     }
   }
 
@@ -2725,6 +2740,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (doctorOutput && data.doctorReport) {
       doctorOutput.textContent = data.doctorReport;
+      const docBadge = document.getElementById('doctor-badge');
+      if (docBadge) {
+        const isReady = data.verified || data.doctorReport.includes('Doctor result: ready');
+        docBadge.textContent = isReady ? 'Ready' : 'Issues';
+        docBadge.className = isReady ? 'badge badge-emerald' : 'badge badge-rose';
+      }
     }
   }
 
