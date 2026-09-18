@@ -54,14 +54,20 @@ function savePipelineSettings(settings) {
 }
 let currentSettings = loadPipelineSettings();
 
-// Helper: Dispatch prompt to OpenAI Codex Extension chat in Antigravity IDE
+// In-memory registry of last dispatched turns for instant watcher handoff
+const lastDispatchedCodexTurn = {};
+
+// Helper: Dispatch prompt to OpenAI Codex Extension chat in Antigravity IDE (Pure Background Zero-Intrusion)
 async function dispatchPromptToCodex(prompt, projectId) {
   const result = {
     dispatched: false,
     sentToWindow: false,
-    method: 'codex_extension_chat',
+    verified: false,
+    busy: false,
+    method: 'codex_background_queue',
     message: '',
     targetWindow: null,
+    targetTurnId: null,
     worker: 'codex'
   };
 
@@ -73,7 +79,7 @@ async function dispatchPromptToCodex(prompt, projectId) {
     const pyCmd = `python "${pyScript}" "@${tmpPromptFile}" "${proj}"`;
 
     const pyOut = await new Promise((resolve) => {
-      exec(pyCmd, { timeout: 15000 }, (err, stdout, stderr) => {
+      exec(pyCmd, { timeout: 20000 }, (err, stdout, stderr) => {
         try {
           resolve(JSON.parse((stdout || '').trim()));
         } catch (e) {
@@ -84,14 +90,23 @@ async function dispatchPromptToCodex(prompt, projectId) {
 
     if (pyOut && pyOut.success) {
       result.dispatched = true;
-      result.sentToWindow = true;
+      result.verified = pyOut.verified;
       result.targetWindow = pyOut.target_window;
-      result.message = `Đã tự động đẩy chỉ đạo vào ô chat Codex Extension (${pyOut.target_window})!`;
-      console.log(`[CODEX DISPATCH SUCCESS] ${pyOut.target_window}`);
+      result.targetTurnId = pyOut.turn_id;
+      result.baselineTurnId = pyOut.baseline_turn_id;
+      result.method = pyOut.method || 'codex_background_queue';
+      result.message = pyOut.message || `Đã nạp chỉ đạo vào phiên Codex ngầm (${pyOut.target_window})!`;
+      lastDispatchedCodexTurn[proj] = {
+        targetTurnId: pyOut.turn_id,
+        baselineTurnId: pyOut.baseline_turn_id,
+        timestamp: Date.now()
+      };
+      console.log(`[CODEX BG DISPATCH SUCCESS] ${pyOut.target_window} turn=${pyOut.turn_id}`);
       return result;
     } else {
-      result.message = `Không thể đẩy vào Codex Extension: ${pyOut?.error || 'Lỗi không xác định'}`;
-      console.warn(`[CODEX DISPATCH FAIL] ${pyOut?.error}`);
+      result.busy = pyOut?.busy || false;
+      result.message = pyOut?.error || 'Không thể gửi lệnh vào Codex Extension';
+      console.warn(`[CODEX BG DISPATCH NOTIFICATION] ${result.message}`);
     }
   } catch (e) {
     result.message = e.message;
@@ -102,10 +117,20 @@ async function dispatchPromptToCodex(prompt, projectId) {
 }
 
 // Helper: Wait for Codex Extension turn completion via watch_codex_session.py
-function waitCodexReport(projectId = 'AI_Multi_Task', timeoutSecs = 180) {
+function waitCodexReport(projectId = 'AI_Multi_Task', timeoutSecs = 180, targetTurnId = null) {
   return new Promise((resolve) => {
     const pyScript = path.join(__dirname, 'watch_codex_session.py');
-    const pyCmd = `python "${pyScript}" --project "${projectId}" --timeout ${timeoutSecs}`;
+    let pyCmd = `python "${pyScript}" --project "${projectId}" --timeout ${timeoutSecs}`;
+    const tracked = lastDispatchedCodexTurn[projectId];
+    const effectiveTargetTurn = targetTurnId || tracked?.targetTurnId;
+    const effectiveBaseline = tracked?.baselineTurnId;
+
+    if (effectiveTargetTurn) {
+      pyCmd += ` --target-turn "${effectiveTargetTurn}"`;
+    } else if (effectiveBaseline) {
+      pyCmd += ` --baseline-turn "${effectiveBaseline}"`;
+    }
+
     exec(pyCmd, { timeout: (timeoutSecs + 10) * 1000 }, (err, stdout, stderr) => {
       try {
         const out = JSON.parse((stdout || '').trim());
@@ -2045,11 +2070,13 @@ ${effectiveReportText}
       dispRes = await dispatchPromptToAntigravity(nextDirectivePrompt, projectId, targetAgySession);
     }
     exchangeItem.dispatched = dispRes.dispatched;
-    exchangeItem.sentToWindow = dispRes.sentToWindow;
+    exchangeItem.verified = dispRes.verified || false;
+    exchangeItem.busy = dispRes.busy || false;
+    exchangeItem.sentToWindow = false;
     exchangeItem.dispatchTarget = dispRes.targetWindow || dispRes.targetSession;
-    exchangeItem.dispatchMethod = dispRes.method || (effectiveWorker === 'codex' ? 'codex_extension_chat' : (dispRes.sentToWindow ? 'antigravity_ide_chat' : 'ao_background_send'));
+    exchangeItem.dispatchMethod = dispRes.method || (effectiveWorker === 'codex' ? 'codex_background_queue' : 'ao_background_send');
     exchangeItem.dispatchMessage = dispRes.message;
-    console.log(`[AUTO-DISPATCH] worker=${effectiveWorker} sentToWindow=${dispRes.sentToWindow}, target=${exchangeItem.dispatchTarget}`);
+    console.log(`[AUTO-DISPATCH] worker=${effectiveWorker} verified=${dispRes.verified}, method=${exchangeItem.dispatchMethod}, target=${exchangeItem.dispatchTarget}`);
   }
 
   // Persist exchange item
@@ -2494,12 +2521,12 @@ app.post('/api/worker/engine', (req, res) => {
 });
 
 app.post('/api/worker/wait-report', async (req, res) => {
-  const { projectId, workerEngine, timeoutSecs } = req.body;
+  const { projectId, workerEngine, timeoutSecs, targetTurnId } = req.body;
   const effectiveWorker = workerEngine || currentSettings.workerEngine || 'gemini';
   const proj = projectId || 'AI_Multi_Task';
 
   if (effectiveWorker === 'codex') {
-    const reportData = await waitCodexReport(proj, timeoutSecs || 180);
+    const reportData = await waitCodexReport(proj, timeoutSecs || 180, targetTurnId);
     return res.json(reportData);
   }
 

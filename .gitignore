@@ -20,6 +20,8 @@ __pycache__/
 # Temporary and log files
 *.log
 .temp_dispatch_prompt.txt
+.temp_dispatch_codex_prompt.txt
+.codex_lock
 **/scratch/
 .tempmediaStorage/
 

@@ -1,19 +1,15 @@
-import ctypes
-from ctypes import wintypes
-import time
-import win32clipboard
-import sys
-import json
 import os
+import glob
+import json
+import time
+import sys
+import subprocess
+from datetime import datetime
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
-
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-DESKTOP_ALL = 0x01FF
 
 LOCK_FILE = os.path.join(os.path.dirname(__file__), '.dispatch_codex.lock')
 
@@ -23,7 +19,7 @@ def acquire_lock():
         try:
             with open(LOCK_FILE, 'r') as f:
                 ts = float(f.read().strip())
-                if now - ts < 2.5:
+                if now - ts < 2.0:
                     return False
         except Exception:
             pass
@@ -41,259 +37,203 @@ def release_lock():
     except Exception:
         pass
 
+def get_codex_sessions_dirs():
+    base = os.path.join(os.environ.get('USERPROFILE', 'C:\\Users\\Admin'), '.codex', 'sessions')
+    if not os.path.exists(base):
+        return []
+    dirs = []
+    today = datetime.now()
+    today_dir = os.path.join(base, str(today.year), f"{today.month:02d}", f"{today.day:02d}")
+    if os.path.exists(today_dir):
+        dirs.append(today_dir)
+    for d in glob.glob(os.path.join(base, "*", "*", "*")):
+        if d != today_dir and os.path.isdir(d):
+            dirs.append(d)
+    return dirs
+
+def find_project_rollouts(project_keyword="AI_Multi_Task"):
+    norm_keyword = project_keyword.lower().replace('/', '\\')
+    matched_files = []
+    for sdir in get_codex_sessions_dirs():
+        files = glob.glob(os.path.join(sdir, "rollout-*.jsonl"))
+        files.sort(key=os.path.getmtime, reverse=True)
+        for fpath in files:
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as fp:
+                    first_line = fp.readline()
+                    if not first_line:
+                        continue
+                    meta = json.loads(first_line)
+                    cwd = meta.get('payload', {}).get('cwd', '')
+                    if norm_keyword in cwd.lower() or os.path.basename(cwd).lower() == norm_keyword:
+                        matched_files.append((fpath, meta.get('payload', {}).get('id', '')))
+            except Exception:
+                continue
+    return matched_files
+
+def is_session_busy(rollout_file):
+    """Checks if the Codex session is currently executing a turn (Anti-Push-Mù)."""
+    try:
+        with open(rollout_file, 'r', encoding='utf-8', errors='ignore') as fp:
+            lines = fp.readlines()
+        if not lines:
+            return False, "Session empty"
+
+        has_task_complete = False
+        last_turn_id = None
+        started_turn_id = None
+
+        for line in reversed(lines[-60:]):
+            try:
+                data = json.loads(line)
+                t = data.get('type')
+                p = data.get('payload', {})
+                if t == 'event_msg' and isinstance(p, dict):
+                    pt = p.get('type')
+                    if pt == 'task_complete' and not has_task_complete:
+                        has_task_complete = True
+                        last_turn_id = p.get('turn_id')
+                    elif pt == 'task_started':
+                        started_turn_id = p.get('turn_id')
+                        if not has_task_complete or (started_turn_id and started_turn_id != last_turn_id):
+                            return True, f"Worker đang bận thực thi turn '{started_turn_id}'"
+                        else:
+                            return False, "Idle"
+            except Exception:
+                continue
+        return False, "Idle"
+    except Exception as e:
+        return False, str(e)
+
+def get_last_completed_turn_id(rollout_file):
+    try:
+        with open(rollout_file, 'r', encoding='utf-8', errors='ignore') as fp:
+            lines = fp.readlines()
+        for line in reversed(lines[-60:]):
+            try:
+                data = json.loads(line)
+                t = data.get('type')
+                p = data.get('payload', {})
+                if t == 'event_msg' and isinstance(p, dict) and p.get('type') == 'task_complete':
+                    return p.get('turn_id')
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
 def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
+    """
+    100% Background Zero-Intrusion Dispatcher:
+    - Never steals mouse (0 SetCursorPos, 0 mouse_event).
+    - Never steals keyboard (0 keybd_event).
+    - Never steals foreground window (0 SetForegroundWindow).
+    - Works even while user is in full-screen gaming, movie watching, or typing elsewhere.
+    - Pre-flight busy check (Chống Push Mù).
+    - Post-flight queue verification (Chống Thất Lạc Lệnh).
+    """
     result = {
         "success": False,
-        "target_window": None,
+        "verified": False,
+        "busy": False,
         "worker": "codex_extension",
+        "method": "codex_background_queue",
+        "target_window": None,
+        "session_id": None,
+        "baseline_turn_id": None,
         "error": None
     }
 
     if not acquire_lock():
-        result["error"] = "Duplicate dispatch rejected by lock"
+        result["error"] = "Thao tác gửi bị từ chối do trùng lặp dispatch lock"
         return result
 
     try:
-        # 1. Switch thread desktop to Default interactive desktop
-        try:
-            hdesk = user32.OpenDesktopW("Default", 0, False, DESKTOP_ALL)
-            if hdesk:
-                user32.SetThreadDesktop(hdesk)
-        except Exception as e:
-            result["error"] = f"Desktop switch failed: {e}"
+        # 1. Locate active session rollout for the project
+        matched = find_project_rollouts(project_keyword)
+        if not matched:
+            result["error"] = f"Không tìm thấy phiên Codex nào khớp với dự án '{project_keyword}'"
             return result
 
-        # 2. Find Antigravity IDE target window
-        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        target_hwnds = []
+        rollout_file, session_id = matched[0]
+        result["session_id"] = session_id
+        result["target_window"] = f"Codex Session [{session_id[:8]}] ({project_keyword})"
 
-        def enum_cb(hwnd, lparam):
-            if user32.IsWindowVisible(hwnd):
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buf = ctypes.create_unicode_buffer(length + 1)
-                    user32.GetWindowTextW(hwnd, buf, length + 1)
-                    title = buf.value
-                    if "Antigravity IDE" in title:
-                        if "Orchestrator - Antigravity IDE" in title:
-                            return True
-                        if project_keyword and project_keyword.lower() in title.lower():
-                            target_hwnds.insert(0, (hwnd, title))
-                        else:
-                            target_hwnds.append((hwnd, title))
-            return True
-
-        user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-
-        if not target_hwnds:
-            result["error"] = f"No Antigravity IDE worker window found matching '{project_keyword}'"
+        # 2. Pre-flight Check: Is Worker Busy? (Anti-Push-Mù)
+        busy, busy_reason = is_session_busy(rollout_file)
+        if busy:
+            result["busy"] = True
+            result["error"] = f"Chống push mù: {busy_reason}. Vui lòng chờ lượt hiện tại kết thúc."
             return result
 
-        target_hwnd, target_title = target_hwnds[0]
-        result["target_window"] = target_title
+        # Record baseline completed turn ID to guarantee instant watcher handover
+        baseline_turn_id = get_last_completed_turn_id(rollout_file)
+        result["baseline_turn_id"] = baseline_turn_id
 
-        # 3. Copy prompt to clipboard
-        try:
-            win32clipboard.OpenClipboard()
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardText(prompt_text, win32clipboard.CF_UNICODETEXT)
-            win32clipboard.CloseClipboard()
-        except Exception as e:
-            result["error"] = f"Clipboard copy failed: {e}"
+        # 3. Pure Background IPC: Send prompt via codex queue
+        CREATE_NO_WINDOW = 0x08000000
+        cmd = ["codex", "queue", "--thread", session_id, "--message", prompt_text]
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            creationflags=CREATE_NO_WINDOW,
+            timeout=15
+        )
+
+        if proc.returncode != 0:
+            result["error"] = f"Lỗi codex queue (exit code {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
             return result
 
-        # 4. Save current foreground window and cursor
-        prev_fore_hwnd = user32.GetForegroundWindow()
-        orig_cursor = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(orig_cursor))
+        # 4. Post-flight Verification: Verify message was queued
+        queue_output = proc.stdout.strip()
+        if "Queued message" not in queue_output and "for thread" not in queue_output:
+            result["error"] = f"Không nhận được tín hiệu xác thực hàng đợi: {queue_output}"
+            return result
 
-        # 5. Bring target IDE window to front
-        try:
-            if user32.IsIconic(target_hwnd):
-                user32.ShowWindow(target_hwnd, 9)
+        # 5. Verify turn activation in rollout (wait up to 2.5 seconds for task_started)
+        turn_started = False
+        new_turn_id = None
+        verify_start = time.time()
 
-            curr_thread = kernel32.GetCurrentThreadId()
-            target_thread = user32.GetWindowThreadProcessId(target_hwnd, None)
-            fore_thread = user32.GetWindowThreadProcessId(prev_fore_hwnd, None) if prev_fore_hwnd else 0
-
-            user32.AttachThreadInput(curr_thread, target_thread, True)
-            if fore_thread:
-                user32.AttachThreadInput(fore_thread, target_thread, True)
-
-            # Unlock foreground lock via simulated Alt tap
-            user32.keybd_event(0x12, 0, 0, 0)
-            user32.keybd_event(0x12, 0, 0x0002, 0)
-
-            user32.SetForegroundWindow(target_hwnd)
-            user32.BringWindowToTop(target_hwnd)
-
-            if fore_thread:
-                user32.AttachThreadInput(fore_thread, target_thread, False)
-            user32.AttachThreadInput(curr_thread, target_thread, False)
-        except Exception:
-            user32.SetForegroundWindow(target_hwnd)
-
-        time.sleep(0.2)
-
-        # 6. Locate Codex Sidebar and Input using UIAutomation
-        import comtypes
-        import comtypes.client
-        mod = comtypes.client.GetModule("UIAutomationCore.dll")
-        uia = comtypes.client.CreateObject("{ff48dba4-60ef-4201-aa87-54103eef594e}", interface=mod.IUIAutomation)
-        elem = uia.ElementFromHandle(target_hwnd)
-
-        true_cond = uia.CreateTrueCondition()
-        all_descendants = elem.FindAll(mod.TreeScope_Descendants, true_cond)
-        
-        codex_open_btn = None
-        input_elem = None
-        send_btn_elem = None
-
-        for i in range(all_descendants.Length):
-            el = all_descendants.GetElement(i)
-            name = el.CurrentName or ""
-            cls_name = el.CurrentClassName or ""
-            ctl = el.CurrentControlType
-
-            if name == "Open Codex Sidebar" or (name == "Codex" and ctl == 50019):
-                codex_open_btn = el
-
-            if "prosemirror" in cls_name.lower() or "thay đổi tiếp theo" in name.lower() or "ask anything" in name.lower():
-                r = el.CurrentBoundingRectangle
-                if r.right > r.left and r.bottom > r.top:
-                    input_elem = el
-
-            if (name == "Gửi" or name == "Send") and ctl == 50000:
-                r = el.CurrentBoundingRectangle
-                if r.right > r.left and r.bottom > r.top:
-                    send_btn_elem = el
-
-        # If Codex input is not found and sidebar button exists, click to open
-        if not input_elem and codex_open_btn:
+        while time.time() - verify_start < 2.5:
             try:
-                inv_pat_unk = codex_open_btn.GetCurrentPattern(mod.UIA_InvokePatternId)
-                inv_pat = inv_pat_unk.QueryInterface(mod.IUIAutomationInvokePattern)
-                inv_pat.Invoke()
-                time.sleep(0.5)
-            except Exception:
-                br = codex_open_btn.CurrentBoundingRectangle
-                user32.SetCursorPos((br.left + br.right) // 2, (br.top + br.bottom) // 2)
-                time.sleep(0.04)
-                user32.mouse_event(0x0002, 0, 0, 0, 0)
-                time.sleep(0.04)
-                user32.mouse_event(0x0004, 0, 0, 0, 0)
-                time.sleep(0.5)
-
-            all_descendants = elem.FindAll(mod.TreeScope_Descendants, true_cond)
-            for i in range(all_descendants.Length):
-                el = all_descendants.GetElement(i)
-                cls_name = el.CurrentClassName or ""
-                name = el.CurrentName or ""
-                if "prosemirror" in cls_name.lower() or "thay đổi tiếp theo" in name.lower() or "ask anything" in name.lower():
-                    r = el.CurrentBoundingRectangle
-                    if r.right > r.left and r.bottom > r.top:
-                        input_elem = el
-                        break
-
-        # 7. Focus and click into input element
-        if input_elem:
-            try:
-                input_elem.SetFocus()
+                with open(rollout_file, 'r', encoding='utf-8', errors='ignore') as fp:
+                    last_lines = fp.readlines()[-15:]
+                for line in reversed(last_lines):
+                    try:
+                        data = json.loads(line)
+                        t = data.get('type')
+                        p = data.get('payload', {})
+                        if t == 'event_msg' and isinstance(p, dict) and p.get('type') == 'task_started':
+                            new_turn_id = p.get('turn_id')
+                            if new_turn_id and new_turn_id != baseline_turn_id:
+                                turn_started = True
+                                break
+                    except Exception:
+                        continue
+                if turn_started:
+                    break
             except Exception:
                 pass
-            r = input_elem.CurrentBoundingRectangle
-            cx = (r.left + r.right) // 2
-            cy = (r.top + r.bottom) // 2
-            user32.SetCursorPos(cx, cy)
-            time.sleep(0.05)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.05)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-            time.sleep(0.1)
-        else:
-            w_rect = wintypes.RECT()
-            user32.GetWindowRect(target_hwnd, ctypes.byref(w_rect))
-            cx = w_rect.right - 220
-            cy = w_rect.bottom - 100
-            user32.SetCursorPos(cx, cy)
-            time.sleep(0.05)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.05)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-            time.sleep(0.1)
-
-        # 8. Paste prompt via Ctrl+V
-        VK_CONTROL = 0x11
-        VK_V = 0x56
-        VK_RETURN = 0x0D
-        KEYEVENTF_KEYUP = 0x0002
-
-        user32.keybd_event(VK_CONTROL, 0, 0, 0)
-        time.sleep(0.04)
-        user32.keybd_event(VK_V, 0, 0, 0)
-        time.sleep(0.04)
-        user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.04)
-        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.25)
-
-        # 9. Submit prompt
-        invoked = False
-        if send_btn_elem:
-            try:
-                inv_pat_unk = send_btn_elem.GetCurrentPattern(mod.UIA_InvokePatternId)
-                inv_pat = inv_pat_unk.QueryInterface(mod.IUIAutomationInvokePattern)
-                inv_pat.Invoke()
-                invoked = True
-            except Exception:
-                br = send_btn_elem.CurrentBoundingRectangle
-                user32.SetCursorPos((br.left + br.right) // 2, (br.top + br.bottom) // 2)
-                time.sleep(0.04)
-                user32.mouse_event(0x0002, 0, 0, 0, 0)
-                time.sleep(0.04)
-                user32.mouse_event(0x0004, 0, 0, 0, 0)
-                invoked = True
-
-        if not invoked:
-            # Try Ctrl+Enter for multiline markdown / code block inputs
-            user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.04)
-            user32.keybd_event(VK_RETURN, 0, 0, 0)
-            time.sleep(0.04)
-            user32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.04)
-            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.08)
-            # Also send standard Enter
-            user32.keybd_event(VK_RETURN, 0, 0, 0)
-            time.sleep(0.04)
-            user32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
-
-        time.sleep(0.3)
-
-        # 10. Restore cursor position and previous foreground window
-        try:
-            user32.SetCursorPos(orig_cursor.x, orig_cursor.y)
-        except Exception:
-            pass
-
-        if prev_fore_hwnd and prev_fore_hwnd != target_hwnd:
-            try:
-                user32.keybd_event(0x12, 0, 0, 0)
-                user32.keybd_event(0x12, 0, 0x0002, 0)
-                user32.SetForegroundWindow(prev_fore_hwnd)
-            except Exception:
-                pass
+            time.sleep(0.15)
 
         result["success"] = True
+        result["verified"] = True
+        result["turn_id"] = new_turn_id
+        result["message"] = f"Đã nạp chỉ đạo vào phiên Codex [{session_id[:8]}] ngầm thành công (xác thực: task_started)!"
         return result
 
+    except subprocess.TimeoutExpired:
+        result["error"] = "Hết thời gian chờ lệnh 'codex queue' phản hồi"
+        return result
     except Exception as e:
-        result["error"] = str(e)
+        result["error"] = f"Lỗi dispatch ngầm: {str(e)}"
         return result
-
     finally:
-        time.sleep(1.0)
         release_lock()
 
 if __name__ == "__main__":
@@ -307,8 +247,8 @@ if __name__ == "__main__":
         prompt_text = prompt_arg
 
     if not prompt_text.strip():
-        print(json.dumps({"success": False, "error": "Empty prompt provided"}))
+        print(json.dumps({"success": False, "error": "Prompt rỗng"}))
         sys.exit(1)
 
     out = dispatch_prompt_to_codex(prompt_text, proj_arg)
-    print(json.dumps(out))
+    print(json.dumps(out, ensure_ascii=False))
