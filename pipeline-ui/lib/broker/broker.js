@@ -3,6 +3,8 @@
 const crypto = require('crypto');
 const {
   DISPATCH_STATES,
+  WAITABLE_STATES,
+  RECOGNIZED_WAIT_STATES,
   ERROR_CODES,
   LIMITS,
   computeRequestFingerprint
@@ -120,8 +122,18 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    // 3. Project Resolution (Section 26)
-    const project = await registryPort.getProject(request.project_id);
+    // 3. Project Resolution (Sections 26, 34)
+    let project;
+    try {
+      project = await registryPort.getProject(request.project_id);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.REGISTRY_UNAVAILABLE,
+        error: `Registry lookup failed: ${err.message}`
+      };
+    }
+
     if (!project) {
       return {
         ok: false,
@@ -163,8 +175,18 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    // 6. Workspace Freshness Gate (Section 31)
-    const currentWorkspace = await workspacePort.getWorkspaceState(project);
+    // 6. Workspace Freshness Gate (Sections 31, 35)
+    let currentWorkspace;
+    try {
+      currentWorkspace = await workspacePort.getWorkspaceState(project);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
+        error: `Workspace state lookup failed: ${err.message}`
+      };
+    }
+
     const currentWsId = currentWorkspace ? currentWorkspace.workspace_state_id : null;
     if (currentWsId !== request.expected_workspace_state_id) {
       return {
@@ -176,7 +198,7 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    // 7. Atomic Write-Ahead State Registration (Sections 32-34)
+    // 7. Atomic Write-Ahead State Registration (Sections 9, 10, 32-34 / BCORE-06)
     const dispatchId = idFactory.nextDispatchId();
     const dispatchRecord = {
       dispatch_id: dispatchId,
@@ -207,7 +229,7 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    // 8. Call Worker Port (Sections 35-38)
+    // 8. Call Worker Port (Sections 12-14, 35-38 / BCORE-02)
     let workerRes;
     try {
       workerRes = await workerPort.dispatch({
@@ -219,9 +241,17 @@ function createBroker(dependencies = {}) {
       });
     } catch (err) {
       // Ambiguous transport failure (Section 38 / BC-010)
-      lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
+      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
         error: err.message
       });
+      if (!tRes.ok) {
+        return {
+          ok: false,
+          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+          dispatch_id: dispatchId,
+          error: tRes.error
+        };
+      }
       return {
         ok: false,
         code: ERROR_CODES.DISPATCH_UNCERTAIN,
@@ -231,8 +261,16 @@ function createBroker(dependencies = {}) {
     }
 
     if (workerRes && workerRes.ok && workerRes.state === DISPATCH_STATES.DISPATCH_ACCEPTED) {
-      // Definitive acceptance (Section 36)
-      lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_ACCEPTED);
+      // Definitive acceptance (Section 14, 36)
+      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_ACCEPTED);
+      if (!tRes.ok) {
+        return {
+          ok: false,
+          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+          dispatch_id: dispatchId,
+          error: tRes.error
+        };
+      }
       return {
         ok: true,
         state: DISPATCH_STATES.DISPATCH_ACCEPTED,
@@ -242,9 +280,17 @@ function createBroker(dependencies = {}) {
       };
     } else if (workerRes && workerRes.ok === false && workerRes.definitive) {
       // Definitive failure (Section 37)
-      lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_FAILED, {
+      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_FAILED, {
         error: workerRes.error || 'Worker rejected dispatch'
       });
+      if (!tRes.ok) {
+        return {
+          ok: false,
+          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+          dispatch_id: dispatchId,
+          error: tRes.error
+        };
+      }
       return {
         ok: false,
         code: ERROR_CODES.DISPATCH_FAILED,
@@ -253,9 +299,17 @@ function createBroker(dependencies = {}) {
       };
     } else {
       // Ambiguous / unhandled worker response (Section 38)
-      lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
+      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
         error: workerRes ? workerRes.error : 'Ambiguous worker response'
       });
+      if (!tRes.ok) {
+        return {
+          ok: false,
+          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+          dispatch_id: dispatchId,
+          error: tRes.error
+        };
+      }
       return {
         ok: false,
         code: ERROR_CODES.DISPATCH_UNCERTAIN,
@@ -267,7 +321,7 @@ function createBroker(dependencies = {}) {
 
   /**
    * waitWorker(request)
-   * Semantic wait/poll entry point (Sections 40-45).
+   * Semantic wait/poll entry point (Sections 15-32, 40-45 / BCORE-02, BCORE-03, BCORE-04, BCORE-05).
    */
   async function waitWorker(request) {
     if (!request || typeof request !== 'object' || Array.isArray(request)) {
@@ -319,7 +373,8 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    // Short-circuit already terminal states
+    // 1. Wait State Gate (Sections 15-21 / BCORE-03)
+    // Terminal states: return stored state without worker call
     if (dispatch.state === DISPATCH_STATES.READY_FOR_REVIEW) {
       return {
         ok: true,
@@ -347,8 +402,59 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    const project = await registryPort.getProject(request.project_id);
+    // DISPATCH_UNCERTAIN must NOT be resurrected by normal wait (Section 19 / BC-025)
+    if (dispatch.state === DISPATCH_STATES.DISPATCH_UNCERTAIN) {
+      return {
+        ok: false,
+        code: ERROR_CODES.DISPATCH_UNCERTAIN,
+        dispatch_id: dispatch.dispatch_id,
+        state: DISPATCH_STATES.DISPATCH_UNCERTAIN,
+        error: dispatch.error || 'Dispatch delivery outcome is uncertain'
+      };
+    }
 
+    // DISPATCHING concurrent wait returns nonterminal DISPATCHING (Section 20 / BC-026)
+    if (dispatch.state === DISPATCH_STATES.DISPATCHING) {
+      return {
+        ok: true,
+        state: DISPATCH_STATES.DISPATCHING,
+        dispatch_id: dispatch.dispatch_id,
+        work_order_id: dispatch.work_order_id
+      };
+    }
+
+    // Only WAITABLE_STATES (DISPATCH_ACCEPTED, RUNNING) are authorized to call workerPort.wait (Section 21)
+    if (!WAITABLE_STATES.has(dispatch.state)) {
+      return {
+        ok: false,
+        code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
+        dispatch_id: dispatch.dispatch_id,
+        state: dispatch.state,
+        error: `Dispatch state '${dispatch.state}' is not waitable`
+      };
+    }
+
+    // 2. Project Resolution for Wait (Sections 34, 36)
+    let project;
+    try {
+      project = await registryPort.getProject(request.project_id);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.REGISTRY_UNAVAILABLE,
+        error: `Registry lookup failed: ${err.message}`
+      };
+    }
+
+    if (!project) {
+      return {
+        ok: false,
+        code: ERROR_CODES.PROJECT_NOT_FOUND,
+        error: `Project '${request.project_id}' not found`
+      };
+    }
+
+    // 3. Worker Wait Transport (Sections 28-30 / BCORE-05 / BC-029)
     let waitRes;
     try {
       waitRes = await workerPort.wait({
@@ -359,20 +465,52 @@ function createBroker(dependencies = {}) {
         timeout_secs: timeoutSecs
       });
     } catch (err) {
+      // Transport failure during wait does NOT mutate lifecycle to DISPATCH_UNCERTAIN
       return {
         ok: false,
-        code: ERROR_CODES.DISPATCH_UNCERTAIN,
+        code: ERROR_CODES.WORKER_WAIT_UNAVAILABLE,
         dispatch_id: request.dispatch_id,
+        state: dispatch.state,
         error: err.message
       };
     }
 
-    // Identity validation (Section 44 / BC-014, BC-015)
-    if (waitRes && waitRes.ok) {
+    // 4. Validate Worker Wait Response (Sections 22-27 / BCORE-04 / BC-027, BC-028)
+    if (!waitRes || typeof waitRes !== 'object') {
+      return {
+        ok: false,
+        code: ERROR_CODES.WORKER_WAIT_UNAVAILABLE,
+        dispatch_id: request.dispatch_id,
+        state: dispatch.state,
+        error: 'Worker wait returned invalid or empty response'
+      };
+    }
+
+    if (waitRes.ok === true) {
+      // Validate recognized state whitelist (Section 22)
+      if (!waitRes.state || typeof waitRes.state !== 'string' || !RECOGNIZED_WAIT_STATES.has(waitRes.state)) {
+        return {
+          ok: false,
+          code: ERROR_CODES.INVALID_WORKER_RESPONSE,
+          dispatch_id: request.dispatch_id,
+          state: dispatch.state,
+          error: `Worker wait returned unrecognized state: '${waitRes.state}'`
+        };
+      }
+
+      // Identity validation (Sections 24, 32 / BC-014, BC-015)
       if (waitRes.dispatch_id !== request.dispatch_id || waitRes.work_order_id !== dispatch.work_order_id) {
-        lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, {
+        const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, {
           error: `Identity mismatch: expected dispatch '${request.dispatch_id}' / work_order '${dispatch.work_order_id}', got '${waitRes.dispatch_id}' / '${waitRes.work_order_id}'`
         });
+        if (!tRes.ok) {
+          return {
+            ok: false,
+            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+            dispatch_id: request.dispatch_id,
+            error: tRes.error
+          };
+        }
         return {
           ok: false,
           code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
@@ -381,9 +519,29 @@ function createBroker(dependencies = {}) {
         };
       }
 
+      // Response DISPATCH_ACCEPTED (Section 25 / BC-034):
+      // If already RUNNING, maintain monotonic state (keep RUNNING, never regress)
+      if (waitRes.state === DISPATCH_STATES.DISPATCH_ACCEPTED) {
+        return {
+          ok: true,
+          state: dispatch.state === DISPATCH_STATES.RUNNING ? DISPATCH_STATES.RUNNING : DISPATCH_STATES.DISPATCH_ACCEPTED,
+          dispatch_id: request.dispatch_id,
+          work_order_id: dispatch.work_order_id
+        };
+      }
+
+      // Response RUNNING (Section 26)
       if (waitRes.state === DISPATCH_STATES.RUNNING) {
         if (dispatch.state !== DISPATCH_STATES.RUNNING) {
-          lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.RUNNING);
+          const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.RUNNING);
+          if (!tRes.ok) {
+            return {
+              ok: false,
+              code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+              dispatch_id: request.dispatch_id,
+              error: tRes.error
+            };
+          }
         }
         return {
           ok: true,
@@ -393,8 +551,17 @@ function createBroker(dependencies = {}) {
         };
       }
 
+      // Response READY_FOR_REVIEW (Section 27 / BC-030)
       if (waitRes.state === DISPATCH_STATES.READY_FOR_REVIEW) {
-        lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.READY_FOR_REVIEW);
+        const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.READY_FOR_REVIEW);
+        if (!tRes.ok) {
+          return {
+            ok: false,
+            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+            dispatch_id: request.dispatch_id,
+            error: tRes.error
+          };
+        }
         return {
           ok: true,
           state: DISPATCH_STATES.READY_FOR_REVIEW,
@@ -402,21 +569,44 @@ function createBroker(dependencies = {}) {
           work_order_id: dispatch.work_order_id
         };
       }
-    } else if (waitRes && waitRes.ok === false) {
+    } else if (waitRes.ok === false) {
       if (waitRes.definitive) {
-        lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.DISPATCH_FAILED, {
-          error: waitRes.error
+        const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.DISPATCH_FAILED, {
+          error: waitRes.error || 'Definitive worker failure'
         });
+        if (!tRes.ok) {
+          return {
+            ok: false,
+            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+            dispatch_id: request.dispatch_id,
+            error: tRes.error
+          };
+        }
         return {
           ok: false,
           code: ERROR_CODES.DISPATCH_FAILED,
           dispatch_id: request.dispatch_id,
-          error: waitRes.error
+          error: waitRes.error || 'Definitive worker failure'
         };
       }
+
+      // Non-definitive failure without known semantic (Section 23)
+      return {
+        ok: false,
+        code: ERROR_CODES.INVALID_WORKER_RESPONSE,
+        dispatch_id: request.dispatch_id,
+        state: dispatch.state,
+        error: waitRes.error || 'Worker wait returned failure without definitive semantic'
+      };
     }
 
-    return waitRes;
+    return {
+      ok: false,
+      code: ERROR_CODES.INVALID_WORKER_RESPONSE,
+      dispatch_id: request.dispatch_id,
+      state: dispatch.state,
+      error: 'Worker wait returned malformed response without valid ok boolean'
+    };
   }
 
   /**
@@ -454,6 +644,7 @@ function createBroker(dependencies = {}) {
 
   /**
    * getProject(projectId)
+   * Section 36: Port exception safety.
    */
   async function getProject(projectId) {
     if (typeof projectId !== 'string' || !projectId.trim()) {
@@ -464,7 +655,17 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    const project = await registryPort.getProject(projectId);
+    let project;
+    try {
+      project = await registryPort.getProject(projectId);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.REGISTRY_UNAVAILABLE,
+        error: `Registry lookup failed: ${err.message}`
+      };
+    }
+
     if (!project) {
       return {
         ok: false,
@@ -477,6 +678,7 @@ function createBroker(dependencies = {}) {
 
   /**
    * getWorkspaceState(projectId)
+   * Section 36: Port exception safety.
    */
   async function getWorkspaceState(projectId) {
     if (typeof projectId !== 'string' || !projectId.trim()) {
@@ -487,7 +689,17 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    const project = await registryPort.getProject(projectId);
+    let project;
+    try {
+      project = await registryPort.getProject(projectId);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.REGISTRY_UNAVAILABLE,
+        error: `Registry lookup failed: ${err.message}`
+      };
+    }
+
     if (!project) {
       return {
         ok: false,
@@ -496,7 +708,17 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    const wsState = await workspacePort.getWorkspaceState(project);
+    let wsState;
+    try {
+      wsState = await workspacePort.getWorkspaceState(project);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
+        error: `Workspace state lookup failed: ${err.message}`
+      };
+    }
+
     return {
       ok: true,
       project_id: projectId,

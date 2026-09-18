@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Broker Core Unit & Characterization Test Suite (BC-001 .. BC-020)
+ * Broker Core Unit & Characterization Test Suite (BC-001 .. BC-034)
  *
  * Validates the standalone deterministic broker core against all required
  * negative, positive, concurrency, and provenance conditions.
@@ -11,7 +11,7 @@
 const assert = require('node:assert');
 const { createBroker } = require('../../lib/broker/broker');
 const { createMemoryLifecycleStore } = require('../../lib/broker/lifecycle-store');
-const { DISPATCH_STATES, ERROR_CODES } = require('../../lib/broker/contracts');
+const { DISPATCH_STATES, ERROR_CODES, computeRequestFingerprint } = require('../../lib/broker/contracts');
 
 // Helper to create fresh test harness with deterministic dependencies
 function createTestHarness(custom = {}) {
@@ -108,7 +108,7 @@ function baseValidRequest(overrides = {}) {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING BROKER CORE TEST SUITE (BC-001 .. BC-020)');
+  console.log('RUNNING BROKER CORE TEST SUITE (BC-001 .. BC-034)');
   console.log('======================================================================');
 
   // -----------------------------------------------------------------------
@@ -643,8 +643,529 @@ async function runAllTests() {
     console.log('✓ BC-020 PASSED: Ordered deterministic lifecycle transitions verified.');
   }
 
+  // -----------------------------------------------------------------------
+  // BC-021: Transition patch cannot overwrite state (Section 37 / BCORE-01)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-021] Testing transition patch cannot overwrite state...');
+  {
+    const { lifecycleStore } = createTestHarness();
+    const record = {
+      dispatch_id: 'D-PATCH-01',
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-PATCH-01',
+      expected_workspace_state_id: 'sha256:current-head-hash',
+      request_fingerprint: 'fp-1',
+      directive: 'test directive',
+      state: DISPATCH_STATES.DISPATCHING,
+      created_at: new Date().toISOString()
+    };
+    const beginRes = lifecycleStore.beginDispatch('ai-multi-task', record);
+    assert.strictEqual(beginRes.ok, true);
+
+    const transRes = lifecycleStore.transition('D-PATCH-01', DISPATCH_STATES.DISPATCH_ACCEPTED, {
+      state: DISPATCH_STATES.READY_FOR_REVIEW
+    });
+    assert.strictEqual(transRes.ok, false);
+    assert.strictEqual(transRes.code, ERROR_CODES.IMMUTABLE_FIELD_VIOLATION);
+    assert.strictEqual(transRes.field, 'state');
+
+    const stored = lifecycleStore.getDispatch('D-PATCH-01');
+    assert.strictEqual(stored.state, DISPATCH_STATES.DISPATCHING);
+    console.log('✓ BC-021 PASSED: State overwrite via patch failed closed, state remains DISPATCHING.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-022: Reserved identity fields immutable in transition patch (Section 38, 52 / BCORE-01)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-022] Testing reserved fields immutable in transition patch & canonical fingerprint...');
+  {
+    const { lifecycleStore } = createTestHarness();
+    const record = {
+      dispatch_id: 'D-PATCH-02',
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-PATCH-02',
+      expected_workspace_state_id: 'sha256:current-head-hash',
+      request_fingerprint: 'fp-2',
+      directive: 'test directive',
+      state: DISPATCH_STATES.DISPATCHING,
+      created_at: new Date().toISOString()
+    };
+    lifecycleStore.beginDispatch('ai-multi-task', record);
+
+    const forbiddenFields = [
+      'dispatch_id',
+      'project_id',
+      'work_order_id',
+      'request_fingerprint',
+      'created_at',
+      'updated_at'
+    ];
+
+    for (const field of forbiddenFields) {
+      const storedBefore = lifecycleStore.getDispatch('D-PATCH-02');
+      const beforeValue = storedBefore[field];
+      const patch = { [field]: 'illegal_value' };
+      const transRes = lifecycleStore.transition('D-PATCH-02', DISPATCH_STATES.DISPATCH_ACCEPTED, patch);
+      assert.strictEqual(transRes.ok, false, `Field '${field}' must fail closed`);
+      assert.strictEqual(transRes.code, ERROR_CODES.IMMUTABLE_FIELD_VIOLATION);
+      assert.strictEqual(transRes.field, field);
+
+      const stored = lifecycleStore.getDispatch('D-PATCH-02');
+      assert.strictEqual(stored[field], beforeValue, `Field '${field}' must remain unmodified`);
+      assert.strictEqual(stored.state, DISPATCH_STATES.DISPATCHING);
+    }
+
+    // Deterministic canonical fingerprint check (Section 52)
+    const fp1 = computeRequestFingerprint({
+      projectId: 'a',
+      workOrderId: 'b',
+      expectedWorkspaceStateId: 'c',
+      directive: 'd\0e'
+    });
+    const fp2 = computeRequestFingerprint({
+      projectId: 'a\0b',
+      workOrderId: '',
+      expectedWorkspaceStateId: 'c',
+      directive: 'd\0e'
+    });
+    assert.notStrictEqual(fp1, fp2, 'Canonical JSON array encoding must prevent delimiter injection collision');
+
+    console.log('✓ BC-022 PASSED: All reserved record fields rejected with IMMUTABLE_FIELD_VIOLATION.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-023: beginDispatch fails closed on project identity mismatch (Section 39 / BCORE-06)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-023] Testing beginDispatch project identity mismatch...');
+  {
+    const { lifecycleStore } = createTestHarness();
+    const record = {
+      dispatch_id: 'D-MISMATCH-01',
+      project_id: 'project-b',
+      work_order_id: 'WO-MISMATCH-01',
+      expected_workspace_state_id: 'sha256:current-head-hash',
+      request_fingerprint: 'fp-mismatch',
+      directive: 'test directive',
+      state: DISPATCH_STATES.DISPATCHING,
+      created_at: new Date().toISOString()
+    };
+
+    const beginRes = lifecycleStore.beginDispatch('ai-multi-task', record);
+    assert.strictEqual(beginRes.ok, false);
+    assert.strictEqual(beginRes.code, ERROR_CODES.PROJECT_IDENTITY_MISMATCH);
+
+    // Verify no record inserted
+    assert.strictEqual(lifecycleStore.getDispatch('D-MISMATCH-01'), null);
+
+    // Verify no active pointer for either project
+    assert.strictEqual(lifecycleStore.getActiveDispatch('ai-multi-task'), null);
+    assert.strictEqual(lifecycleStore.getActiveDispatch('project-b'), null);
+
+    // Verify no history event
+    assert.strictEqual(lifecycleStore.getProjectHistory('ai-multi-task').length, 0);
+    assert.strictEqual(lifecycleStore.getProjectHistory('project-b').length, 0);
+
+    console.log('✓ BC-023 PASSED: Project identity mismatch rejected with zero store side-effects.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-024: Duplicate dispatch_id collision fails closed (Section 40 / BCORE-06)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-024] Testing dispatch_id collision protection...');
+  {
+    const duplicateIdFactory = {
+      nextDispatchId: () => 'D-COLLISION-STATIC-ID'
+    };
+    const { broker, lifecycleStore, workerCalls } = createTestHarness({ idFactory: duplicateIdFactory });
+
+    // First dispatch succeeds
+    const res1 = await broker.dispatchWorker(baseValidRequest({ work_order_id: 'WO-FIRST' }));
+    assert.strictEqual(res1.ok, true);
+    assert.strictEqual(res1.dispatch_id, 'D-COLLISION-STATIC-ID');
+    assert.strictEqual(workerCalls.dispatch.length, 1);
+
+    // Fast-finish the first dispatch so project is IDLE
+    lifecycleStore.transition('D-COLLISION-STATIC-ID', DISPATCH_STATES.READY_FOR_REVIEW);
+
+    // Second dispatch attempts with different work order but idFactory generates the collision
+    const res2 = await broker.dispatchWorker(baseValidRequest({ work_order_id: 'WO-SECOND' }));
+    assert.strictEqual(res2.ok, false);
+    assert.strictEqual(res2.code, ERROR_CODES.DISPATCH_ID_COLLISION);
+    assert.strictEqual(workerCalls.dispatch.length, 1, 'Worker must not be called on dispatch_id collision');
+
+    const originalRecord = lifecycleStore.getDispatch('D-COLLISION-STATIC-ID');
+    assert.strictEqual(originalRecord.work_order_id, 'WO-FIRST');
+    assert.strictEqual(originalRecord.state, DISPATCH_STATES.READY_FOR_REVIEW);
+
+    console.log('✓ BC-024 PASSED: Dispatch ID collision detected and rejected with zero worker calls.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-025: DISPATCH_UNCERTAIN resurrection blocked (Section 41 / BCORE-03)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-025] Testing DISPATCH_UNCERTAIN cannot be waited or resurrected...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => { throw new Error('Network timeout during dispatch'); },
+      wait: async () => ({
+        ok: true,
+        state: DISPATCH_STATES.READY_FOR_REVIEW,
+        dispatch_id: 'D-ANY',
+        work_order_id: 'WO-018'
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, lifecycleStore, workerCalls } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.DISPATCH_UNCERTAIN);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.DISPATCH_UNCERTAIN);
+    assert.strictEqual(waitRes.state, DISPATCH_STATES.DISPATCH_UNCERTAIN);
+    assert.strictEqual(workerCalls.wait.length, 0, 'workerPort.wait must NOT be called for DISPATCH_UNCERTAIN');
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.state, DISPATCH_STATES.DISPATCH_UNCERTAIN);
+    console.log('✓ BC-025 PASSED: DISPATCH_UNCERTAIN cannot be resurrected by wait; 0 worker calls.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-026: Concurrent waitWorker on DISPATCHING returns nonterminal (Section 42 / BCORE-03)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-026] Testing concurrent wait on DISPATCHING state...');
+  {
+    let resolveWorkerDispatch;
+    const workerDispatchPromise = new Promise((resolve) => {
+      resolveWorkerDispatch = resolve;
+    });
+
+    const customWorkerPort = {
+      dispatch: async () => {
+        await workerDispatchPromise;
+        return { ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED };
+      },
+      wait: async (args) => ({
+        ok: true,
+        state: DISPATCH_STATES.RUNNING,
+        dispatch_id: args.dispatch_id,
+        work_order_id: args.work_order_id
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, lifecycleStore, workerCalls } = createTestHarness({ workerPort: customWorkerPort });
+
+    // Start dispatch without awaiting immediately
+    const dispatchPromise = broker.dispatchWorker(baseValidRequest());
+
+    // Allow event loop to advance to workerPort.dispatch call
+    await new Promise((r) => setImmediate(r));
+
+    const active = lifecycleStore.getActiveDispatch('ai-multi-task');
+    assert.ok(active);
+    assert.strictEqual(active.state, DISPATCH_STATES.DISPATCHING);
+
+    // Call waitWorker while dispatch is still in progress
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: active.dispatch_id,
+      timeout_secs: 5
+    });
+
+    assert.strictEqual(waitRes.ok, true);
+    assert.strictEqual(waitRes.state, DISPATCH_STATES.DISPATCHING);
+    assert.strictEqual(workerCalls.wait.length, 0, 'workerPort.wait must NOT be called while DISPATCHING');
+
+    // Now resolve worker dispatch
+    resolveWorkerDispatch();
+    const dispRes = await dispatchPromise;
+    assert.strictEqual(dispRes.ok, true);
+    assert.strictEqual(dispRes.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+
+    console.log('✓ BC-026 PASSED: Concurrent wait during DISPATCHING returns nonterminal DISPATCHING without wait calls.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-027: Malformed / unrecognized wait state fails closed (Section 43 / BCORE-04)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-027] Testing unrecognized worker wait state fails closed...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => ({
+        ok: true,
+        state: 'DONE',
+        dispatch_id: args.dispatch_id,
+        work_order_id: args.work_order_id
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, lifecycleStore } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.INVALID_WORKER_RESPONSE);
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.state, DISPATCH_STATES.DISPATCH_ACCEPTED, 'State must remain DISPATCH_ACCEPTED');
+    console.log('✓ BC-027 PASSED: Arbitrary "DONE" worker state rejected with INVALID_WORKER_RESPONSE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-028: Wait returning undefined fails closed (Section 44 / BCORE-04)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-028] Testing wait returning undefined fails closed...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async () => undefined,
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, lifecycleStore } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.ok(
+      waitRes.code === ERROR_CODES.WORKER_WAIT_UNAVAILABLE || waitRes.code === ERROR_CODES.INVALID_WORKER_RESPONSE,
+      `Expected WORKER_WAIT_UNAVAILABLE or INVALID_WORKER_RESPONSE, got ${waitRes.code}`
+    );
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    console.log('✓ BC-028 PASSED: Undefined worker wait response handled with structured failure.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-029: Wait transport exception is nonterminal WORKER_WAIT_UNAVAILABLE (Section 45 / BCORE-05)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-029] Testing wait transport exception preserves lifecycle state...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async () => {
+        throw new Error('Transient polling network reset');
+      },
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, lifecycleStore } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    // Advance to RUNNING first via lifecycleStore to test RUNNING preservation
+    lifecycleStore.transition(dispRes.dispatch_id, DISPATCH_STATES.RUNNING);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.WORKER_WAIT_UNAVAILABLE);
+    assert.strictEqual(waitRes.state, DISPATCH_STATES.RUNNING);
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.state, DISPATCH_STATES.RUNNING, 'State must remain RUNNING, not DISPATCH_UNCERTAIN');
+    console.log('✓ BC-029 PASSED: Wait transport exception returned WORKER_WAIT_UNAVAILABLE without mutating RUNNING state.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-030: Transition failure after READY_FOR_REVIEW reports LIFECYCLE_STORE_FAILURE (Section 46 / BCORE-02)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-030] Testing lifecycle transition failure on READY_FOR_REVIEW...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => ({
+        ok: true,
+        state: DISPATCH_STATES.READY_FOR_REVIEW,
+        dispatch_id: args.dispatch_id,
+        work_order_id: args.work_order_id
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const baseStore = createMemoryLifecycleStore();
+    const failingStore = {
+      ...baseStore,
+      transition: (dispatchId, nextState, patch) => {
+        if (nextState === DISPATCH_STATES.READY_FOR_REVIEW) {
+          return {
+            ok: false,
+            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+            error: 'Simulated persistence failure on READY_FOR_REVIEW transition'
+          };
+        }
+        return baseStore.transition(dispatchId, nextState, patch);
+      }
+    };
+
+    const { broker } = createTestHarness({
+      workerPort: customWorkerPort,
+      lifecycleStore: failingStore
+    });
+
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    assert.strictEqual(dispRes.ok, true);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    assert.strictEqual(waitRes.dispatch_id, dispRes.dispatch_id);
+    console.log('✓ BC-030 PASSED: Transition failure during READY_FOR_REVIEW returned LIFECYCLE_STORE_FAILURE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-031: Transition failure after dispatch DISPATCH_ACCEPTED reports failure (Section 47 / BCORE-02)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-031] Testing lifecycle transition failure on DISPATCH_ACCEPTED...');
+  {
+    const baseStore = createMemoryLifecycleStore();
+    const failingStore = {
+      ...baseStore,
+      transition: (dispatchId, nextState, patch) => {
+        if (nextState === DISPATCH_STATES.DISPATCH_ACCEPTED) {
+          return {
+            ok: false,
+            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+            error: 'Simulated persistence failure on DISPATCH_ACCEPTED transition'
+          };
+        }
+        return baseStore.transition(dispatchId, nextState, patch);
+      }
+    };
+
+    const { broker } = createTestHarness({ lifecycleStore: failingStore });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    console.log('✓ BC-031 PASSED: Transition failure during DISPATCH_ACCEPTED returned LIFECYCLE_STORE_FAILURE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-032: Registry port throws during dispatch (Section 48 / Port Safety)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-032] Testing registry port exception during dispatch...');
+  {
+    const throwingRegistryPort = {
+      getProject: async () => {
+        throw new Error('Database connection lost to registry');
+      }
+    };
+
+    const { broker, workerCalls } = createTestHarness({ registryPort: throwingRegistryPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.REGISTRY_UNAVAILABLE);
+    assert.strictEqual(workerCalls.dispatch.length, 0, 'Worker must not be called when registry throws');
+    console.log('✓ BC-032 PASSED: Registry port exception caught and mapped to REGISTRY_UNAVAILABLE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-033: Workspace port throws during dispatch (Section 49 / Port Safety)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-033] Testing workspace port exception during dispatch...');
+  {
+    const throwingWorkspacePort = {
+      getWorkspaceState: async () => {
+        throw new Error('Git repository locked or inaccessible');
+      }
+    };
+
+    const { broker, workerCalls } = createTestHarness({ workspacePort: throwingWorkspacePort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE);
+    assert.strictEqual(workerCalls.dispatch.length, 0, 'Worker must not be called when workspace throws');
+    console.log('✓ BC-033 PASSED: Workspace port exception caught and mapped to WORKSPACE_STATE_UNAVAILABLE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-034: Wait returns DISPATCH_ACCEPTED when already RUNNING preserves RUNNING (Section 50 / BCORE-04)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-034] Testing wait response DISPATCH_ACCEPTED preserves RUNNING state...');
+  {
+    let waitCallCount = 0;
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => {
+        waitCallCount++;
+        if (waitCallCount === 1) {
+          return {
+            ok: true,
+            state: DISPATCH_STATES.RUNNING,
+            dispatch_id: args.dispatch_id,
+            work_order_id: args.work_order_id
+          };
+        }
+        return {
+          ok: true,
+          state: DISPATCH_STATES.DISPATCH_ACCEPTED,
+          dispatch_id: args.dispatch_id,
+          work_order_id: args.work_order_id
+        };
+      },
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, lifecycleStore } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    // First wait transitions to RUNNING
+    const wait1 = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+    assert.strictEqual(wait1.ok, true);
+    assert.strictEqual(wait1.state, DISPATCH_STATES.RUNNING);
+
+    // Second wait receives stale DISPATCH_ACCEPTED
+    const wait2 = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+    assert.strictEqual(wait2.ok, true);
+    assert.strictEqual(wait2.state, DISPATCH_STATES.RUNNING, 'State must remain RUNNING, never regress');
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.state, DISPATCH_STATES.RUNNING);
+    console.log('✓ BC-034 PASSED: Monotonic lifecycle preserved: RUNNING was not regressed to DISPATCH_ACCEPTED.');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-020: 20/20 PASS)');
+  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-034: 34/34 PASS)');
   console.log('======================================================================');
 }
 

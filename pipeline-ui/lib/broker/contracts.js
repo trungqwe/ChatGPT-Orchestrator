@@ -3,8 +3,7 @@
 const crypto = require('crypto');
 
 /**
- * Dispatch Lifecycle States
- * Section 19: Minimal deterministic control states.
+ * Dispatch Lifecycle States (Section 19)
  */
 const DISPATCH_STATES = Object.freeze({
   DISPATCHING: 'DISPATCHING',
@@ -38,6 +37,37 @@ const TERMINAL_STATES = Object.freeze(new Set([
 ]));
 
 /**
+ * States authorized to call workerPort.wait (Section 21)
+ */
+const WAITABLE_STATES = Object.freeze(new Set([
+  DISPATCH_STATES.DISPATCH_ACCEPTED,
+  DISPATCH_STATES.RUNNING
+]));
+
+/**
+ * Recognized Successful Worker Wait States (Section 22)
+ */
+const RECOGNIZED_WAIT_STATES = Object.freeze(new Set([
+  DISPATCH_STATES.DISPATCH_ACCEPTED,
+  DISPATCH_STATES.RUNNING,
+  DISPATCH_STATES.READY_FOR_REVIEW
+]));
+
+/**
+ * Reserved Record Fields (Section 7, BCORE-01)
+ * Immutable after beginDispatch. A patch containing any of these must fail closed.
+ */
+const RESERVED_RECORD_FIELDS = Object.freeze(new Set([
+  'dispatch_id',
+  'project_id',
+  'work_order_id',
+  'request_fingerprint',
+  'created_at',
+  'updated_at',
+  'state'
+]));
+
+/**
  * Standard Structured Error Codes
  */
 const ERROR_CODES = Object.freeze({
@@ -53,7 +83,15 @@ const ERROR_CODES = Object.freeze({
   PROVENANCE_AMBIGUOUS: 'PROVENANCE_AMBIGUOUS',
   DISPATCH_NOT_FOUND: 'DISPATCH_NOT_FOUND',
   DISPATCH_PROJECT_MISMATCH: 'DISPATCH_PROJECT_MISMATCH',
-  ILLEGAL_STATE_TRANSITION: 'ILLEGAL_STATE_TRANSITION'
+  ILLEGAL_STATE_TRANSITION: 'ILLEGAL_STATE_TRANSITION',
+  IMMUTABLE_FIELD_VIOLATION: 'IMMUTABLE_FIELD_VIOLATION',
+  PROJECT_IDENTITY_MISMATCH: 'PROJECT_IDENTITY_MISMATCH',
+  DISPATCH_ID_COLLISION: 'DISPATCH_ID_COLLISION',
+  LIFECYCLE_STORE_FAILURE: 'LIFECYCLE_STORE_FAILURE',
+  WORKER_WAIT_UNAVAILABLE: 'WORKER_WAIT_UNAVAILABLE',
+  INVALID_WORKER_RESPONSE: 'INVALID_WORKER_RESPONSE',
+  REGISTRY_UNAVAILABLE: 'REGISTRY_UNAVAILABLE',
+  WORKSPACE_STATE_UNAVAILABLE: 'WORKSPACE_STATE_UNAVAILABLE'
 });
 
 /**
@@ -67,16 +105,17 @@ const LIMITS = Object.freeze({
 });
 
 /**
- * Compute canonical SHA-256 fingerprint for deterministic request identity (Section 28).
- * Fingerprint incorporates: project_id, work_order_id, expected_workspace_state_id, directive exact bytes.
+ * Compute canonical SHA-256 fingerprint for deterministic request identity (Section 28, 52).
+ * Uses canonical JSON array encoding to ensure unambiguous field boundaries.
+ * Does NOT include opaque audit_metadata (Section 53).
  */
 function computeRequestFingerprint({ projectId, workOrderId, expectedWorkspaceStateId, directive }) {
-  const payload = [
+  const payload = JSON.stringify([
     projectId || '',
     workOrderId || '',
     expectedWorkspaceStateId || '',
     directive || ''
-  ].join('\0');
+  ]);
   return crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
 }
 
@@ -84,6 +123,9 @@ module.exports = {
   DISPATCH_STATES,
   ACTIVE_STATES,
   TERMINAL_STATES,
+  WAITABLE_STATES,
+  RECOGNIZED_WAIT_STATES,
+  RESERVED_RECORD_FIELDS,
   ERROR_CODES,
   LIMITS,
   computeRequestFingerprint

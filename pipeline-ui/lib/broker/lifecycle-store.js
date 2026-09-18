@@ -1,6 +1,11 @@
 'use strict';
 
-const { DISPATCH_STATES, ACTIVE_STATES, ERROR_CODES } = require('./contracts');
+const {
+  DISPATCH_STATES,
+  ACTIVE_STATES,
+  RESERVED_RECORD_FIELDS,
+  ERROR_CODES
+} = require('./contracts');
 
 /**
  * Valid Transition Map (Section 46):
@@ -34,7 +39,7 @@ const ALLOWED_TRANSITIONS = Object.freeze({
 /**
  * Volatile / Memory-backed Lifecycle Store (Sections 16-18)
  * Explicit label: VOLATILE / NON-DURABLE reference implementation for tests.
- * Provides atomic concurrency semantics and transition validation.
+ * Provides atomic concurrency semantics, immutable identity protection, and transition validation.
  */
 function createMemoryLifecycleStore(options = {}) {
   const clock = options.clock || {
@@ -71,11 +76,40 @@ function createMemoryLifecycleStore(options = {}) {
   }
 
   /**
-   * Atomic Begin Dispatch (Section 34):
-   * Ensures only one active dispatch can be registered per project.
-   * Detects idempotent replay or duplicate conflicts atomically.
+   * Atomic Begin Dispatch (Sections 9, 10, 34 / BCORE-06):
+   * 1. Validates record.project_id === projectId (fail closed on mismatch).
+   * 2. Checks dispatch_id collision (fail closed on duplicate ID).
+   * 3. Ensures only one active dispatch can be registered per project.
+   * 4. Atomically registers DISPATCHING intent.
    */
   function beginDispatch(projectId, record) {
+    if (!record || typeof record !== 'object') {
+      return {
+        ok: false,
+        code: ERROR_CODES.INVALID_REQUEST,
+        error: 'Record must be a non-null object'
+      };
+    }
+
+    // BCORE-06: Project identity mismatch validation (Section 9)
+    if (record.project_id !== projectId) {
+      return {
+        ok: false,
+        code: ERROR_CODES.PROJECT_IDENTITY_MISMATCH,
+        error: `Project identity mismatch: argument '${projectId}' does not match record '${record.project_id}'`
+      };
+    }
+
+    // BCORE-06: Dispatch ID collision check (Section 10)
+    if (dispatchesById.has(record.dispatch_id)) {
+      return {
+        ok: false,
+        code: ERROR_CODES.DISPATCH_ID_COLLISION,
+        error: `Dispatch ID collision: '${record.dispatch_id}' already exists in lifecycle store`
+      };
+    }
+
+    // Active dispatch check
     const currentActiveId = activeDispatchByProject.get(projectId);
     if (currentActiveId) {
       const activeRecord = dispatchesById.get(currentActiveId);
@@ -129,8 +163,10 @@ function createMemoryLifecycleStore(options = {}) {
   }
 
   /**
-   * Transition Dispatch State (Section 46):
-   * Enforces transition legality and manages active state membership.
+   * Transition Dispatch State (Sections 6, 7, 46 / BCORE-01):
+   * 1. Validates that patch does NOT mutate reserved authoritative fields.
+   * 2. Enforces transition legality against ALLOWED_TRANSITIONS.
+   * 3. Manages active state membership.
    */
   function transition(dispatchId, nextState, patch = {}) {
     const record = dispatchesById.get(dispatchId);
@@ -140,6 +176,20 @@ function createMemoryLifecycleStore(options = {}) {
         code: ERROR_CODES.DISPATCH_NOT_FOUND,
         error: `Dispatch '${dispatchId}' not found`
       };
+    }
+
+    // BCORE-01: Immutable lifecycle identity protection (Sections 6-8)
+    if (patch && typeof patch === 'object') {
+      for (const key of Object.keys(patch)) {
+        if (RESERVED_RECORD_FIELDS.has(key)) {
+          return {
+            ok: false,
+            code: ERROR_CODES.IMMUTABLE_FIELD_VIOLATION,
+            field: key,
+            error: `Cannot mutate authoritative reserved field '${key}' in transition patch`
+          };
+        }
+      }
     }
 
     const allowed = ALLOWED_TRANSITIONS[record.state];
@@ -156,7 +206,9 @@ function createMemoryLifecycleStore(options = {}) {
     const previousState = record.state;
     record.state = nextState;
     record.updated_at = clock.iso();
-    Object.assign(record, patch);
+    if (patch) {
+      Object.assign(record, patch);
+    }
 
     // If new state is terminal (inactive), clear from active dispatch pointer
     if (!ACTIVE_STATES.has(nextState)) {
@@ -173,7 +225,7 @@ function createMemoryLifecycleStore(options = {}) {
       next_state: nextState,
       timestamp: clock.now(),
       iso: clock.iso(),
-      patch: { ...patch }
+      patch: patch ? { ...patch } : {}
     });
 
     return { ok: true, dispatch: { ...record } };
