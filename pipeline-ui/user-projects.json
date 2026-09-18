@@ -1,0 +1,26 @@
+[
+  {
+    "id": "calc-engine",
+    "name": "calc-engine",
+    "path": "d:\\TU_CODE\\Orchestrator\\calc-engine",
+    "addedAt": "2026-09-17T12:00:00.000Z"
+  },
+  {
+    "id": "orchestrator",
+    "name": "Orchestrator",
+    "path": "d:\\TU_CODE\\Orchestrator",
+    "addedAt": "2026-09-17T12:00:00.000Z"
+  },
+  {
+    "id": "ai_task_manager",
+    "name": "AI_Task_Manager",
+    "path": "D:\\TU_CODE\\AI_Task_Manager",
+    "addedAt": "2026-09-17T06:11:23.274Z"
+  },
+  {
+    "id": "ai_multi_task",
+    "name": "AI_Multi_Task",
+    "path": "D:\\TU_CODE\\AI_Multi_Task",
+    "addedAt": "2026-09-17T06:14:40.954Z"
+  }
+]

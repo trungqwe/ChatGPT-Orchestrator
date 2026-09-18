@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChatGPT Web & Antigravity Pipeline Portal</title>
+  <meta name="description" content="Dedicated UI Portal to manage, filter, and extract data from ChatGPT Web Orchestrator and Antigravity Worker pipeline.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Topbar Header -->
+    <header class="topbar">
+      <div class="brand-section">
+        <div class="brand-logo">
+          <span class="logo-orb pulse-glow"></span>
+          <span class="logo-text">Pipeline<span class="highlight">Observer</span></span>
+        </div>
+      </div>
+
+      <!-- Context Toolbar: Only Project & Antigravity Session -->
+      <div class="model-selection-toolbar">
+        <div class="context-select-group">
+          <span class="model-role-tag">Dự Án:</span>
+          <select id="global-project-select" class="form-select form-select-sm" title="Chọn Thư Mục Dự Án">
+            <option value="">Đang nạp dự án...</option>
+          </select>
+          <button id="btn-open-project-folder" class="btn btn-secondary btn-xs" title="Mở trực tiếp thư mục dự án trên máy" style="display:flex; align-items:center; gap:4px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+            <span>📂 Mở Thư Mục...</span>
+          </button>
+        </div>
+
+        <div class="context-select-group">
+          <span class="model-role-tag">Phiên Antigravity:</span>
+          <select id="global-antigravity-session-select" class="form-select form-select-sm" title="Chọn Phiên Chat Antigravity" style="min-width: 280px; max-width: 420px;">
+            <option value="auto">🟢 Tự động phát hiện phiên hoạt động</option>
+          </select>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Container -->
+    <div class="content-container">
+      <!-- Sidebar Navigation -->
+      <aside class="sidebar">
+        <nav class="nav-menu">
+          <button class="nav-item active" data-tab="observer">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/></svg>
+            <span>Khung Điều Phối & Quan Sát</span>
+            <span class="badge badge-cyan">Live Stream</span>
+          </button>
+          <button class="nav-item" data-tab="projects">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            <span>Quản Lý Dự Án</span>
+          </button>
+          <button class="nav-item" data-tab="settings">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+            <span>Cấu Hình</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="pane-card sidebar-tech-pane">
+            <div class="pane-card-header">
+              <div class="pane-title-group">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+                <span>Lộ Trình & Files Kỹ Thuật</span>
+              </div>
+              <span class="badge badge-purple" id="badge-tech-files-count">0 Files</span>
+            </div>
+            <div class="pane-card-body">
+              <div class="tech-files-list" id="tech-files-list">
+                <div class="text-muted" style="font-size: 0.8rem;">Chọn dự án để xem file...</div>
+              </div>
+              <div class="tech-file-preview-box hidden" id="tech-file-preview-box">
+                <div class="preview-header">
+                  <span id="preview-filename" class="preview-filename">ROADMAP.md</span>
+                  <button id="btn-close-file-preview" class="btn-xs-close">&times;</button>
+                </div>
+                <pre class="preview-content" id="preview-file-content"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main Workspace View -->
+      <main class="main-content">
+        <!-- Overview Stats Banner -->
+        <section class="stats-grid">
+          <div class="stat-card stat-cyan">
+            <div class="stat-label">Tổng Số Sessions</div>
+            <div class="stat-value" id="stat-total-sessions">0</div>
+            <div class="stat-sub">Quản lý qua AO Daemon</div>
+          </div>
+          <div class="stat-card stat-purple">
+            <div class="stat-label">Orchestrator (ChatGPT Web)</div>
+            <div class="stat-value" id="stat-orch-sessions">0</div>
+            <div class="stat-sub">Model: chatgpt-web/medium</div>
+          </div>
+          <div class="stat-card stat-emerald">
+            <div class="stat-label">Worker (Antigravity)</div>
+            <div class="stat-value" id="stat-worker-sessions">0</div>
+            <div class="stat-sub">Harness: agy (ConPTY)</div>
+          </div>
+          <div class="stat-card stat-blue">
+            <div class="stat-label">Dự Án Đã Đăng Ký</div>
+            <div class="stat-value" id="stat-projects-count">0</div>
+            <div class="stat-sub">Git Worktrees Cô Lập</div>
+          </div>
+        </section>
+
+
+        <!-- Dynamic View: Projects -->
+        <section class="tab-view" id="view-projects">
+          <div class="view-header">
+            <div>
+              <h2 class="section-title">Quản Lý Dự Án Repository</h2>
+              <p class="section-subtitle">Đăng ký và cấu hình dự án Git để làm việc với ChatGPT Web và Antigravity.</p>
+            </div>
+            <button id="btn-add-project-modal" class="btn btn-primary">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+              <span>Thêm Repository Mới</span>
+            </button>
+          </div>
+
+          <div class="projects-grid" id="projects-container">
+            <!-- Rendered by JS -->
+          </div>
+        </section>
+
+        <!-- Dynamic View: Cấu Hình (Settings) -->
+        <section class="tab-view" id="view-settings">
+          <div class="view-header">
+            <div>
+              <h2 class="section-title">Cấu Hình Kết Nối ChatGPT Web & Codex</h2>
+              <p class="section-subtitle">Đăng nhập tài khoản ChatGPT Web, tự động kết nối Codex runtime và đồng bộ danh mục model.</p>
+            </div>
+            <div class="settings-top-actions">
+              <button id="btn-sync-codex" class="btn btn-secondary">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                <span>Kiểm Tra & Đồng Bộ Codex</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="settings-grid">
+            <!-- Connection Status Card -->
+            <div class="card settings-card">
+              <div class="card-header">
+                <div class="card-title-group">
+                  <span class="card-title">Trạng Thái Kết Nối ChatGPT & Codex</span>
+                </div>
+                <span class="badge badge-emerald" id="badge-chatgpt-status">🟢 ĐÃ KẾT NỐI & VERIFIED</span>
+              </div>
+              <div class="card-body">
+                <div class="settings-meta-grid">
+                  <div class="meta-item">
+                    <span class="meta-label">Tài Khoản ChatGPT:</span>
+                    <span class="meta-value text-cyan" id="cfg-account-status">Đang Đăng Nhập (Authenticated)</span>
+                  </div>
+                  <div class="meta-item">
+                    <span class="meta-label">Codex Native Route:</span>
+                    <span class="meta-value text-purple" id="cfg-route-status">Đã Kết Nối (127.0.0.1:17841)</span>
+                  </div>
+                  <div class="meta-item">
+                    <span class="meta-label">Trạng Thái Proxy:</span>
+                    <span class="meta-value" id="cfg-proxy-status">Online (Port 17841)</span>
+                  </div>
+                  <div class="meta-item">
+                    <span class="meta-label">Trạng Thái Verify:</span>
+                    <span class="meta-value text-emerald" id="cfg-verify-status">✓ Xác Thực Thành Công</span>
+                  </div>
+                </div>
+
+                <div class="settings-actions-row">
+                  <button id="btn-chatgpt-login" class="btn btn-primary">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                    <span>🔐 Đăng Nhập ChatGPT Web</span>
+                  </button>
+                  <button id="btn-chatgpt-logout" class="btn btn-secondary btn-danger-subtle">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                    <span>🚪 Thoát Tài Khoản / Đổi Tài Khoản</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Codex Models Dropdown Card -->
+            <div class="card settings-card">
+              <div class="card-header">
+                <div class="card-title-group">
+                  <span class="card-title">Danh Mục Model Codex (Import Tự Động)</span>
+                </div>
+                <span class="badge badge-cyan" id="badge-codex-model-status">✓ Verified (Codex Ready)</span>
+              </div>
+              <div class="card-body">
+                <div class="form-group">
+                  <label class="form-label" style="font-size:0.82rem; font-weight:600;">Model Codex Hoạt Động (Mặc định cao nhất):</label>
+                  <div style="display:flex; gap:8px; align-items:center;">
+                    <select id="select-codex-imported-models" class="form-select" style="flex:1;">
+                      <option value="chatgpt-web/high" selected>chatgpt-web/high (ChatGPT Web High Reasoning) - Mặc định</option>
+                      <option value="chatgpt-web/medium">chatgpt-web/medium (ChatGPT Web Medium Reasoning)</option>
+                      <option value="chatgpt-web/light">chatgpt-web/light (ChatGPT Web Light / Fast)</option>
+                      <option value="gpt-5.6-sol">gpt-5.6-sol (Sol Deep Audit Backend)</option>
+                      <option value="gpt-5.6-luna">gpt-5.6-luna (Luna Extended Context Backend)</option>
+                    </select>
+                    <button id="btn-verify-model" class="btn btn-secondary btn-sm" title="Kiểm tra ping trực tiếp qua Codex">
+                      <span>Test Verify</span>
+                    </button>
+                  </div>
+                  <p class="text-muted" style="font-size:0.75rem; margin-top:6px;">
+                    Các model được tự động đồng bộ từ <code>codex-chatgpt-web</code> vào Codex. Hệ thống luôn mặc định sử dụng model cao nhất <code>chatgpt-web/high</code> cho các lượt điều phối tự động.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <!-- Diagnostics Console -->
+            <div class="card terminal-card">
+              <div class="card-header">
+                <span class="card-title">Codex & ChatGPT Web Doctor Log</span>
+                <span class="badge badge-purple" id="doctor-badge">Ready</span>
+              </div>
+              <pre class="terminal-body" id="doctor-output" style="max-height: 200px;">Đang đọc thông tin chẩn đoán...</pre>
+            </div>
+          </div>
+        </section>
+
+        <!-- Dynamic View: Observer & Orchestrator -->
+        <section class="tab-view active" id="view-observer">
+          <!-- Full Workspace Chat Pane -->
+          <div class="observer-workspace full-chat-workspace">
+            <div class="observer-main-pane">
+              <div class="chat-portal-card">
+                <!-- Header -->
+                <div class="chat-card-header">
+                  <div class="chat-header-info">
+                    <div class="chat-header-title-row">
+                      <span class="chat-indicator-dot"></span>
+                      <h3 class="chat-header-title">Khung Trao Đổi ChatGPT Web ⇄ Antigravity</h3>
+                      <div class="chat-meta-inline">
+                        <span class="metric-lbl">Dự Án:</span>
+                        <span class="metric-val" id="disp-active-project">-</span>
+                        <span class="meta-divider">•</span>
+                        <span class="metric-lbl">Phiên:</span>
+                        <span class="metric-val" id="disp-active-session">-</span>
+                        <span class="meta-divider">•</span>
+                        <span class="status-badge badge-emerald" id="disp-loop-status">Sẵn Sàng</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Verification / Retry Alert Banner (Active when delivery needs attention) -->
+                <div id="dispatch-verify-banner" class="dispatch-verify-banner hidden">
+                  <div class="verify-banner-content">
+                    <span class="verify-icon">⚠️</span>
+                    <span id="verify-banner-msg">Chưa phát hiện Agent trên Antigravity IDE bắt đầu thi công...</span>
+                  </div>
+                  <div class="verify-banner-actions">
+                    <button id="btn-verify-retry" class="btn btn-xs btn-primary">🔄 Thử Nạp Lại</button>
+                    <button id="btn-verify-copy" class="btn btn-xs btn-secondary">📋 Copy Prompt</button>
+                    <button id="btn-verify-dismiss" class="btn btn-xs btn-ghost" title="Đóng">&times;</button>
+                  </div>
+                </div>
+
+                <!-- Chat Messages Scroll Container -->
+                <div class="chat-messages-container" id="exchange-stream-container">
+                  <div class="stream-empty-state" id="stream-empty-state">
+                    <span class="empty-dot"></span>
+                    <span class="empty-hint">Chưa có tin nhắn trong phiên trao đổi này. Bấm "⚡ Bắt Đầu Vòng Lặp Tự Động" hoặc gửi tin nhắn để bắt đầu.</span>
+                  </div>
+                </div>
+
+                <!-- Chat Input & Quick Action Area -->
+                <div class="chat-composer-box">
+                  <!-- Fast Action Toolbar -->
+                  <div class="chat-toolbar">
+                    <button id="btn-quick-fire-report" class="btn-chip btn-chip-primary" title="Bắt đầu vòng lặp tự động khép kín: Tự audit -> Tự nạp lệnh vào Antigravity -> Agent sửa code -> Tự lấy báo cáo audit tiếp...">
+                      <span id="txt-loop-btn">⚡ Bắt Đầu Vòng Lặp Tự Động</span>
+                    </button>
+                    <button id="btn-stop-loop" class="btn-chip btn-chip-danger hidden" title="Dừng vòng lặp tự động">
+                      <span>🛑 Dừng Vòng Lặp</span>
+                    </button>
+                    <button id="btn-quick-preview-report" class="btn-chip" title="Xem trước nội dung Worker Report & Handoff">
+                      <span>👁️ Xem Trước Báo Cáo</span>
+                    </button>
+                    <button id="btn-clear-chat-stream" class="btn-chip btn-danger-subtle" title="Chỉ xóa nội dung chat hiển thị trên tool, tuyệt đối không xóa file cứng của Antigravity">
+                      <span>🗑️ Xóa Lịch Sử Chat</span>
+                    </button>
+                    <div class="chat-toolbar-spacer"></div>
+                    <div class="live-sync-indicator" title="Chế độ Live Sync & Điều phối tự động khép kín">
+                      <span class="pulse-dot"></span>
+                      <span id="live-indicator-text">🟢 Vòng Lặp Tự Động Khép Kín</span>
+                    </div>
+                  </div>
+
+                  <!-- Text Input Row -->
+                  <div class="chat-input-wrapper">
+                    <textarea id="chat-input-textarea" class="chat-textarea" rows="2" placeholder="Gõ câu hỏi, chỉ đạo bổ sung, hoặc bấm 'Gửi Báo Cáo Antigravity Mới Nhất'... (Shift+Enter xuống dòng, Enter để gửi)"></textarea>
+                    <button id="btn-chat-send" class="btn-chat-send" title="Gửi sang ChatGPT Web (Enter)">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+                    </button>
+                  </div>
+                  
+                  <div class="chat-status-bar" id="chat-status-bar">
+                    <span id="chat-status-text">Sẵn sàng điều phối</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Slide-over Drawer: Session Detail & Extraction Inspector -->
+    <div class="drawer-overlay" id="drawer-overlay"></div>
+    <aside class="drawer" id="session-drawer">
+      <div class="drawer-header">
+        <div class="drawer-title-group">
+          <span class="badge" id="drawer-role-badge">Role</span>
+          <h3 class="drawer-title" id="drawer-title">Session Detail</h3>
+        </div>
+        <button class="btn-close" id="drawer-close-btn">&times;</button>
+      </div>
+
+      <div class="drawer-tabs">
+        <button class="drawer-tab-btn active" data-dtab="overview">Tổng Quan</button>
+        <button class="drawer-tab-btn" data-dtab="plan" id="dtab-plan-btn">Chiết Xuất Kế Hoạch (Plan)</button>
+        <button class="drawer-tab-btn" data-dtab="artifacts" id="dtab-artifacts-btn">Files & Tests (Worker)</button>
+      </div>
+
+      <div class="drawer-body">
+        <!-- Drawer Tab: Overview -->
+        <div class="dtab-content active" id="dtab-overview">
+          <div class="meta-list" id="drawer-meta-list"></div>
+          
+          <div class="quick-action-box">
+            <h4>Hành Động Nhanh</h4>
+            <div class="action-buttons">
+              <button class="btn btn-secondary" id="drawer-send-btn">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                <span>Nhắn Tin Điều Phối (Send/Steer)</span>
+              </button>
+              <button class="btn btn-danger" id="drawer-kill-btn">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                <span>Dừng Session (Kill)</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Drawer Tab: Plan Extraction (for Orchestrator) -->
+        <div class="dtab-content" id="dtab-plan">
+          <div class="extract-alert">
+            <span class="extract-icon">💡</span>
+            <div>
+              <strong>Kế hoạch được trích lọc từ ChatGPT Web</strong>
+              <p>Bạn có thể duyệt kế hoạch này và bấm nút bên dưới để chuyển giao trực tiếp cho Worker Antigravity thi công.</p>
+            </div>
+          </div>
+
+          <div class="plan-section">
+            <div class="section-subtitle-bar">
+              <span>Nội dung kế hoạch chi tiết:</span>
+              <button class="btn btn-xs btn-secondary" id="btn-copy-plan">Sao Chép</button>
+            </div>
+            <pre class="code-preview-box" id="extracted-plan-text">Đang chiết xuất kế hoạch...</pre>
+          </div>
+
+          <div class="plan-section">
+            <div class="section-subtitle-bar">
+              <span>Prompt giao việc chuẩn cho Antigravity Worker:</span>
+              <button class="btn btn-xs btn-secondary" id="btn-copy-worker-prompt">Sao Chép Prompt</button>
+            </div>
+            <pre class="code-preview-box prompt-box" id="extracted-worker-prompt">Đang chiết xuất prompt...</pre>
+          </div>
+
+          <div class="bridge-action-bar">
+            <button class="btn btn-success btn-lg" id="btn-dispatch-to-agy">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+              <span>Giao Ngay Cho Antigravity Worker</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Drawer Tab: Worker Artifacts & Worktree -->
+        <div class="dtab-content" id="dtab-artifacts">
+          <div class="worktree-header-bar">
+            <div>
+              <span class="worktree-path-label">Đường dẫn Git Worktree:</span>
+              <code class="worktree-path" id="worktree-path-val">...</code>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-run-worktree-test">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              <span>Chạy Kiểm Thử (Run Test)</span>
+            </button>
+          </div>
+
+          <!-- Test Output Section -->
+          <div class="test-result-box hidden" id="test-result-box">
+            <div class="test-result-header">
+              <span id="test-status-badge" class="badge">Running</span>
+              <span id="test-cmd-label">node test.js</span>
+            </div>
+            <pre class="terminal-body" id="test-output-text">Chạy test...</pre>
+          </div>
+
+          <!-- Files in Worktree -->
+          <div class="files-split-view">
+            <div class="file-list-col">
+              <h4>Files Trong Worktree</h4>
+              <ul class="file-list" id="worktree-files-ul">
+                <li class="file-item loading">Đang nạp file...</li>
+              </ul>
+            </div>
+            <div class="file-preview-col">
+              <div class="preview-header">
+                <span id="preview-filename">Chọn file để xem code</span>
+                <button class="btn btn-xs btn-secondary" id="btn-copy-code">Copy</button>
+              </div>
+              <pre class="code-preview-box large" id="file-content-view">// Nội dung file sẽ hiển thị tại đây</pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Modal: Spawn Session -->
+    <div class="modal-overlay" id="spawn-modal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 class="modal-title">Khởi Tạo Session Mới</h3>
+          <button class="btn-close" id="spawn-modal-close">&times;</button>
+        </div>
+        <form id="spawn-form">
+          <div class="form-group">
+            <label class="form-label">Chọn Dự Án:</label>
+            <select class="form-select" id="spawn-project" required></select>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Chọn Vai Trò & Agent:</label>
+            <div class="role-selector-cards">
+              <label class="role-card selected" id="role-opt-orch">
+                <input type="radio" name="spawn-role" value="orchestrator" checked>
+                <div class="role-card-body">
+                  <span class="role-name">Orchestrator</span>
+                  <span class="role-agent">ChatGPT Web (via Codex)</span>
+                  <span class="role-desc">Lập kế hoạch, thiết kế kiến trúc, phân chia công việc.</span>
+                </div>
+              </label>
+
+              <label class="role-card" id="role-opt-worker">
+                <input type="radio" name="spawn-role" value="worker">
+                <div class="role-card-body">
+                  <span class="role-name">Worker</span>
+                  <span class="role-agent">Antigravity (agy CLI)</span>
+                  <span class="role-desc">Triển khai code, tạo file, thực thi lệnh và test trong Git worktree.</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Tên Session (Tối đa 20 ký tự):</label>
+            <input type="text" class="form-input" id="spawn-name" placeholder="vd: feature-greeting, plan-v1..." maxlength="20" required>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Yêu Cầu / Prompt Ban Đầu:</label>
+            <textarea class="form-textarea" id="spawn-prompt" rows="5" placeholder="Nhập yêu cầu chi tiết cho agent..." required></textarea>
+          </div>
+
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" id="spawn-modal-cancel">Hủy</button>
+            <button type="submit" class="btn btn-primary" id="spawn-submit-btn">
+              <span>Bắt Đầu Session</span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Modal: Send Message -->
+    <div class="modal-overlay" id="send-modal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 class="modal-title">Gửi Lệnh Điều Phối (Send/Steer)</h3>
+          <button class="btn-close" id="send-modal-close">&times;</button>
+        </div>
+        <form id="send-form">
+          <input type="hidden" id="send-session-id">
+          <div class="form-group">
+            <label class="form-label">Session Nhận Lệnh:</label>
+            <input type="text" class="form-input" id="send-session-display" readonly>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Nội Dung Tin Nhắn / Lệnh Chỉ Đạo:</label>
+            <textarea class="form-textarea" id="send-message-text" rows="4" placeholder="Nhập hướng dẫn tiếp theo hoặc câu hỏi..." required></textarea>
+          </div>
+
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" id="send-modal-cancel">Hủy</button>
+            <button type="submit" class="btn btn-primary">Gửi Lệnh Ngay</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toast-container"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

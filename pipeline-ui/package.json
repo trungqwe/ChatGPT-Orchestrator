@@ -1,0 +1,17 @@
+{
+  "name": "pipeline-ui",
+  "version": "1.0.0",
+  "description": "Custom Management & Extraction Portal for ChatGPT Web Orchestrator + Antigravity Worker Pipeline",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "desktop": "electron desktop-main.js",
+    "test": "node test/pipeline-api.test.js && node test/closed-loop.test.js"
+  },
+  "dependencies": {
+    "express": "^4.22.3"
+  },
+  "devDependencies": {
+    "electron": "^44.4.1"
+  }
+}

@@ -1,0 +1,6 @@
+[submodule "agent-orchestrator"]
+	path = agent-orchestrator
+	url = https://github.com/Untrivial-ai/agent-orchestrator.git
+[submodule "codex-chatgpt-web"]
+	path = codex-chatgpt-web
+	url = https://github.com/miuuyy/codex-chatgpt-web
