@@ -4,6 +4,8 @@ import json
 import time
 import sys
 import subprocess
+import uuid
+import re
 from datetime import datetime
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -132,12 +134,20 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
     - Pre-flight busy check (Chống Push Mù).
     - Post-flight queue verification (Chống Thất Lạc Lệnh).
     """
+    dispatch_id = str(uuid.uuid4())
+    client_user_message_id = f"orchestrator:{dispatch_id}"
+
     result = {
         "success": False,
         "queued": False,
         "verified": False,
         "turn_started": False,
         "turn_id": None,
+        "dispatch_id": dispatch_id,
+        "client_user_message_id": client_user_message_id,
+        "queued_submission_id": None,
+        "correlation_method": "unavailable",
+        "observed_post_dispatch_turn_id": None,
         "busy": False,
         "worker": "codex_extension",
         "method": "codex_background_queue",
@@ -173,7 +183,7 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
         baseline_turn_id = get_last_completed_turn_id(rollout_file)
         result["baseline_turn_id"] = baseline_turn_id
 
-        # Record baseline line count before dispatch to ensure new task_started is strictly post-dispatch
+        # Record baseline line count before dispatch to ensure post-dispatch diagnostic observation
         baseline_line_count = 0
         try:
             with open(rollout_file, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -201,28 +211,59 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
             result["verified"] = False
             result["turn_started"] = False
             result["turn_id"] = None
+            result["correlation_method"] = "unavailable"
             result["error"] = f"Lỗi codex queue (exit code {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
             return result
 
-        # 4. Post-flight Verification: Verify message was queued
+        # 4. Post-flight Verification: Inspect transport output
         queue_output = proc.stdout.strip()
-        if "Queued message" not in queue_output and "for thread" not in queue_output:
-            result["queued"] = False
-            result["success"] = False
-            result["verified"] = False
-            result["turn_started"] = False
-            result["turn_id"] = None
-            result["error"] = f"Không nhận được tín hiệu xác thực hàng đợi: {queue_output}"
-            return result
+        parsed_transport_json = None
 
-        result["queued"] = True
+        for line in queue_output.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("{") and line_str.endswith("}"):
+                try:
+                    parsed_transport_json = json.loads(line_str)
+                    break
+                except Exception:
+                    continue
 
-        # 5. Verify turn activation in rollout (wait up to 2.5 seconds for task_started)
-        turn_started = False
-        new_turn_id = None
+        exact_turn_id = None
+        exact_sub_id = None
+
+        if parsed_transport_json and isinstance(parsed_transport_json, dict):
+            exact_turn_id = parsed_transport_json.get("turn_id")
+            if not exact_turn_id and isinstance(parsed_transport_json.get("turn"), dict):
+                exact_turn_id = parsed_transport_json["turn"].get("id")
+            exact_sub_id = parsed_transport_json.get("queued_submission_id") or parsed_transport_json.get("submission_id") or parsed_transport_json.get("id")
+            if parsed_transport_json.get("client_user_message_id"):
+                result["client_user_message_id"] = parsed_transport_json.get("client_user_message_id")
+            result["queued"] = bool(parsed_transport_json.get("queued", True))
+        else:
+            if "Queued message" in queue_output or "for thread" in queue_output:
+                result["queued"] = True
+                m = re.search(r"Queued message\s+([^\s]+)\s+for thread", queue_output)
+                if m:
+                    exact_sub_id = m.group(1)
+            else:
+                result["queued"] = False
+                result["success"] = False
+                result["verified"] = False
+                result["turn_started"] = False
+                result["turn_id"] = None
+                result["correlation_method"] = "unavailable"
+                result["error"] = f"Không nhận được tín hiệu xác thực hàng đợi: {queue_output}"
+                return result
+
+        if exact_sub_id:
+            result["queued_submission_id"] = str(exact_sub_id)
+
+        # 5. Diagnostic observation: observe whether a new task_started appeared in rollout
+        # CRITICAL (B-01): Heuristic observation of rollout lines is strictly DIAGNOSTIC.
+        # It NEVER authorizes verified=true. Exact correlation must come from the transport.
+        observed_post_dispatch_turn_id = None
         verify_start = time.time()
-
-        while time.time() - verify_start < 2.5:
+        while time.time() - verify_start < 1.0:
             try:
                 with open(rollout_file, 'r', encoding='utf-8', errors='ignore') as fp:
                     all_lines = fp.readlines()
@@ -235,29 +276,36 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
                         if t == 'event_msg' and isinstance(p, dict) and p.get('type') == 'task_started':
                             observed_tid = p.get('turn_id')
                             if observed_tid and observed_tid != baseline_turn_id:
-                                new_turn_id = observed_tid
-                                turn_started = True
+                                observed_post_dispatch_turn_id = observed_tid
                                 break
                     except Exception:
                         continue
-                if turn_started:
+                if observed_post_dispatch_turn_id:
                     break
             except Exception:
                 pass
-            time.sleep(0.15)
+            time.sleep(0.1)
 
-        if turn_started and new_turn_id:
+        result["observed_post_dispatch_turn_id"] = observed_post_dispatch_turn_id
+
+        # 6. Decision Tree (Section 9): Path A vs Path B
+        if exact_turn_id:
+            # Path A: Exact transport correlation confirmed
             result["success"] = True
             result["verified"] = True
             result["turn_started"] = True
-            result["turn_id"] = new_turn_id
-            result["message"] = f"Đã nạp chỉ đạo vào phiên Codex [{session_id[:8]}] ngầm thành công (xác thực: task_started turn '{new_turn_id}')!"
+            result["turn_id"] = str(exact_turn_id)
+            result["correlation_method"] = "exact_transport"
+            result["message"] = f"Đã nạp chỉ đạo vào phiên Codex [{session_id[:8]}] và xác thực turn '{exact_turn_id}' qua exact_transport."
         else:
+            # Path B: Local installed transport cannot return exact correlation (codex-cli 0.154.0)
+            # Fail-closed: message was queued, but exact resulting turn cannot be proven.
             result["success"] = True
             result["verified"] = False
             result["turn_started"] = False
             result["turn_id"] = None
-            result["message"] = f"Lệnh đã nạp vào hàng đợi Codex [{session_id[:8]}] nhưng chưa quan sát thấy task_started trong cửa sổ theo dõi"
+            result["correlation_method"] = "unavailable"
+            result["message"] = f"Lệnh đã nạp vào hàng đợi Codex [{session_id[:8]}] nhưng transport cục bộ không hỗ trợ exact turn correlation (fail-closed)"
 
         return result
 

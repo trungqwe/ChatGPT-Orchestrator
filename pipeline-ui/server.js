@@ -96,9 +96,17 @@ async function dispatchPromptToCodex(prompt, projectId) {
       result.targetWindow = pyOut.target_window;
       result.baselineTurnId = pyOut.baseline_turn_id;
       result.method = pyOut.method || 'codex_background_queue';
+      result.dispatchId = pyOut.dispatch_id || null;
+      result.sessionId = pyOut.session_id || null;
+      result.correlationMethod = pyOut.correlation_method || 'unavailable';
 
-      // Distinguish queued from verified
-      const isTurnVerified = !!(pyOut.verified && pyOut.turn_started && pyOut.turn_id);
+      // Distinguish queued from verified: only verified when exact correlation exists
+      const isTurnVerified = !!(
+        pyOut.verified &&
+        pyOut.turn_started &&
+        pyOut.turn_id &&
+        pyOut.correlation_method === 'exact_transport'
+      );
       result.verified = isTurnVerified;
       result.turn_started = isTurnVerified;
       result.targetTurnId = isTurnVerified ? pyOut.turn_id : null;
@@ -107,15 +115,18 @@ async function dispatchPromptToCodex(prompt, projectId) {
         result.message = pyOut.message || `Đã nạp chỉ đạo vào phiên Codex ngầm (${pyOut.target_window}) và xác thực turn ${pyOut.turn_id}!`;
         lastDispatchedCodexTurn[proj] = {
           targetTurnId: pyOut.turn_id,
+          sessionId: pyOut.session_id,
+          dispatchId: pyOut.dispatch_id,
+          correlationMethod: pyOut.correlation_method,
           baselineTurnId: pyOut.baseline_turn_id,
           timestamp: Date.now()
         };
-        console.log(`[CODEX BG DISPATCH VERIFIED] ${pyOut.target_window} turn=${pyOut.turn_id}`);
+        console.log(`[CODEX BG DISPATCH VERIFIED] ${pyOut.target_window} turn=${pyOut.turn_id} (exact)`);
       } else {
         // Clear any stale tracking to guarantee we NEVER watch an unverified turn
         delete lastDispatchedCodexTurn[proj];
-        result.message = pyOut.message || `Lệnh đã nạp vào hàng đợi Codex (${pyOut.target_window}) nhưng chưa xác thực được task_started`;
-        console.warn(`[CODEX BG DISPATCH UNVERIFIED] ${pyOut.target_window} queued=true but task_started not observed`);
+        result.message = pyOut.message || `Lệnh đã nạp vào hàng đợi Codex (${pyOut.target_window}) nhưng chưa xác thực được exact turn_id`;
+        console.warn(`[CODEX BG DISPATCH UNVERIFIED] ${pyOut.target_window} queued=true, exact correlation=${pyOut.correlation_method}`);
       }
       return result;
     } else {
@@ -132,10 +143,11 @@ async function dispatchPromptToCodex(prompt, projectId) {
 }
 
 // Helper: Wait for Codex Extension turn completion via watch_codex_session.py
-function waitCodexReport(projectId = 'AI_Multi_Task', timeoutSecs = 180, targetTurnId = null) {
+function waitCodexReport(projectId = 'AI_Multi_Task', timeoutSecs = 180, targetTurnId = null, sessionId = null) {
   return new Promise((resolve) => {
     const tracked = lastDispatchedCodexTurn[projectId];
     const effectiveTargetTurn = targetTurnId || tracked?.targetTurnId;
+    const effectiveSessionId = sessionId || tracked?.sessionId;
 
     // Reject waiting without verified target turn ID to prevent stale report attribution
     if (!effectiveTargetTurn) {
@@ -151,7 +163,10 @@ function waitCodexReport(projectId = 'AI_Multi_Task', timeoutSecs = 180, targetT
     }
 
     const pyScript = path.join(__dirname, 'watch_codex_session.py');
-    const pyCmd = `python "${pyScript}" --project "${projectId}" --timeout ${timeoutSecs} --target-turn "${effectiveTargetTurn}"`;
+    let pyCmd = `python "${pyScript}" --project "${projectId}" --timeout ${timeoutSecs} --target-turn "${effectiveTargetTurn}"`;
+    if (effectiveSessionId) {
+      pyCmd += ` --session-id "${effectiveSessionId}"`;
+    }
 
     exec(pyCmd, { timeout: (timeoutSecs + 10) * 1000 }, (err, stdout, stderr) => {
       try {
@@ -2551,12 +2566,12 @@ app.post('/api/worker/engine', (req, res) => {
 });
 
 app.post('/api/worker/wait-report', async (req, res) => {
-  const { projectId, workerEngine, timeoutSecs, targetTurnId } = req.body;
+  const { projectId, workerEngine, timeoutSecs, targetTurnId, sessionId } = req.body;
   const effectiveWorker = workerEngine || currentSettings.workerEngine || 'gemini';
   const proj = projectId || 'AI_Multi_Task';
 
   if (effectiveWorker === 'codex') {
-    const reportData = await waitCodexReport(proj, timeoutSecs || 180, targetTurnId);
+    const reportData = await waitCodexReport(proj, timeoutSecs || 180, targetTurnId, sessionId);
     return res.json(reportData);
   }
 

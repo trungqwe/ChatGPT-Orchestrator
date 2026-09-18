@@ -44,6 +44,29 @@ def find_project_rollouts(project_keyword="AI_Multi_Task"):
                 continue
     return matched_files
 
+def find_session_rollout_by_id(session_id):
+    """Locate rollout file specifically for the given session_id."""
+    if not session_id:
+        return None
+    for sdir in get_codex_sessions_dirs():
+        files = glob.glob(os.path.join(sdir, f"rollout-*{session_id}*.jsonl"))
+        for fpath in files:
+            return fpath
+        all_files = glob.glob(os.path.join(sdir, "rollout-*.jsonl"))
+        all_files.sort(key=os.path.getmtime, reverse=True)
+        for fpath in all_files:
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as fp:
+                    first_line = fp.readline()
+                    if not first_line:
+                        continue
+                    meta = json.loads(first_line)
+                    if meta.get('payload', {}).get('id') == session_id:
+                        return fpath
+            except Exception:
+                continue
+    return None
+
 def extract_latest_codex_report(project_keyword="AI_Multi_Task"):
     files = find_project_rollouts(project_keyword)
     if not files:
@@ -79,33 +102,50 @@ def extract_latest_codex_report(project_keyword="AI_Multi_Task"):
                 except Exception:
                     continue
 
+        is_valid = isinstance(last_message, str) and bool(last_message.strip())
         return {
-            "success": bool(last_message),
+            "success": is_valid,
             "session_file": latest_file,
             "session_id": session_id,
             "turn_id": turn_id,
             "duration_ms": duration_ms,
-            "report_text": last_message,
-            "error": None if last_message else "Chưa có phản hồi nào từ agent trong rollout"
+            "report_text": last_message if is_valid else None,
+            "error": None if is_valid else "Chưa có phản hồi hợp lệ từ agent trong rollout"
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline_turn_id=None, target_turn_id=None, poll_interval=0.5):
+def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline_turn_id=None, target_turn_id=None, session_id=None, poll_interval=0.5):
     """
     Instant-Responsive Watcher (Chống Chờ Chết):
     - Polls every 500ms.
+    - If session_id is specified: binds strictly to that session file.
     - If target_turn_id is specified: waits for task_complete of that exact turn.
     - If baseline_turn_id is specified: waits for task_complete with turn_id != baseline_turn_id.
     - Returns in < 1 second once Codex finishes.
     - Never waits to timeout if turn is already completed.
+    - Fails closed on empty/whitespace report body.
     """
     start_time = time.time()
-    files = find_project_rollouts(project_keyword)
-    if not files:
-        return {"success": False, "error": f"Không tìm thấy phiên Codex nào cho '{project_keyword}'"}
+    target_file = None
 
-    target_file, session_id = files[0]
+    if session_id:
+        target_file = find_session_rollout_by_id(session_id)
+        if not target_file:
+            return {
+                "success": False,
+                "verified": False,
+                "session_id": session_id,
+                "target_turn_id": target_turn_id,
+                "turn_id": None,
+                "report_text": None,
+                "error": f"Không tìm thấy phiên Codex với session_id '{session_id}'"
+            }
+    else:
+        files = find_project_rollouts(project_keyword)
+        if not files:
+            return {"success": False, "error": f"Không tìm thấy phiên Codex nào cho '{project_keyword}'"}
+        target_file, session_id = files[0]
 
     # If neither target nor baseline is specified, detect latest completed turn at start
     if not target_turn_id and not baseline_turn_id:
@@ -129,7 +169,7 @@ def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline
     try:
         with open(target_file, 'r', encoding='utf-8', errors='ignore') as fp:
             recent_lines = fp.readlines()[-30:]
-        
+
         for line in reversed(recent_lines):
             try:
                 data = json.loads(line)
@@ -144,14 +184,36 @@ def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline
                         is_match = True
 
                     if is_match:
+                        last_msg = p.get('last_agent_message')
+                        is_valid_report = isinstance(last_msg, str) and bool(last_msg.strip())
+                        if not is_valid_report:
+                            return {
+                                "success": False,
+                                "verified": False,
+                                "turn_completed": True,
+                                "report_available": False,
+                                "target_turn_id": target_turn_id or current_turn_id,
+                                "turn_id": current_turn_id,
+                                "session_file": target_file,
+                                "session_id": session_id,
+                                "duration_ms": p.get('duration_ms', 0),
+                                "report_text": None,
+                                "elapsed_secs": round(time.time() - start_time, 2),
+                                "instant": True,
+                                "error": "Target Codex turn completed without a non-empty worker report"
+                            }
+
                         return {
                             "success": True,
                             "verified": True,
+                            "turn_completed": True,
+                            "report_available": True,
+                            "target_turn_id": target_turn_id or current_turn_id,
+                            "turn_id": current_turn_id,
                             "session_file": target_file,
                             "session_id": session_id,
-                            "turn_id": current_turn_id,
                             "duration_ms": p.get('duration_ms', 0),
-                            "report_text": p.get('last_agent_message', ''),
+                            "report_text": last_msg,
                             "elapsed_secs": round(time.time() - start_time, 2),
                             "instant": True,
                             "error": None
@@ -165,9 +227,11 @@ def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline
     while time.time() - start_time < timeout_secs:
         time.sleep(poll_interval)
 
-        current_files = find_project_rollouts(project_keyword)
-        if current_files:
-            target_file, session_id = current_files[0]
+        # If not bound to a specific session_id, track latest project rollout
+        if not session_id:
+            current_files = find_project_rollouts(project_keyword)
+            if current_files:
+                target_file, session_id = current_files[0]
 
         try:
             with open(target_file, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -189,22 +253,51 @@ def watch_codex_turn(project_keyword="AI_Multi_Task", timeout_secs=180, baseline
                                 is_match = True
 
                             if is_match:
-                                last_msg = p.get('last_agent_message', '')
+                                last_msg = p.get('last_agent_message')
+                                is_valid_report = isinstance(last_msg, str) and bool(last_msg.strip())
+                                if not is_valid_report:
+                                    return {
+                                        "success": False,
+                                        "verified": False,
+                                        "turn_completed": True,
+                                        "report_available": False,
+                                        "target_turn_id": target_turn_id or tid,
+                                        "turn_id": tid,
+                                        "session_file": target_file,
+                                        "session_id": session_id,
+                                        "duration_ms": p.get('duration_ms', 0),
+                                        "report_text": None,
+                                        "elapsed_secs": round(time.time() - start_time, 2),
+                                        "instant": False,
+                                        "error": "Target Codex turn completed without a non-empty worker report"
+                                    }
+
                                 return {
                                     "success": True,
                                     "verified": True,
+                                    "turn_completed": True,
+                                    "report_available": True,
+                                    "target_turn_id": target_turn_id or tid,
+                                    "turn_id": tid,
                                     "session_file": target_file,
                                     "session_id": session_id,
-                                    "turn_id": tid,
                                     "duration_ms": p.get('duration_ms', 0),
                                     "report_text": last_msg,
                                     "elapsed_secs": round(time.time() - start_time, 2),
+                                    "instant": False,
                                     "error": None
                                 }
                         elif pt == 'error':
+                            err_tid = p.get('turn_id')
                             return {
                                 "success": False,
-                                "verified": True,
+                                "verified": False,
+                                "turn_failed": True,
+                                "turn_id": err_tid,
+                                "target_turn_id": target_turn_id,
+                                "session_file": target_file,
+                                "session_id": session_id,
+                                "report_text": None,
                                 "error": p.get('message') or 'Codex runtime error'
                             }
                 except Exception:
@@ -241,11 +334,12 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--baseline-turn", default=None)
     parser.add_argument("--target-turn", default=None)
+    parser.add_argument("--session-id", default=None)
     parser.add_argument("--latest", action="store_true")
     args = parser.parse_args()
 
     if args.latest:
         res = extract_latest_codex_report(args.project)
     else:
-        res = watch_codex_turn(args.project, args.timeout, args.baseline_turn, args.target_turn)
+        res = watch_codex_turn(args.project, args.timeout, args.baseline_turn, args.target_turn, args.session_id)
     print(json.dumps(res, ensure_ascii=False))

@@ -47,7 +47,12 @@ function compileMockCodexExe(targetExePath, defaultOutputMessage) {
     'using System.IO;',
     'class P {',
     '  static void Main(string[] args) {',
-    `    Console.WriteLine(@"${defaultOutputMessage.replace(/"/g, '""')}");`,
+    '    string jsonOut = Environment.GetEnvironmentVariable("MOCK_EXACT_TRANSPORT_JSON");',
+    '    if (!string.IsNullOrEmpty(jsonOut)) {',
+    '      Console.WriteLine(jsonOut);',
+    '    } else {',
+    `      Console.WriteLine(@"${defaultOutputMessage.replace(/"/g, '""')}");`,
+    '    }',
     '    string rf = Environment.GetEnvironmentVariable("MOCK_ROLLOUT_FILE");',
     '    string turn = Environment.GetEnvironmentVariable("MOCK_TASK_STARTED_TURN");',
     '    if (!string.IsNullOrEmpty(rf) && !string.IsNullOrEmpty(turn) && File.Exists(rf)) {',
@@ -206,8 +211,8 @@ function testF02_CodexDispatchStateModel() {
     });
 
     // -----------------------------------------------------------------------
-    // Test B: Queue acknowledged, matching task_started observed post-dispatch
-    // Invariant: queued=true, verified=true, turn_started=true, turn_id=matching ID
+    // Test B (F-02-B): Exact transport returns correlated turn ID
+    // Invariant: queued=true, verified=true, turn_started=true, turn_id=matching ID, correlation_method='exact_transport'
     // -----------------------------------------------------------------------
     cleanLock();
     // Fresh session file (idle state)
@@ -220,8 +225,12 @@ function testF02_CodexDispatchStateModel() {
       ...process.env,
       USERPROFILE: tmpDir,
       PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
-      MOCK_ROLLOUT_FILE: rolloutFile,
-      MOCK_TASK_STARTED_TURN: 'turn-new-active-001' // Mock codex queues and activates turn
+      MOCK_EXACT_TRANSPORT_JSON: JSON.stringify({
+        queued: true,
+        queued_submission_id: 'sub-active-001',
+        turn_id: 'turn-new-active-001',
+        client_user_message_id: 'orchestrator:test-exact-001'
+      })
     };
 
     const procB = spawnSync('python', [scriptPath, 'test prompt text 2', 'AI_Multi_Task'], {
@@ -235,19 +244,21 @@ function testF02_CodexDispatchStateModel() {
     const resB = JSON.parse((procB.stdout || '').trim());
 
     assert.strictEqual(resB.queued, true, 'Queue accepted');
-    assert.strictEqual(resB.verified, true, 'verified must be true when matching task_started observed');
-    assert.strictEqual(resB.turn_started, true, 'turn_started must be true when matching task_started observed');
-    assert.strictEqual(resB.turn_id, 'turn-new-active-001', 'turn_id must match observed turn_id');
+    assert.strictEqual(resB.verified, true, 'verified must be true when exact transport correlates turn');
+    assert.strictEqual(resB.turn_started, true, 'turn_started must be true when exact transport correlates turn');
+    assert.strictEqual(resB.turn_id, 'turn-new-active-001', 'turn_id must match exact transport turn_id');
+    assert.strictEqual(resB.correlation_method, 'exact_transport', 'correlation_method must be exact_transport');
+    assert.strictEqual(resB.queued_submission_id, 'sub-active-001', 'queued_submission_id must match transport output');
     assert.ok(resB.message.includes('turn-new-active-001'), 'Message references verified turn ID');
-    console.log('✓ F-02 Test B PASSED: Matching task_started verified=true, turn_id=turn-new-active-001.');
+    console.log('✓ F-02-B PASSED: Exact transport correlation verified=true, turn_id=turn-new-active-001.');
 
-    recordResult('F-02-B', 'Queue acknowledged, matching turn started', 'INVARIANT_ENFORCED', {
+    recordResult('F-02-B', 'Exact transport queue-to-turn correlation', 'INVARIANT_ENFORCED', {
       queueAccepted: 'YES',
       turnStarted: 'YES',
       turnCompleted: 'NO',
       reportTargetMatch: 'YES',
-      observed: 'queued=true, verified=true, turn_started=true, turn_id=turn-new-active-001',
-      desiredSafe: 'verified=true, turn_started=true with matching observed turn ID',
+      observed: 'queued=true, verified=true, turn_started=true, turn_id=turn-new-active-001, correlation_method=exact_transport',
+      desiredSafe: 'verified=true, turn_started=true with exact transport correlated turn ID',
       testFile: __filename
     });
 
@@ -308,6 +319,53 @@ function testF02_CodexDispatchStateModel() {
       reportTargetMatch: 'NO',
       observed: 'queued=true, verified=false, turn_started=false, turn_id=null (historical start ignored)',
       desiredSafe: 'verified=false when only pre-dispatch historical events exist',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test D (NT-025): Concurrent same-session unrelated task_started appearing post-dispatch
+    // Invariant: Unrelated Turn B must NEVER become verified turn for Dispatch A
+    // (queued=true, verified=false, turn_started=false, turn_id=null)
+    // -----------------------------------------------------------------------
+    cleanLock();
+    fs.writeFileSync(
+      rolloutFile,
+      JSON.stringify({ payload: { id: '01a0b53f', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }) + '\n'
+    );
+
+    const envD = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_ROLLOUT_FILE: rolloutFile,
+      MOCK_TASK_STARTED_TURN: 'turn-unrelated-concurrent-B' // Unrelated turn appearing post-dispatch
+    };
+
+    const procD = spawnSync('python', [scriptPath, 'test prompt for dispatch A', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: envD,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(procD.status, 0, `Script executes: ${procD.stderr}`);
+    const resD = JSON.parse((procD.stdout || '').trim());
+
+    assert.strictEqual(resD.queued, true, 'Queue accepted for prompt A');
+    assert.strictEqual(resD.verified, false, 'verified must be false because Turn B is not correlated to Dispatch A');
+    assert.strictEqual(resD.turn_started, false, 'turn_started must be false for Dispatch A');
+    assert.strictEqual(resD.turn_id, null, 'turn_id for Dispatch A must be null (unrelated Turn B rejected)');
+    assert.strictEqual(resD.observed_post_dispatch_turn_id, 'turn-unrelated-concurrent-B', 'Unrelated turn preserved diagnostically only');
+    assert.strictEqual(resD.correlation_method, 'unavailable', 'correlation_method must be unavailable');
+    console.log('✓ NT-025 PASSED: Concurrent unrelated task_started rejected; verified=false, turn_id=null.');
+
+    recordResult('NT-025', 'Concurrent same-session unrelated task_started rejected', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'YES',
+      turnStarted: 'NO',
+      turnCompleted: 'NO',
+      reportTargetMatch: 'NO (unrelated Turn B rejected)',
+      observed: 'queued=true, verified=false, turn_started=false, turn_id=null, observed_post_dispatch_turn_id=turn-unrelated-concurrent-B',
+      desiredSafe: 'verified=false, turn_id=null: unrelated Turn B must never cause verified=true for A',
       testFile: __filename
     });
   } finally {
@@ -480,6 +538,195 @@ function testF03_WatcherExactTurnProvenance() {
       desiredSafe: 'success=true with exact target turn attribution',
       testFile: __filename
     });
+
+    // -----------------------------------------------------------------------
+    // Test D (NT-026): Matching task_complete with empty report body ("")
+    // Invariant: success=false, verified=false, turn_completed=true, report_available=false, report_text=null
+    // -----------------------------------------------------------------------
+    fs.appendFileSync(
+      rolloutFile,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          thread_id: 'sess-stale-01',
+          turn_id: 'turn-B-empty-001',
+          duration_ms: 1200,
+          last_agent_message: ''
+        }
+      }) + '\n'
+    );
+
+    const procD = spawnSync(
+      'python',
+      [scriptPath, '--project', 'AI_Multi_Task', '--target-turn', 'turn-B-empty-001', '--timeout', '2'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env,
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(procD.status, 0, 'Watcher executes cleanly');
+    const resD = JSON.parse((procD.stdout || '').trim());
+
+    assert.strictEqual(resD.success, false, 'success must be false on empty report body');
+    assert.strictEqual(resD.verified, false, 'verified must be false on empty report body');
+    assert.strictEqual(resD.turn_completed, true, 'turn_completed must be true to preserve completion identity');
+    assert.strictEqual(resD.report_available, false, 'report_available must be false');
+    assert.strictEqual(resD.report_text, null, 'report_text must be null (empty string rejected)');
+    assert.strictEqual(resD.turn_id, 'turn-B-empty-001', 'turn_id preserved diagnostically');
+    assert.ok(resD.error && resD.error.includes('without a non-empty worker report'), 'Error explains empty report fail-closed');
+    console.log('✓ NT-026 PASSED: Empty report body fails closed (success=false, verified=false, report_text=null).');
+
+    recordResult('NT-026', 'Matching task_complete with empty report rejected', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'YES',
+      turnCompleted: 'YES',
+      reportTargetMatch: 'NO (empty report rejected)',
+      observed: 'success=false, verified=false, turn_completed=true, report_available=false, report_text=null',
+      desiredSafe: 'success=false, verified=false when last_agent_message is empty string',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test E (NT-027): Matching task_complete with whitespace report body ("   \r\n")
+    // Invariant: success=false, verified=false, turn_completed=true, report_available=false, report_text=null
+    // -----------------------------------------------------------------------
+    fs.appendFileSync(
+      rolloutFile,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          thread_id: 'sess-stale-01',
+          turn_id: 'turn-B-ws-002',
+          duration_ms: 1500,
+          last_agent_message: '   \r\n'
+        }
+      }) + '\n'
+    );
+
+    const procE = spawnSync(
+      'python',
+      [scriptPath, '--project', 'AI_Multi_Task', '--target-turn', 'turn-B-ws-002', '--timeout', '2'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env,
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(procE.status, 0, 'Watcher executes cleanly');
+    const resE = JSON.parse((procE.stdout || '').trim());
+
+    assert.strictEqual(resE.success, false, 'success must be false on whitespace report body');
+    assert.strictEqual(resE.verified, false, 'verified must be false on whitespace report body');
+    assert.strictEqual(resE.turn_completed, true, 'turn_completed must be true');
+    assert.strictEqual(resE.report_available, false, 'report_available must be false');
+    assert.strictEqual(resE.report_text, null, 'report_text must be null (whitespace rejected)');
+    assert.strictEqual(resE.turn_id, 'turn-B-ws-002', 'turn_id preserved diagnostically');
+    console.log('✓ NT-027 PASSED: Whitespace report body fails closed (success=false, verified=false, report_text=null).');
+
+    recordResult('NT-027', 'Matching task_complete with whitespace report rejected', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'YES',
+      turnCompleted: 'YES',
+      reportTargetMatch: 'NO (whitespace report rejected)',
+      observed: 'success=false, verified=false, turn_completed=true, report_available=false, report_text=null',
+      desiredSafe: 'success=false, verified=false when last_agent_message is whitespace only',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test F (NT-028): Matching target turn emits runtime error
+    // Invariant: success=false, verified=false, turn_failed=true, report_text=null
+    // -----------------------------------------------------------------------
+    fs.appendFileSync(
+      rolloutFile,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'error',
+          thread_id: 'sess-stale-01',
+          turn_id: 'turn-B-err-003',
+          message: 'Worker encountered fatal unhandled exception'
+        }
+      }) + '\n'
+    );
+
+    const procF = spawnSync(
+      'python',
+      [scriptPath, '--project', 'AI_Multi_Task', '--target-turn', 'turn-B-err-003', '--timeout', '2'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env,
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(procF.status, 0, 'Watcher executes cleanly');
+    const resF = JSON.parse((procF.stdout || '').trim());
+
+    assert.strictEqual(resF.success, false, 'success must be false on runtime error');
+    assert.strictEqual(resF.verified, false, 'verified must be false on runtime error');
+    assert.strictEqual(resF.turn_failed, true, 'turn_failed must be true');
+    assert.strictEqual(resF.turn_id, 'turn-B-err-003', 'turn_id preserved diagnostically');
+    assert.strictEqual(resF.report_text, null, 'report_text must be null');
+    assert.ok(resF.error && resF.error.includes('fatal unhandled exception'), 'Error message preserved');
+    console.log('✓ NT-028 PASSED: Runtime error fails closed without false verified=true (success=false, verified=false).');
+
+    recordResult('NT-028', 'Matching target turn runtime error fails closed', 'INVARIANT_ENFORCED', {
+      queueAccepted: 'N/A',
+      turnStarted: 'YES',
+      turnCompleted: 'NO (turn failed)',
+      reportTargetMatch: 'NO (error event)',
+      observed: 'success=false, verified=false, turn_failed=true, report_text=null',
+      desiredSafe: 'success=false, verified=false on runtime error (no false verification)',
+      testFile: __filename
+    });
+
+    // -----------------------------------------------------------------------
+    // Test G: Exact session_id binding prevents ambiguity across multiple sessions
+    // -----------------------------------------------------------------------
+    const otherRolloutFile = path.join(sessDir, 'rollout-other-session.jsonl');
+    fs.writeFileSync(
+      otherRolloutFile,
+      [
+        JSON.stringify({ payload: { id: 'sess-other-99', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            thread_id: 'sess-other-99',
+            turn_id: 'turn-other-session',
+            duration_ms: 1000,
+            last_agent_message: 'OTHER SESSION REPORT'
+          }
+        })
+      ].join('\n') + '\n'
+    );
+
+    const procG = spawnSync(
+      'python',
+      [scriptPath, '--project', 'AI_Multi_Task', '--session-id', 'sess-stale-01', '--target-turn', 'turn-B-new-99999', '--timeout', '2'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env,
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(procG.status, 0, 'Watcher executes cleanly');
+    const resG = JSON.parse((procG.stdout || '').trim());
+    assert.strictEqual(resG.success, true, 'Bound session completes successfully');
+    assert.strictEqual(resG.session_id, 'sess-stale-01', 'Must remain strictly bound to requested session_id');
+    assert.strictEqual(resG.turn_id, 'turn-B-new-99999', 'Target turn matches');
+    console.log('✓ Session Binding Test PASSED: Watcher remained strictly bound to requested session_id.');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
