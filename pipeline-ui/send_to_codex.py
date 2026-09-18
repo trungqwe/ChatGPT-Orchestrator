@@ -219,27 +219,58 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
 
         # 4. Post-flight Verification: Inspect transport output
         # Active legacy adapter: codex_cli_queue (supports_exact_turn_correlation = False)
-        # CRITICAL (B-03B / WO-V3-001F Section 5-8):
-        # Unnegotiated generic JSON stdout must NEVER manufacture queue acceptance authority
-        # (queued=true / success=true) or populate transport diagnostic IDs.
-        # Only the recognized narrow textual acknowledgement shape establishes queue acceptance.
+        # CRITICAL (B-07 / WO-V3-001G):
+        # 1. Line-exact matching: parse stdout line by line, stripped of outer whitespace.
+        # 2. Must use re.fullmatch (never re.search) matching:
+        #    ^Queued message\s+(\S+)\s+for thread\s+(\S+)$
+        # 3. ACK session binding: ACK thread must match requested session_id.
+        # 4. Multiple/ambiguous ACKs fail closed: exactly one exact ACK line must exist.
         queue_output = proc.stdout.strip()
+        ack_pattern = re.compile(r"^Queued message\s+(\S+)\s+for thread\s+(\S+)$")
+        recognized_acks = []
 
-        # Narrow regex match: "Queued message <id> for thread <thread_id>"
-        ack_match = re.search(r"Queued message\s+(\S+)\s+for thread\s+(\S+)", queue_output)
-        if ack_match:
-            result["queued"] = True
-            # Preserved from recognized text ACK for diagnostic purposes only (never turn proof)
-            result["queued_submission_id"] = ack_match.group(1)
-        else:
+        for line in queue_output.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            m = ack_pattern.fullmatch(line_str)
+            if m:
+                recognized_acks.append((m.group(1), m.group(2)))
+
+        if len(recognized_acks) == 0:
             result["queued"] = False
             result["success"] = False
             result["verified"] = False
             result["turn_started"] = False
             result["turn_id"] = None
             result["correlation_method"] = "unavailable"
-            result["error"] = f"Không nhận diện được tín hiệu xác nhận hàng đợi hợp lệ (không khớp mẫu 'Queued message <id> for thread <id>'): {queue_output}"
+            result["error"] = f"NO_RECOGNIZED_QUEUE_ACK: Không tìm thấy dòng xác nhận hàng đợi hợp lệ khớp '^Queued message <id> for thread <id>$': {queue_output}"
             return result
+        elif len(recognized_acks) > 1:
+            result["queued"] = False
+            result["success"] = False
+            result["verified"] = False
+            result["turn_started"] = False
+            result["turn_id"] = None
+            result["correlation_method"] = "unavailable"
+            result["error"] = f"AMBIGUOUS_QUEUE_ACK: Phát hiện {len(recognized_acks)} dòng xác nhận hàng đợi trong stdout; từ chối do mơ hồ: {recognized_acks}"
+            return result
+
+        ack_msg_id, ack_thread_id = recognized_acks[0]
+
+        if ack_thread_id != session_id:
+            result["queued"] = False
+            result["success"] = False
+            result["verified"] = False
+            result["turn_started"] = False
+            result["turn_id"] = None
+            result["correlation_method"] = "unavailable"
+            result["error"] = f"ACK_SESSION_MISMATCH: Tín hiệu hàng đợi trả về phiên '{ack_thread_id}', khác với phiên yêu cầu '{session_id}'"
+            return result
+
+        # Valid exact ACK bound to requested session
+        result["queued"] = True
+        result["queued_submission_id"] = ack_msg_id
 
         # 5. Diagnostic observation: observe whether a new task_started appeared in rollout
         # CRITICAL (B-01 / Section 15): Heuristic observation of rollout lines is strictly DIAGNOSTIC.

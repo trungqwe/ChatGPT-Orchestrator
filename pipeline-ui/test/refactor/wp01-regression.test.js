@@ -10,10 +10,14 @@
  * - L-NT-035: JSON without queued field does not establish queue acceptance (B-03B)
  * - L-NT-036: JSON with queued=true cannot create queue authority or overwrite IDs (B-03B)
  * - L-NT-037: Loose text (e.g. 'for thread ...') does not establish queue acceptance (B-03B)
- * - Positive ACK: Exact CLI textual acknowledgement creates valid queue acceptance
  * - L-NT-038: Mixed turn/report provenance rejected; report strictly bound to task_complete (B-06)
  * - L-NT-039: Incomplete new turn response_item does not rewrite completed report (B-06)
  * - L-NT-040: Empty task_complete does not borrow text from response_item (B-06)
+ * - L-NT-041: Embedded ACK phrase within other text rejected as queue acceptance (B-07)
+ * - L-NT-042: ACK for wrong session fails closed with ACK_SESSION_MISMATCH (B-07)
+ * - L-NT-043: Exact matching ACK for requested session accepted with diagnostic submission ID (B-07)
+ * - L-NT-044: Multiple matching ACK lines fail closed with AMBIGUOUS_QUEUE_ACK (B-07)
+ * - L-NT-045: Multiple conflicting ACK lines fail closed with AMBIGUOUS_QUEUE_ACK (B-07)
  */
 
 const fs = require('fs');
@@ -64,7 +68,7 @@ function cleanLock() {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING WP-V3-01 REGRESSION TEST SUITE (L-NT-029 .. L-NT-040)');
+  console.log('RUNNING WP-V3-01 REGRESSION TEST SUITE (L-NT-029 .. L-NT-045)');
   console.log('======================================================================');
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch_wp01_reg_'));
@@ -468,37 +472,6 @@ async function runAllTests() {
     console.log('✓ L-NT-037 PASSED: Loose text patterns rejected as queue acceptance.');
 
     // -----------------------------------------------------------------------
-    // POSITIVE ACK TEST: Exact CLI textual acknowledgement creates valid queue acceptance
-    // -----------------------------------------------------------------------
-    console.log('\n[POSITIVE ACK] Testing valid recognized textual ACK pattern...');
-    cleanLock();
-    const envPos = {
-      ...process.env,
-      USERPROFILE: tmpDir,
-      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
-      MOCK_STDOUT_TEXT: 'Queued message msg_test_123 for thread sess_001'
-    };
-
-    const procPos = spawnSync('python', [SEND_TO_CODEX, 'test prompt positive', 'AI_Multi_Task'], {
-      cwd: PIPELINE_UI_DIR,
-      env: envPos,
-      timeout: 10000,
-      encoding: 'utf-8'
-    });
-
-    assert.strictEqual(procPos.status, 0, `Script failed: ${procPos.stderr}`);
-    const resPos = JSON.parse((procPos.stdout || '').trim());
-
-    assert.strictEqual(resPos.success, true, 'success must be true on recognized textual ACK');
-    assert.strictEqual(resPos.queued, true, 'queued must be true on recognized textual ACK');
-    assert.strictEqual(resPos.verified, false, 'verified must remain false (fail-closed legacy contract)');
-    assert.strictEqual(resPos.turn_started, false, 'turn_started must remain false');
-    assert.strictEqual(resPos.turn_id, null, 'turn_id must remain null');
-    assert.strictEqual(resPos.correlation_method, 'unavailable', 'correlation_method must be unavailable');
-    assert.strictEqual(resPos.queued_submission_id, 'msg_test_123', 'queued_submission_id preserved as diagnostic');
-    console.log('✓ POSITIVE ACK PASSED: Exact textual ACK acknowledged with diagnostic queued_submission_id.');
-
-    // -----------------------------------------------------------------------
     // L-NT-038: Mixed turn/report provenance rejected (B-06)
     // Fixture: task_complete A with REPORT A; later response_item assistant with TEXT FROM LATER TURN B
     // -----------------------------------------------------------------------
@@ -649,8 +622,157 @@ async function runAllTests() {
     assert.strictEqual(res40.report_text, null, 'report_text must be null (no borrowing from response_item)');
     console.log('✓ L-NT-040 PASSED: Empty complete failed closed without borrowing assistant text.');
 
+    // -----------------------------------------------------------------------
+    // L-NT-041: Embedded ACK phrase within other text rejected as queue acceptance (B-07)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-041] Testing embedded ACK phrase within other text rejected...');
+    cleanLock();
+    // Ensure sess_001 is latest rollout for AI_Multi_Task
+    const nowB07 = Date.now() / 1000 + 1000;
+    fs.utimesSync(rolloutFile, nowB07, nowB07);
+    const env41 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'WARNING: Queued message fake for thread sess_001 but transport uncertain'
+    };
+
+    const proc41 = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-041', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env41,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc41.status, 0, `Script failed: ${proc41.stderr}`);
+    const res41 = JSON.parse((proc41.stdout || '').trim());
+
+    assert.strictEqual(res41.success, false, 'success must be false for embedded ACK phrase');
+    assert.strictEqual(res41.queued, false, 'queued must be false for embedded ACK phrase');
+    assert.strictEqual(res41.verified, false, 'verified must remain false');
+    assert.strictEqual(res41.turn_id, null, 'turn_id must remain null');
+    console.log('✓ L-NT-041 PASSED: Embedded ACK phrase rejected as full line ACK.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-042: ACK for wrong session fails closed with ACK_SESSION_MISMATCH (B-07)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-042] Testing ACK for wrong session fails closed with ACK_SESSION_MISMATCH...');
+    cleanLock();
+    const env42 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'Queued message msg123 for thread sess_OTHER'
+    };
+
+    const proc42 = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-042', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env42,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc42.status, 0, `Script failed: ${proc42.stderr}`);
+    const res42 = JSON.parse((proc42.stdout || '').trim());
+
+    assert.strictEqual(res42.success, false, 'success must be false for wrong session ACK');
+    assert.strictEqual(res42.queued, false, 'queued must be false for wrong session ACK');
+    assert.strictEqual(res42.verified, false, 'verified must be false');
+    assert.strictEqual(res42.turn_id, null, 'turn_id must be null');
+    assert.ok(res42.error.includes('ACK_SESSION_MISMATCH'), 'Error must indicate ACK_SESSION_MISMATCH');
+    console.log('✓ L-NT-042 PASSED: ACK for wrong session rejected with ACK_SESSION_MISMATCH.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-043: Exact matching ACK for requested session accepted with diagnostic submission ID (B-07)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-043] Testing exact matching ACK for requested session accepted...');
+    cleanLock();
+    const env43 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'Queued message msg123 for thread sess_001'
+    };
+
+    const proc43 = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-043', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env43,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc43.status, 0, `Script failed: ${proc43.stderr}`);
+    const res43 = JSON.parse((proc43.stdout || '').trim());
+
+    assert.strictEqual(res43.success, true, 'success must be true on exact matching ACK');
+    assert.strictEqual(res43.queued, true, 'queued must be true on exact matching ACK');
+    assert.strictEqual(res43.verified, false, 'verified must remain false');
+    assert.strictEqual(res43.turn_started, false, 'turn_started must remain false');
+    assert.strictEqual(res43.turn_id, null, 'turn_id must remain null');
+    assert.strictEqual(res43.queued_submission_id, 'msg123', 'queued_submission_id must match ACK message ID');
+    assert.strictEqual(res43.correlation_method, 'unavailable', 'correlation_method must be unavailable');
+    console.log('✓ L-NT-043 PASSED: Exact matching ACK for requested session successfully accepted.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-044: Multiple matching ACK lines fail closed with AMBIGUOUS_QUEUE_ACK (B-07)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-044] Testing multiple matching ACK lines fail closed with AMBIGUOUS_QUEUE_ACK...');
+    cleanLock();
+    const env44 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'Queued message msg123 for thread sess_001\r\nQueued message msg456 for thread sess_001'
+    };
+
+    const proc44 = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-044', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env44,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc44.status, 0, `Script failed: ${proc44.stderr}`);
+    const res44 = JSON.parse((proc44.stdout || '').trim());
+
+    assert.strictEqual(res44.success, false, 'success must be false on multiple ACKs');
+    assert.strictEqual(res44.queued, false, 'queued must be false on multiple ACKs');
+    assert.strictEqual(res44.verified, false, 'verified must remain false');
+    assert.strictEqual(res44.turn_id, null, 'turn_id must remain null');
+    assert.ok(res44.error.includes('AMBIGUOUS_QUEUE_ACK'), 'Error must indicate AMBIGUOUS_QUEUE_ACK');
+    console.log('✓ L-NT-044 PASSED: Multiple matching ACKs rejected fail-closed.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-045: Multiple conflicting ACK lines fail closed with AMBIGUOUS_QUEUE_ACK (B-07)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-045] Testing multiple conflicting ACK lines fail closed with AMBIGUOUS_QUEUE_ACK...');
+    cleanLock();
+    const env45 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'Queued message msg123 for thread sess_001\r\nQueued message msg456 for thread sess_OTHER'
+    };
+
+    const proc45 = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-045', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env45,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc45.status, 0, `Script failed: ${proc45.stderr}`);
+    const res45 = JSON.parse((proc45.stdout || '').trim());
+
+    assert.strictEqual(res45.success, false, 'success must be false on conflicting ACKs');
+    assert.strictEqual(res45.queued, false, 'queued must be false on conflicting ACKs');
+    assert.strictEqual(res45.verified, false, 'verified must remain false');
+    assert.strictEqual(res45.turn_id, null, 'turn_id must remain null');
+    assert.ok(res45.error.includes('AMBIGUOUS_QUEUE_ACK'), 'Error must indicate AMBIGUOUS_QUEUE_ACK');
+    console.log('✓ L-NT-045 PASSED: Multiple conflicting ACKs rejected fail-closed.');
+
     console.log('\n======================================================================');
-    console.log('ALL WP-V3-01 REGRESSION TESTS PASSED (L-NT-029 .. L-NT-040: 12/12 PASS)');
+    console.log('ALL WP-V3-01 REGRESSION TESTS PASSED (L-NT-029 .. L-NT-045: 17/17 PASS)');
     console.log('======================================================================');
 
   } finally {

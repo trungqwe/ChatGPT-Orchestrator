@@ -194,6 +194,8 @@ function testF02_CodexDispatchStateModel() {
     const resA = JSON.parse((procA.stdout || '').trim());
 
     assert.strictEqual(resA.queued, true, 'Queue accepted');
+    assert.strictEqual(resA.session_id, '01a0b53f', 'Session must match requested session (B-07)');
+    assert.strictEqual(resA.queued_submission_id, 'msg_test', 'queued_submission_id must match ACK message ID');
     assert.strictEqual(resA.verified, false, 'verified must be false when task_started missing');
     assert.strictEqual(resA.turn_started, false, 'turn_started must be false when task_started missing');
     assert.strictEqual(resA.turn_id, null, 'turn_id must be null when task_started missing');
