@@ -99,38 +99,86 @@ function computeRootIdentityKey(rootPath) {
 }
 
 /**
- * Validate and canonicalize project root.
- * Verifies that the path is absolute, exists on disk, and is a directory.
+ * Validate project root path shape (REG-01).
+ * Pure structural check: does NOT touch filesystem state.
+ * Requires an absolute, fully-qualified drive/UNC path on Windows, or absolute path on POSIX.
+ * Rejects relative paths (., .., ./foo, foo/bar), root-relative paths (\, \Code\App),
+ * and drive-relative paths (C:foo).
  */
-function canonicalizeProjectRoot(rootPath, customFs = fs) {
+function validateProjectRootShape(rootPath, platform = process.platform) {
   if (typeof rootPath !== 'string' || !rootPath.trim()) {
     throw new RegistryError(
-      REGISTRY_ERROR_CODES.INVALID_PROJECT_ROOT,
+      REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
       'Project root must be a non-empty string'
     );
   }
 
   const trimmed = rootPath.trim();
 
-  // Validate absolute path
-  if (!path.isAbsolute(trimmed)) {
-    throw new RegistryError(
-      REGISTRY_ERROR_CODES.INVALID_PROJECT_ROOT,
-      `Project root must be an absolute path: '${trimmed}'`
-    );
-  }
-
-  // On Windows, require drive letter or UNC prefix
-  if (process.platform === 'win32') {
-    const isDrive = /^[a-zA-Z]:[/\\]/.test(trimmed);
-    const isUnc = /^\\\\[^/\\]+[/\\][^/\\]+/.test(trimmed);
-    if (!isDrive && !isUnc) {
+  if (platform === 'win32') {
+    // Reject relative prefixes explicitly
+    if (
+      trimmed === '.' ||
+      trimmed === '..' ||
+      trimmed.startsWith('./') ||
+      trimmed.startsWith('.\\') ||
+      trimmed.startsWith('../') ||
+      trimmed.startsWith('..\\')
+    ) {
       throw new RegistryError(
-        REGISTRY_ERROR_CODES.INVALID_PROJECT_ROOT,
+        REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
+        `Project root must be a fully-qualified absolute path, got relative: '${trimmed}'`
+      );
+    }
+
+    // Fully qualified Windows path must be:
+    // 1. Drive letter followed by colon and separator (e.g. C:\ or C:/)
+    // 2. UNC path (e.g. \\server\share\...)
+    const isDriveAbsolute = /^[a-zA-Z]:[/\\]/.test(trimmed);
+    const isUnc = /^\\\\[^/\\]+[/\\][^/\\]+/.test(trimmed);
+
+    if (!isDriveAbsolute && !isUnc) {
+      throw new RegistryError(
+        REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
         `Project root must be a fully-qualified Windows drive or UNC path: '${trimmed}'`
       );
     }
+  } else {
+    // POSIX
+    if (
+      !trimmed.startsWith('/') ||
+      trimmed === '.' ||
+      trimmed === '..' ||
+      trimmed.startsWith('./') ||
+      trimmed.startsWith('../')
+    ) {
+      throw new RegistryError(
+        REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
+        `Project root must be an absolute path starting with '/': '${trimmed}'`
+      );
+    }
   }
+
+  return trimmed;
+}
+
+/**
+ * Validate and canonicalize project root.
+ * Applies strict structural shape rules (REG-01), verifies that the path exists on disk,
+ * is a directory, and that realpath proves canonical identity (REG-02: fails closed).
+ */
+function canonicalizeProjectRoot(rootPath, customFs = fs, platform = process.platform) {
+  // First apply the structural shape contract (Section 9 / REG-01)
+  try {
+    validateProjectRootShape(rootPath, platform);
+  } catch (err) {
+    throw new RegistryError(
+      REGISTRY_ERROR_CODES.INVALID_PROJECT_ROOT,
+      `Project root shape invalid: ${err.message}`
+    );
+  }
+
+  const trimmed = rootPath.trim();
 
   // Check filesystem existence and directory status
   let stat;
@@ -150,14 +198,18 @@ function canonicalizeProjectRoot(rootPath, customFs = fs) {
     );
   }
 
-  // Resolve canonical filesystem path via realpath
-  let canonicalRoot = trimmed;
+  // Resolve canonical filesystem path via realpath (REG-02: fails closed without fallback)
+  let canonicalRoot;
   try {
-    canonicalRoot = customFs.realpathSync.native
-      ? customFs.realpathSync.native(trimmed)
-      : customFs.realpathSync(trimmed);
-  } catch {
-    canonicalRoot = path.resolve(trimmed);
+    const realpathFn = customFs.realpathSync && customFs.realpathSync.native
+      ? customFs.realpathSync.native
+      : (customFs.realpathSync || fs.realpathSync);
+    canonicalRoot = realpathFn(trimmed);
+  } catch (err) {
+    throw new RegistryError(
+      REGISTRY_ERROR_CODES.INVALID_PROJECT_ROOT,
+      `Cannot prove canonical filesystem identity for project root '${trimmed}': ${err.message}`
+    );
   }
 
   const identityKey = computeRootIdentityKey(canonicalRoot);
@@ -328,8 +380,8 @@ function validateProjectRecord(project) {
 
 /**
  * Validate full registry document structure (A-02: Structural validity check).
- * Validates JSON structure, keys, schema version, and checks that no duplicate
- * root identity keys exist among persisted records.
+ * Validates JSON structure, keys, schema version, root shape (REG-01),
+ * and checks that no duplicate root identity keys exist among persisted records.
  */
 function validateRegistryDocument(doc) {
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
@@ -372,6 +424,9 @@ function validateRegistryDocument(doc) {
         `Map key '${mapKey}' does not match project_id '${project.project_id}'`
       );
     }
+
+    // REG-01 / Section 8: Structural root shape enforcement on persisted projects
+    validateProjectRootShape(project.project_root);
 
     const identityKey = computeRootIdentityKey(project.project_root);
     if (seenRootIdentities.has(identityKey)) {
@@ -520,8 +575,9 @@ function createProjectRegistry(options = {}) {
     // Structural validation (A-02: structural validation != runtime availability)
     validateRegistryDocument(parsed);
 
-    inMemoryData = parsed;
-    return inMemoryData;
+    // Hardened load ownership (Section 20): retain detached in-memory authority
+    inMemoryData = structuredClone(parsed);
+    return structuredClone(inMemoryData);
   }
 
   // Perform initial load
@@ -531,7 +587,9 @@ function createProjectRegistry(options = {}) {
    * getProject(projectId)
    * Resolves project mapping by explicit project ID.
    * Performs runtime availability check (A-02): checks that the registered project root
-   * currently exists on disk and is a directory. If not, fails closed with PROJECT_ROOT_UNAVAILABLE.
+   * currently exists on disk and is a directory.
+   * Revalidates runtime canonical realpath identity (REG-04): fails closed with
+   * PROJECT_ROOT_UNAVAILABLE if realpath fails or resolved identity drifts from stored mapping.
    * Returns detached object.
    */
   async function getProject(projectId) {
@@ -544,7 +602,7 @@ function createProjectRegistry(options = {}) {
       return null;
     }
 
-    // Runtime root availability check (A-02)
+    // 1. Runtime root existence and directory check (A-02)
     let stat;
     try {
       stat = customFs.statSync(project.project_root);
@@ -559,6 +617,30 @@ function createProjectRegistry(options = {}) {
       throw new RegistryError(
         REGISTRY_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE,
         `Project root '${project.project_root}' for project '${projectId}' is no longer a directory`
+      );
+    }
+
+    // 2. Runtime realpath canonical identity revalidation (REG-04)
+    let runtimeCanonical;
+    try {
+      const realpathFn = customFs.realpathSync && customFs.realpathSync.native
+        ? customFs.realpathSync.native
+        : (customFs.realpathSync || fs.realpathSync);
+      runtimeCanonical = realpathFn(project.project_root);
+    } catch (err) {
+      throw new RegistryError(
+        REGISTRY_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE,
+        `Failed to resolve runtime canonical path for project root '${project.project_root}': ${err.message}`
+      );
+    }
+
+    const storedIdentity = computeRootIdentityKey(project.project_root);
+    const runtimeIdentity = computeRootIdentityKey(runtimeCanonical);
+
+    if (storedIdentity !== runtimeIdentity) {
+      throw new RegistryError(
+        REGISTRY_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE,
+        `Runtime canonical identity '${runtimeIdentity}' for project root does not match stored identity '${storedIdentity}'`
       );
     }
 
@@ -583,7 +665,7 @@ function createProjectRegistry(options = {}) {
       // 1. Validate complete record shape and exact fields
       const validated = validateProjectRecord(projectInput);
 
-      // 2. Validate and canonicalize project root (runtime availability check)
+      // 2. Validate and canonicalize project root (runtime availability check, REG-01/REG-02)
       const { canonicalRoot, identityKey } = canonicalizeProjectRoot(validated.project_root, customFs);
 
       const candidate = {
@@ -663,11 +745,13 @@ function createProjectRegistry(options = {}) {
   }
 
   /**
-   * validate()
+   * validate() (REG-03)
    * Runs structural and duplicate root validation on the loaded registry.
+   * Returns a detached validated snapshot: structuredClone(inMemoryData).
    */
   function validate() {
-    return validateRegistryDocument(inMemoryData);
+    validateRegistryDocument(inMemoryData);
+    return structuredClone(inMemoryData);
   }
 
   /**
@@ -793,6 +877,7 @@ module.exports = {
   RegistryError,
   PROJECT_ID_REGEX,
   computeRootIdentityKey,
+  validateProjectRootShape,
   canonicalizeProjectRoot,
   validateProjectRecord,
   validateRegistryDocument,

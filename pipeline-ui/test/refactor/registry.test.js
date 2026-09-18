@@ -15,6 +15,7 @@ const {
   REGISTRY_ERROR_CODES,
   RegistryError,
   computeRootIdentityKey,
+  validateProjectRootShape,
   canonicalizeProjectRoot,
   createProjectRegistry
 } = require('../../lib/broker/registry');
@@ -65,7 +66,7 @@ function makeValidProject(id, rootPath, overrides = {}) {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING REGISTRY TEST SUITE (RG-001 .. RG-032)');
+  console.log('RUNNING REGISTRY TEST SUITE (RG-001 .. RG-039)');
   console.log('======================================================================\n');
 
   // RG-001: Empty / nonexistent registry file
@@ -1114,8 +1115,325 @@ async function runAllTests() {
     }
   }
 
+  // RG-033: validate() snapshot detached (REG-03)
+  {
+    console.log('[RG-033] validate() returns detached snapshot; mutations do not affect internal state or disk...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-a');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-a', projDir));
+
+      const snapshot = registry.validate();
+      snapshot.projects['proj-a'].worker.session_id = 'ATTACKER_SESSION';
+      snapshot.projects['proj-a'].auditor.task_id = 'ATTACKER_TASK';
+      snapshot.projects['proj-a'].policy.max_active_dispatches = 999;
+      snapshot.projects['proj-a'].project_root = 'C:\\Other';
+
+      const refetched = await registry.getProject('proj-a');
+      assert.strictEqual(refetched.worker.session_id, 'session-proj-a-01');
+      assert.strictEqual(refetched.auditor.task_id, 'task-proj-a-01');
+      assert.strictEqual(refetched.policy.max_active_dispatches, 1);
+      assert.strictEqual(refetched.project_root, projDir);
+
+      const fileContent = JSON.parse(fs.readFileSync(regFile, 'utf8'));
+      assert.strictEqual(fileContent.projects['proj-a'].worker.session_id, 'session-proj-a-01');
+
+      console.log('✓ RG-033 PASSED: validate() snapshot is deeply detached.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-034: Persisted relative root rejected on load (REG-01)
+  {
+    console.log('[RG-034] Manually persisted relative project_root rejected on load with REGISTRY_SCHEMA_INVALID...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const badDoc = {
+        schema_version: 1,
+        projects: {
+          bad: makeValidProject('bad', '.')
+        }
+      };
+      fs.writeFileSync(regFile, JSON.stringify(badDoc), 'utf8');
+
+      let caught = null;
+      try {
+        createProjectRegistry({ registryFilePath: regFile });
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID);
+
+      console.log('✓ RG-034 PASSED: Persisted relative root rejected on load with REGISTRY_SCHEMA_INVALID.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-035: Windows root-relative path rejected (REG-01)
+  {
+    console.log('[RG-035] Windows root-relative project_root rejected on load with REGISTRY_SCHEMA_INVALID...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const badDoc = {
+        schema_version: 1,
+        projects: {
+          'bad-root-rel': makeValidProject('bad-root-rel', '\\SomeFolder')
+        }
+      };
+      fs.writeFileSync(regFile, JSON.stringify(badDoc), 'utf8');
+
+      let caught = null;
+      try {
+        createProjectRegistry({ registryFilePath: regFile });
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID);
+
+      // Verify pure helper with explicit win32 semantics
+      let caughtHelper = null;
+      try {
+        validateProjectRootShape('\\SomeFolder', 'win32');
+      } catch (err) {
+        caughtHelper = err;
+      }
+      assert.ok(caughtHelper);
+      assert.strictEqual(caughtHelper.code, REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID);
+
+      let caughtRootSlash = null;
+      try {
+        validateProjectRootShape('\\', 'win32');
+      } catch (err) {
+        caughtRootSlash = err;
+      }
+      assert.ok(caughtRootSlash);
+      assert.strictEqual(caughtRootSlash.code, REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID);
+
+      console.log('✓ RG-035 PASSED: Windows root-relative path rejected with REGISTRY_SCHEMA_INVALID.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-036: Realpath failure on putProject fails closed (REG-02)
+  {
+    console.log('[RG-036] Realpath failure on putProject fails closed with INVALID_PROJECT_ROOT (no resolve fallback)...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-dir');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const faultFs = {
+        ...fs,
+        realpathSync: () => {
+          throw new Error('EINVAL: Injected realpath failure');
+        }
+      };
+      faultFs.realpathSync.native = () => {
+        throw new Error('EINVAL: Injected realpath failure');
+      };
+
+      const registry = createProjectRegistry({ registryFilePath: regFile, fs: faultFs });
+      let caught = null;
+      try {
+        await registry.putProject(makeValidProject('proj-realpath-fail', projDir));
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.INVALID_PROJECT_ROOT);
+      assert.strictEqual(fs.existsSync(regFile), false);
+      assert.strictEqual((await registry.listProjects()).length, 0);
+
+      console.log('✓ RG-036 PASSED: Realpath failure on putProject fails closed with INVALID_PROJECT_ROOT.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-037: Realpath failure on getProject fails closed (REG-04)
+  {
+    console.log('[RG-037] Realpath failure on getProject fails closed with PROJECT_ROOT_UNAVAILABLE and zero worker dispatch...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projA = path.join(sandbox.dir, 'proj-a');
+      const projB = path.join(sandbox.dir, 'proj-b');
+      fs.mkdirSync(projA, { recursive: true });
+      fs.mkdirSync(projB, { recursive: true });
+
+      let realpathFaultA = false;
+      const faultFs = {
+        ...fs,
+        realpathSync: (p) => {
+          if (realpathFaultA && typeof p === 'string' && p.includes('proj-a')) {
+            throw new Error('EACCES: Injected realpath failure');
+          }
+          return fs.realpathSync(p);
+        }
+      };
+      faultFs.realpathSync.native = (p) => {
+        if (realpathFaultA && typeof p === 'string' && p.includes('proj-a')) {
+          throw new Error('EACCES: Injected realpath failure');
+        }
+        return fs.realpathSync.native(p);
+      };
+
+      const registry = createProjectRegistry({ registryFilePath: regFile, fs: faultFs });
+      await registry.putProject(makeValidProject('proj-a', projA));
+      await registry.putProject(makeValidProject('proj-b', projB));
+
+      // Enable realpath fault on proj-a
+      realpathFaultA = true;
+      let caughtA = null;
+      try {
+        await registry.getProject('proj-a');
+      } catch (err) {
+        caughtA = err;
+      }
+      assert.ok(caughtA);
+      assert.strictEqual(caughtA.code, REGISTRY_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE);
+
+      // proj-b remains unaffected
+      const loadedB = await registry.getProject('proj-b');
+      assert.ok(loadedB);
+      assert.strictEqual(loadedB.project_id, 'proj-b');
+
+      // Broker integration check (Section 30): broker dispatching on proj-a results in 0 worker calls
+      let workerDispatchCount = 0;
+      const broker = createBroker({
+        registryPort: registry,
+        workspacePort: { getWorkspaceState: async () => ({ workspace_state_id: 'ws-1' }) },
+        workerPort: {
+          dispatch: async () => {
+            workerDispatchCount++;
+            return { ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED };
+          }
+        }
+      });
+
+      const brokerRes = await broker.dispatchWorker({
+        schema_version: 1,
+        project_id: 'proj-a',
+        work_order_id: 'WO-037',
+        expected_workspace_state_id: 'ws-1',
+        directive: 'test'
+      });
+      assert.strictEqual(brokerRes.ok, false);
+      assert.strictEqual(brokerRes.code, ERROR_CODES.REGISTRY_UNAVAILABLE);
+      assert.strictEqual(workerDispatchCount, 0);
+
+      console.log('✓ RG-037 PASSED: Realpath failure on getProject fails closed; broker produces 0 worker calls.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-038: Runtime root identity drift on getProject fails closed (REG-04)
+  {
+    console.log('[RG-038] Runtime root identity drift fails closed with PROJECT_ROOT_UNAVAILABLE without mutation...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-dir');
+      const driftDir = path.join(sandbox.dir, 'drift-dir');
+      fs.mkdirSync(projDir, { recursive: true });
+      fs.mkdirSync(driftDir, { recursive: true });
+
+      let driftActive = false;
+      const driftFs = {
+        ...fs,
+        realpathSync: (p) => {
+          if (driftActive && typeof p === 'string' && p.includes('proj-dir')) {
+            return driftDir;
+          }
+          return fs.realpathSync(p);
+        }
+      };
+      driftFs.realpathSync.native = (p) => {
+        if (driftActive && typeof p === 'string' && p.includes('proj-dir')) {
+          return driftDir;
+        }
+        return fs.realpathSync.native(p);
+      };
+
+      const registry = createProjectRegistry({ registryFilePath: regFile, fs: driftFs });
+      await registry.putProject(makeValidProject('proj-drift', projDir));
+
+      // Enable drift
+      driftActive = true;
+      let caught = null;
+      try {
+        await registry.getProject('proj-drift');
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE);
+
+      // Verify no silent recanonicalization or mutation occurred
+      driftActive = false;
+      const refetched = await registry.getProject('proj-drift');
+      assert.ok(refetched);
+      assert.strictEqual(refetched.project_root, projDir);
+
+      console.log('✓ RG-038 PASSED: Runtime canonical drift fails closed without silent mutation.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-039: Absolute missing root remains structurally valid on load (Section 28)
+  {
+    console.log('[RG-039] Absolute missing root succeeds structural load but fails runtime getProject()...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const missingAbsRoot = path.join(sandbox.dir, 'missing-folder');
+
+      const docWithMissingAbs = {
+        schema_version: 1,
+        projects: {
+          'proj-missing-abs': makeValidProject('proj-missing-abs', missingAbsRoot)
+        }
+      };
+      fs.writeFileSync(regFile, JSON.stringify(docWithMissingAbs), 'utf8');
+
+      // Structural load must succeed
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      const validated = registry.validate();
+      assert.strictEqual(validated.schema_version, 1);
+      assert.ok(validated.projects['proj-missing-abs']);
+
+      // Runtime getProject must fail closed
+      let caught = null;
+      try {
+        await registry.getProject('proj-missing-abs');
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE);
+
+      console.log('✓ RG-039 PASSED: Absolute missing root is structurally valid on load, unavailable at runtime.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
   console.log('======================================================================');
-  console.log('ALL REGISTRY TESTS PASSED (RG-001 .. RG-032: 32/32 PASS)');
+  console.log('ALL REGISTRY TESTS PASSED (RG-001 .. RG-039: 39/39 PASS)');
   console.log('======================================================================\n');
 }
 
