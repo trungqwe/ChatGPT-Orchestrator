@@ -3,8 +3,8 @@
 const crypto = require('crypto');
 const {
   DISPATCH_STATES,
-  WAITABLE_STATES,
-  RECOGNIZED_WAIT_STATES,
+  isWaitableState,
+  isRecognizedWaitState,
   ERROR_CODES,
   LIMITS,
   computeRequestFingerprint
@@ -48,6 +48,33 @@ function createBroker(dependencies = {}) {
   if (!registryPort) throw new Error('registryPort dependency is required');
   if (!workspacePort) throw new Error('workspacePort dependency is required');
   if (!workerPort) throw new Error('workerPort dependency is required');
+
+  /**
+   * Safe Transition Helper (BCORE-10 / Sections 27-28)
+   * Catches both structured rejection results and thrown persistence exceptions,
+   * returning a consistent LIFECYCLE_STORE_FAILURE.
+   */
+  function safeTransition(dispatchId, nextState, patch) {
+    try {
+      const res = lifecycleStore.transition(dispatchId, nextState, patch);
+      if (!res || !res.ok) {
+        return {
+          ok: false,
+          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+          dispatch_id: dispatchId,
+          error: res && res.error ? res.error : `Lifecycle transition to '${nextState}' failed`
+        };
+      }
+      return res;
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+        dispatch_id: dispatchId,
+        error: `Lifecycle store transition failed: ${err.message}`
+      };
+    }
+  }
 
   /**
    * dispatchWorker(request)
@@ -112,6 +139,26 @@ function createBroker(dependencies = {}) {
       };
     }
 
+    // BCORE-08 / Section 15: Validate audit_metadata shape and cloneability
+    if ('audit_metadata' in request && request.audit_metadata !== null && request.audit_metadata !== undefined) {
+      if (typeof request.audit_metadata !== 'object' || Array.isArray(request.audit_metadata)) {
+        return {
+          ok: false,
+          code: ERROR_CODES.INVALID_REQUEST,
+          error: 'audit_metadata must be null or a plain object'
+        };
+      }
+      try {
+        structuredClone(request.audit_metadata);
+      } catch (err) {
+        return {
+          ok: false,
+          code: ERROR_CODES.INVALID_REQUEST,
+          error: `audit_metadata cannot be safely cloned: ${err.message}`
+        };
+      }
+    }
+
     // 2. Directive Payload Size Check (Section 24)
     const directiveBytes = Buffer.byteLength(request.directive, 'utf8');
     if (directiveBytes > LIMITS.MAX_DIRECTIVE_BYTES) {
@@ -150,8 +197,18 @@ function createBroker(dependencies = {}) {
       directive: request.directive
     });
 
-    // 5. Active Dispatch Fast-Check (Sections 27-30)
-    const activeDispatch = lifecycleStore.getActiveDispatch(request.project_id);
+    // 5. Active Dispatch Fast-Check (Sections 27-30 / BCORE-10: Exception Safety)
+    let activeDispatch;
+    try {
+      activeDispatch = lifecycleStore.getActiveDispatch(request.project_id);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+        error: `Lifecycle store getActiveDispatch failed: ${err.message}`
+      };
+    }
+
     if (activeDispatch) {
       if (activeDispatch.work_order_id === request.work_order_id) {
         if (activeDispatch.request_fingerprint === fingerprint) {
@@ -198,7 +255,7 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    // 7. Atomic Write-Ahead State Registration (Sections 9, 10, 32-34 / BCORE-06)
+    // 7. Atomic Write-Ahead State Registration (Sections 9, 10, 12, 16, 32-34 / BCORE-06, BCORE-08, BCORE-10)
     const dispatchId = idFactory.nextDispatchId();
     const dispatchRecord = {
       dispatch_id: dispatchId,
@@ -207,12 +264,22 @@ function createBroker(dependencies = {}) {
       expected_workspace_state_id: request.expected_workspace_state_id,
       request_fingerprint: fingerprint,
       directive: request.directive,
-      audit_metadata: request.audit_metadata || null,
+      audit_metadata: request.audit_metadata ? structuredClone(request.audit_metadata) : null,
       state: DISPATCH_STATES.DISPATCHING,
       created_at: clock.iso()
     };
 
-    const beginRes = lifecycleStore.beginDispatch(request.project_id, dispatchRecord);
+    let beginRes;
+    try {
+      beginRes = lifecycleStore.beginDispatch(request.project_id, dispatchRecord);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+        error: `Lifecycle store beginDispatch failed: ${err.message}`
+      };
+    }
+
     if (!beginRes.ok) {
       if (beginRes.code === ERROR_CODES.IDEMPOTENT_REPLAY) {
         return {
@@ -229,7 +296,7 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    // 8. Call Worker Port (Sections 12-14, 35-38 / BCORE-02)
+    // 8. Call Worker Port (Sections 12-14, 35-38 / BCORE-02, BCORE-10)
     let workerRes;
     try {
       workerRes = await workerPort.dispatch({
@@ -241,16 +308,11 @@ function createBroker(dependencies = {}) {
       });
     } catch (err) {
       // Ambiguous transport failure (Section 38 / BC-010)
-      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
+      const tRes = safeTransition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
         error: err.message
       });
       if (!tRes.ok) {
-        return {
-          ok: false,
-          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-          dispatch_id: dispatchId,
-          error: tRes.error
-        };
+        return tRes;
       }
       return {
         ok: false,
@@ -262,14 +324,9 @@ function createBroker(dependencies = {}) {
 
     if (workerRes && workerRes.ok && workerRes.state === DISPATCH_STATES.DISPATCH_ACCEPTED) {
       // Definitive acceptance (Section 14, 36)
-      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_ACCEPTED);
+      const tRes = safeTransition(dispatchId, DISPATCH_STATES.DISPATCH_ACCEPTED);
       if (!tRes.ok) {
-        return {
-          ok: false,
-          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-          dispatch_id: dispatchId,
-          error: tRes.error
-        };
+        return tRes;
       }
       return {
         ok: true,
@@ -280,16 +337,11 @@ function createBroker(dependencies = {}) {
       };
     } else if (workerRes && workerRes.ok === false && workerRes.definitive) {
       // Definitive failure (Section 37)
-      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_FAILED, {
+      const tRes = safeTransition(dispatchId, DISPATCH_STATES.DISPATCH_FAILED, {
         error: workerRes.error || 'Worker rejected dispatch'
       });
       if (!tRes.ok) {
-        return {
-          ok: false,
-          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-          dispatch_id: dispatchId,
-          error: tRes.error
-        };
+        return tRes;
       }
       return {
         ok: false,
@@ -299,16 +351,11 @@ function createBroker(dependencies = {}) {
       };
     } else {
       // Ambiguous / unhandled worker response (Section 38)
-      const tRes = lifecycleStore.transition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
+      const tRes = safeTransition(dispatchId, DISPATCH_STATES.DISPATCH_UNCERTAIN, {
         error: workerRes ? workerRes.error : 'Ambiguous worker response'
       });
       if (!tRes.ok) {
-        return {
-          ok: false,
-          code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-          dispatch_id: dispatchId,
-          error: tRes.error
-        };
+        return tRes;
       }
       return {
         ok: false,
@@ -321,7 +368,7 @@ function createBroker(dependencies = {}) {
 
   /**
    * waitWorker(request)
-   * Semantic wait/poll entry point (Sections 15-32, 40-45 / BCORE-02, BCORE-03, BCORE-04, BCORE-05).
+   * Semantic wait/poll entry point (Sections 15-32, 40-45 / BCORE-02, BCORE-03, BCORE-04, BCORE-05, BCORE-10).
    */
   async function waitWorker(request) {
     if (!request || typeof request !== 'object' || Array.isArray(request)) {
@@ -356,7 +403,19 @@ function createBroker(dependencies = {}) {
     if (timeoutSecs > LIMITS.MAX_TIMEOUT_SECS) timeoutSecs = LIMITS.MAX_TIMEOUT_SECS;
     if (timeoutSecs < LIMITS.MIN_TIMEOUT_SECS) timeoutSecs = LIMITS.MIN_TIMEOUT_SECS;
 
-    const dispatch = lifecycleStore.getDispatch(request.dispatch_id);
+    // BCORE-10: Exception boundary for store read
+    let dispatch;
+    try {
+      dispatch = lifecycleStore.getDispatch(request.dispatch_id);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+        dispatch_id: request.dispatch_id,
+        error: `Lifecycle store getDispatch failed: ${err.message}`
+      };
+    }
+
     if (!dispatch) {
       return {
         ok: false,
@@ -424,7 +483,7 @@ function createBroker(dependencies = {}) {
     }
 
     // Only WAITABLE_STATES (DISPATCH_ACCEPTED, RUNNING) are authorized to call workerPort.wait (Section 21)
-    if (!WAITABLE_STATES.has(dispatch.state)) {
+    if (!isWaitableState(dispatch.state)) {
       return {
         ok: false,
         code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
@@ -488,7 +547,7 @@ function createBroker(dependencies = {}) {
 
     if (waitRes.ok === true) {
       // Validate recognized state whitelist (Section 22)
-      if (!waitRes.state || typeof waitRes.state !== 'string' || !RECOGNIZED_WAIT_STATES.has(waitRes.state)) {
+      if (!waitRes.state || typeof waitRes.state !== 'string' || !isRecognizedWaitState(waitRes.state)) {
         return {
           ok: false,
           code: ERROR_CODES.INVALID_WORKER_RESPONSE,
@@ -500,16 +559,11 @@ function createBroker(dependencies = {}) {
 
       // Identity validation (Sections 24, 32 / BC-014, BC-015)
       if (waitRes.dispatch_id !== request.dispatch_id || waitRes.work_order_id !== dispatch.work_order_id) {
-        const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, {
+        const tRes = safeTransition(request.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, {
           error: `Identity mismatch: expected dispatch '${request.dispatch_id}' / work_order '${dispatch.work_order_id}', got '${waitRes.dispatch_id}' / '${waitRes.work_order_id}'`
         });
         if (!tRes.ok) {
-          return {
-            ok: false,
-            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-            dispatch_id: request.dispatch_id,
-            error: tRes.error
-          };
+          return tRes;
         }
         return {
           ok: false,
@@ -533,14 +587,9 @@ function createBroker(dependencies = {}) {
       // Response RUNNING (Section 26)
       if (waitRes.state === DISPATCH_STATES.RUNNING) {
         if (dispatch.state !== DISPATCH_STATES.RUNNING) {
-          const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.RUNNING);
+          const tRes = safeTransition(request.dispatch_id, DISPATCH_STATES.RUNNING);
           if (!tRes.ok) {
-            return {
-              ok: false,
-              code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-              dispatch_id: request.dispatch_id,
-              error: tRes.error
-            };
+            return tRes;
           }
         }
         return {
@@ -553,14 +602,9 @@ function createBroker(dependencies = {}) {
 
       // Response READY_FOR_REVIEW (Section 27 / BC-030)
       if (waitRes.state === DISPATCH_STATES.READY_FOR_REVIEW) {
-        const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.READY_FOR_REVIEW);
+        const tRes = safeTransition(request.dispatch_id, DISPATCH_STATES.READY_FOR_REVIEW);
         if (!tRes.ok) {
-          return {
-            ok: false,
-            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-            dispatch_id: request.dispatch_id,
-            error: tRes.error
-          };
+          return tRes;
         }
         return {
           ok: true,
@@ -571,16 +615,11 @@ function createBroker(dependencies = {}) {
       }
     } else if (waitRes.ok === false) {
       if (waitRes.definitive) {
-        const tRes = lifecycleStore.transition(request.dispatch_id, DISPATCH_STATES.DISPATCH_FAILED, {
+        const tRes = safeTransition(request.dispatch_id, DISPATCH_STATES.DISPATCH_FAILED, {
           error: waitRes.error || 'Definitive worker failure'
         });
         if (!tRes.ok) {
-          return {
-            ok: false,
-            code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
-            dispatch_id: request.dispatch_id,
-            error: tRes.error
-          };
+          return tRes;
         }
         return {
           ok: false,
@@ -611,7 +650,7 @@ function createBroker(dependencies = {}) {
 
   /**
    * getWorkerStatus(projectId)
-   * Returns deterministic worker state (Section 39).
+   * Returns deterministic worker state (Section 39 / BCORE-10: Exception Safety).
    */
   async function getWorkerStatus(projectId) {
     if (typeof projectId !== 'string' || !projectId.trim()) {
@@ -622,7 +661,17 @@ function createBroker(dependencies = {}) {
       };
     }
 
-    const active = lifecycleStore.getActiveDispatch(projectId);
+    let active;
+    try {
+      active = lifecycleStore.getActiveDispatch(projectId);
+    } catch (err) {
+      return {
+        ok: false,
+        code: ERROR_CODES.LIFECYCLE_STORE_FAILURE,
+        error: `Lifecycle store getActiveDispatch failed: ${err.message}`
+      };
+    }
+
     if (active) {
       return {
         ok: true,

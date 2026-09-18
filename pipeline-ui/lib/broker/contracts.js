@@ -16,56 +16,88 @@ const DISPATCH_STATES = Object.freeze({
 });
 
 /**
- * Active States (Section 20):
- * A project is considered busy if it has a dispatch in any of these states.
- * DISPATCH_UNCERTAIN is treated as active/blocking for safety until reconciled.
+ * Private Authority Sets (BCORE-09 / Sections 18-21)
+ * Private module-internal Sets prevent external mutation of contract membership.
  */
-const ACTIVE_STATES = Object.freeze(new Set([
+const _ACTIVE_STATES_SET = new Set([
   DISPATCH_STATES.DISPATCHING,
   DISPATCH_STATES.DISPATCH_ACCEPTED,
   DISPATCH_STATES.RUNNING,
   DISPATCH_STATES.DISPATCH_UNCERTAIN
-]));
+]);
 
-/**
- * Terminal / Inactive States (Section 20)
- */
-const TERMINAL_STATES = Object.freeze(new Set([
+const _TERMINAL_STATES_SET = new Set([
   DISPATCH_STATES.READY_FOR_REVIEW,
   DISPATCH_STATES.DISPATCH_FAILED,
   DISPATCH_STATES.PROVENANCE_AMBIGUOUS
-]));
+]);
 
-/**
- * States authorized to call workerPort.wait (Section 21)
- */
-const WAITABLE_STATES = Object.freeze(new Set([
+const _WAITABLE_STATES_SET = new Set([
   DISPATCH_STATES.DISPATCH_ACCEPTED,
   DISPATCH_STATES.RUNNING
-]));
+]);
 
-/**
- * Recognized Successful Worker Wait States (Section 22)
- */
-const RECOGNIZED_WAIT_STATES = Object.freeze(new Set([
+const _RECOGNIZED_WAIT_STATES_SET = new Set([
   DISPATCH_STATES.DISPATCH_ACCEPTED,
   DISPATCH_STATES.RUNNING,
   DISPATCH_STATES.READY_FOR_REVIEW
-]));
+]);
 
-/**
- * Reserved Record Fields (Section 7, BCORE-01)
- * Immutable after beginDispatch. A patch containing any of these must fail closed.
- */
-const RESERVED_RECORD_FIELDS = Object.freeze(new Set([
+const _MUTABLE_TRANSITION_FIELDS_SET = new Set([
+  'error',
+  'diagnostics'
+]);
+
+const _RESERVED_RECORD_FIELDS_SET = new Set([
   'dispatch_id',
   'project_id',
   'work_order_id',
+  'expected_workspace_state_id',
   'request_fingerprint',
+  'directive',
+  'audit_metadata',
   'created_at',
   'updated_at',
   'state'
-]));
+]);
+
+/**
+ * Predicate Authority Functions (Option A - Preferred)
+ */
+function isActiveState(state) {
+  return _ACTIVE_STATES_SET.has(state);
+}
+
+function isTerminalState(state) {
+  return _TERMINAL_STATES_SET.has(state);
+}
+
+function isWaitableState(state) {
+  return _WAITABLE_STATES_SET.has(state);
+}
+
+function isRecognizedWaitState(state) {
+  return _RECOGNIZED_WAIT_STATES_SET.has(state);
+}
+
+function isMutableTransitionField(field) {
+  return _MUTABLE_TRANSITION_FIELDS_SET.has(field);
+}
+
+function isReservedRecordField(field) {
+  return _RESERVED_RECORD_FIELDS_SET.has(field);
+}
+
+/**
+ * Genuinely Frozen Array Exports (Sections 18-20)
+ * Exported as frozen Arrays to guarantee external immutability.
+ */
+const ACTIVE_STATES = Object.freeze([..._ACTIVE_STATES_SET]);
+const TERMINAL_STATES = Object.freeze([..._TERMINAL_STATES_SET]);
+const WAITABLE_STATES = Object.freeze([..._WAITABLE_STATES_SET]);
+const RECOGNIZED_WAIT_STATES = Object.freeze([..._RECOGNIZED_WAIT_STATES_SET]);
+const MUTABLE_TRANSITION_FIELDS = Object.freeze([..._MUTABLE_TRANSITION_FIELDS_SET]);
+const RESERVED_RECORD_FIELDS = Object.freeze([..._RESERVED_RECORD_FIELDS_SET]);
 
 /**
  * Standard Structured Error Codes
@@ -85,6 +117,7 @@ const ERROR_CODES = Object.freeze({
   DISPATCH_PROJECT_MISMATCH: 'DISPATCH_PROJECT_MISMATCH',
   ILLEGAL_STATE_TRANSITION: 'ILLEGAL_STATE_TRANSITION',
   IMMUTABLE_FIELD_VIOLATION: 'IMMUTABLE_FIELD_VIOLATION',
+  INVALID_TRANSITION_PATCH: 'INVALID_TRANSITION_PATCH',
   PROJECT_IDENTITY_MISMATCH: 'PROJECT_IDENTITY_MISMATCH',
   DISPATCH_ID_COLLISION: 'DISPATCH_ID_COLLISION',
   LIFECYCLE_STORE_FAILURE: 'LIFECYCLE_STORE_FAILURE',
@@ -125,7 +158,14 @@ module.exports = {
   TERMINAL_STATES,
   WAITABLE_STATES,
   RECOGNIZED_WAIT_STATES,
+  MUTABLE_TRANSITION_FIELDS,
   RESERVED_RECORD_FIELDS,
+  isActiveState,
+  isTerminalState,
+  isWaitableState,
+  isRecognizedWaitState,
+  isMutableTransitionField,
+  isReservedRecordField,
   ERROR_CODES,
   LIMITS,
   computeRequestFingerprint

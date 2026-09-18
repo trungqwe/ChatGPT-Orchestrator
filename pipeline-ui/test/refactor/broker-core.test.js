@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Broker Core Unit & Characterization Test Suite (BC-001 .. BC-034)
+ * Broker Core Unit & Characterization Test Suite (BC-001 .. BC-048)
  *
  * Validates the standalone deterministic broker core against all required
  * negative, positive, concurrency, and provenance conditions.
@@ -108,7 +108,7 @@ function baseValidRequest(overrides = {}) {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING BROKER CORE TEST SUITE (BC-001 .. BC-034)');
+  console.log('RUNNING BROKER CORE TEST SUITE (BC-001 .. BC-048)');
   console.log('======================================================================');
 
   // -----------------------------------------------------------------------
@@ -1164,8 +1164,381 @@ async function runAllTests() {
     console.log('✓ BC-034 PASSED: Monotonic lifecycle preserved: RUNNING was not regressed to DISPATCH_ACCEPTED.');
   }
 
+  // -----------------------------------------------------------------------
+  // BC-035: Directive immutable through transition patch (BCORE-07 / Section 30)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-035] Testing directive immutable through transition patch...');
+  {
+    const { broker, lifecycleStore } = createTestHarness();
+    const req = baseValidRequest();
+    const dispRes = await broker.dispatchWorker(req);
+    assert.strictEqual(dispRes.ok, true);
+
+    const transRes = lifecycleStore.transition(dispRes.dispatch_id, DISPATCH_STATES.RUNNING, {
+      directive: 'altered directive text'
+    });
+    assert.strictEqual(transRes.ok, false);
+    assert.strictEqual(transRes.code, ERROR_CODES.IMMUTABLE_FIELD_VIOLATION);
+    assert.strictEqual(transRes.field, 'directive');
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.directive, req.directive);
+    assert.strictEqual(stored.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    console.log('✓ BC-035 PASSED: Attempt to patch directive failed closed with IMMUTABLE_FIELD_VIOLATION.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-036: Workspace authorization immutable through patch (BCORE-07 / Section 31)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-036] Testing expected_workspace_state_id immutable through patch...');
+  {
+    const { broker, lifecycleStore } = createTestHarness();
+    const req = baseValidRequest();
+    const dispRes = await broker.dispatchWorker(req);
+    assert.strictEqual(dispRes.ok, true);
+
+    const transRes = lifecycleStore.transition(dispRes.dispatch_id, DISPATCH_STATES.RUNNING, {
+      expected_workspace_state_id: 'sha256:other-workspace-state'
+    });
+    assert.strictEqual(transRes.ok, false);
+    assert.strictEqual(transRes.code, ERROR_CODES.IMMUTABLE_FIELD_VIOLATION);
+    assert.strictEqual(transRes.field, 'expected_workspace_state_id');
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.expected_workspace_state_id, req.expected_workspace_state_id);
+    console.log('✓ BC-036 PASSED: Attempt to patch expected_workspace_state_id failed closed.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-037: Audit metadata immutable through patch (BCORE-07 / Section 32)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-037] Testing audit_metadata immutable through patch...');
+  {
+    const { broker, lifecycleStore } = createTestHarness();
+    const req = baseValidRequest({ audit_metadata: { decision_id: 'original-id' } });
+    const dispRes = await broker.dispatchWorker(req);
+    assert.strictEqual(dispRes.ok, true);
+
+    const transRes = lifecycleStore.transition(dispRes.dispatch_id, DISPATCH_STATES.RUNNING, {
+      audit_metadata: { decision_id: 'mutated-id' }
+    });
+    assert.strictEqual(transRes.ok, false);
+    assert.strictEqual(transRes.code, ERROR_CODES.IMMUTABLE_FIELD_VIOLATION);
+    assert.strictEqual(transRes.field, 'audit_metadata');
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.deepStrictEqual(stored.audit_metadata, { decision_id: 'original-id' });
+    console.log('✓ BC-037 PASSED: Attempt to patch audit_metadata failed closed.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-038: Original input alias is detached at write boundary (BCORE-08 / Section 33)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-038] Testing original input alias is detached at write boundary...');
+  {
+    const { broker, lifecycleStore } = createTestHarness();
+    const audit_metadata = {
+      auditor: 'codex',
+      nested: {
+        decision_id: 'A-1'
+      }
+    };
+    const req = baseValidRequest({ audit_metadata });
+    const dispRes = await broker.dispatchWorker(req);
+    assert.strictEqual(dispRes.ok, true);
+
+    // Mutate the original request object after dispatch
+    audit_metadata.nested.decision_id = 'MUTATED';
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.audit_metadata.nested.decision_id, 'A-1', 'Store record must not be affected by caller mutation');
+    console.log('✓ BC-038 PASSED: Mutating input audit_metadata object after dispatch does not alter stored record.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-039: Getter alias is detached at read boundary (BCORE-08 / Section 34)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-039] Testing getter returns are deeply detached...');
+  {
+    const { broker, lifecycleStore } = createTestHarness();
+    const req = baseValidRequest({
+      audit_metadata: {
+        auditor: 'codex',
+        nested: {
+          decision_id: 'A-1'
+        }
+      }
+    });
+    const dispRes = await broker.dispatchWorker(req);
+    assert.strictEqual(dispRes.ok, true);
+
+    // Fetch copy and mutate nested property
+    const copy = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    copy.audit_metadata.nested.decision_id = 'MUTATED';
+
+    // Fetch again
+    const secondFetch = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(secondFetch.audit_metadata.nested.decision_id, 'A-1', 'getDispatch must return deeply detached copies');
+
+    // Test getActiveDispatch detachment
+    const activeCopy = lifecycleStore.getActiveDispatch('ai-multi-task');
+    activeCopy.audit_metadata.nested.decision_id = 'MUTATED_ACTIVE';
+
+    const activeSecondFetch = lifecycleStore.getActiveDispatch('ai-multi-task');
+    assert.strictEqual(activeSecondFetch.audit_metadata.nested.decision_id, 'A-1', 'getActiveDispatch must return deeply detached copies');
+    console.log('✓ BC-039 PASSED: Store getters return deeply detached objects.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-040: History alias is detached (BCORE-08 / Section 35)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-040] Testing history alias is deeply detached...');
+  {
+    const { broker, lifecycleStore } = createTestHarness();
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    assert.strictEqual(dispRes.ok, true);
+
+    const diagnostics = {
+      nested: {
+        source: 'original'
+      }
+    };
+    const transRes = lifecycleStore.transition(dispRes.dispatch_id, DISPATCH_STATES.RUNNING, { diagnostics });
+    assert.strictEqual(transRes.ok, true);
+
+    // Mutate original diagnostics object
+    diagnostics.nested.source = 'mutated_original';
+
+    const history1 = lifecycleStore.getProjectHistory('ai-multi-task');
+    const runningEvent = history1.find((e) => e.next_state === DISPATCH_STATES.RUNNING);
+    assert.strictEqual(runningEvent.patch.diagnostics.nested.source, 'original', 'Stored history must be detached from caller patch');
+
+    // Mutate returned history object
+    runningEvent.patch.diagnostics.nested.source = 'mutated_returned_history';
+
+    const history2 = lifecycleStore.getProjectHistory('ai-multi-task');
+    const runningEvent2 = history2.find((e) => e.next_state === DISPATCH_STATES.RUNNING);
+    assert.strictEqual(runningEvent2.patch.diagnostics.nested.source, 'original', 'Mutating returned history must not alter stored history');
+    console.log('✓ BC-040 PASSED: Lifecycle history and transition patches are deeply detached.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-041: Contract authority cannot be mutated (BCORE-09 / Section 36)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-041] Testing contract authority cannot be externally mutated...');
+  {
+    const contracts = require('../../lib/broker/contracts');
+    assert.strictEqual(Object.isFrozen(contracts.WAITABLE_STATES), true, 'WAITABLE_STATES must be frozen');
+    assert.strictEqual(contracts.WAITABLE_STATES.add, undefined, 'WAITABLE_STATES must not be a mutable Set');
+    assert.throws(() => {
+      contracts.WAITABLE_STATES.push(DISPATCH_STATES.DISPATCH_UNCERTAIN);
+    }, TypeError);
+
+    // Operational verification: DISPATCH_UNCERTAIN remains non-waitable
+    const customWorkerPort = {
+      dispatch: async () => { throw new Error('Network timeout'); },
+      wait: async () => ({
+        ok: true,
+        state: DISPATCH_STATES.READY_FOR_REVIEW,
+        dispatch_id: 'D-ANY',
+        work_order_id: 'WO-018'
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, workerCalls } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.DISPATCH_UNCERTAIN);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.DISPATCH_UNCERTAIN);
+    assert.strictEqual(workerCalls.wait.length, 0, 'DISPATCH_UNCERTAIN must remain non-waitable despite any consumer attack');
+    console.log('✓ BC-041 PASSED: Contract WAITABLE_STATES cannot be mutated, DISPATCH_UNCERTAIN non-waitable.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-042: Reserved/mutable-field authority cannot be weakened (BCORE-09 / Section 37)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-042] Testing mutable transition fields authority cannot be weakened...');
+  {
+    const contracts = require('../../lib/broker/contracts');
+    assert.strictEqual(Object.isFrozen(contracts.MUTABLE_TRANSITION_FIELDS), true);
+    assert.throws(() => {
+      contracts.MUTABLE_TRANSITION_FIELDS.push('directive');
+    }, TypeError);
+
+    const { broker, lifecycleStore } = createTestHarness();
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    const transRes = lifecycleStore.transition(dispRes.dispatch_id, DISPATCH_STATES.RUNNING, {
+      directive: 'attack'
+    });
+    assert.strictEqual(transRes.ok, false);
+    assert.strictEqual(transRes.code, ERROR_CODES.IMMUTABLE_FIELD_VIOLATION);
+    console.log('✓ BC-042 PASSED: MUTABLE_TRANSITION_FIELDS cannot be mutated, patch authority preserved.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-043: getActiveDispatch throws reports LIFECYCLE_STORE_FAILURE (BCORE-10 / Section 38)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-043] Testing getActiveDispatch exception boundary...');
+  {
+    const baseStore = createMemoryLifecycleStore();
+    const throwingStore = {
+      ...baseStore,
+      getActiveDispatch: () => { throw new Error('Database connection failed during getActiveDispatch'); }
+    };
+
+    const { broker, workerCalls } = createTestHarness({ lifecycleStore: throwingStore });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    assert.strictEqual(workerCalls.dispatch.length, 0, 'Worker must not be called if store read throws');
+    console.log('✓ BC-043 PASSED: getActiveDispatch exception caught and returned LIFECYCLE_STORE_FAILURE with 0 worker calls.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-044: beginDispatch throws reports LIFECYCLE_STORE_FAILURE (BCORE-10 / Section 39)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-044] Testing beginDispatch exception boundary...');
+  {
+    const baseStore = createMemoryLifecycleStore();
+    const throwingStore = {
+      ...baseStore,
+      beginDispatch: () => { throw new Error('Persistence disk full during beginDispatch'); }
+    };
+
+    const { broker, workerCalls } = createTestHarness({ lifecycleStore: throwingStore });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    assert.strictEqual(workerCalls.dispatch.length, 0, 'Worker must not be called if beginDispatch throws');
+    console.log('✓ BC-044 PASSED: beginDispatch exception caught and returned LIFECYCLE_STORE_FAILURE with 0 worker calls.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-045: waitWorker getDispatch throws reports LIFECYCLE_STORE_FAILURE (BCORE-10 / Section 40)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-045] Testing waitWorker getDispatch exception boundary...');
+  {
+    const baseStore = createMemoryLifecycleStore();
+    const throwingStore = {
+      ...baseStore,
+      getDispatch: () => { throw new Error('Store read corrupted during getDispatch'); }
+    };
+
+    const { broker, workerCalls } = createTestHarness({ lifecycleStore: throwingStore });
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ANY',
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    assert.strictEqual(workerCalls.wait.length, 0, 'Worker wait must not be called if getDispatch throws');
+    console.log('✓ BC-045 PASSED: waitWorker getDispatch exception caught and returned LIFECYCLE_STORE_FAILURE with 0 wait calls.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-046: getWorkerStatus store throws reports LIFECYCLE_STORE_FAILURE (BCORE-10 / Section 41)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-046] Testing getWorkerStatus store exception boundary...');
+  {
+    const baseStore = createMemoryLifecycleStore();
+    const throwingStore = {
+      ...baseStore,
+      getActiveDispatch: () => { throw new Error('Store access error'); }
+    };
+
+    const { broker } = createTestHarness({ lifecycleStore: throwingStore });
+    const statusRes = await broker.getWorkerStatus('ai-multi-task');
+
+    assert.strictEqual(statusRes.ok, false);
+    assert.strictEqual(statusRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    console.log('✓ BC-046 PASSED: getWorkerStatus store exception caught and returned LIFECYCLE_STORE_FAILURE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-047: transition throws after worker acceptance reports failure (BCORE-10 / Section 42)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-047] Testing transition exception after dispatch acceptance...');
+  {
+    const baseStore = createMemoryLifecycleStore();
+    const throwingStore = {
+      ...baseStore,
+      transition: (id, nextState, patch) => {
+        if (nextState === DISPATCH_STATES.DISPATCH_ACCEPTED) {
+          throw new Error('Store transition crashed during acceptance');
+        }
+        return baseStore.transition(id, nextState, patch);
+      }
+    };
+
+    const { broker } = createTestHarness({ lifecycleStore: throwingStore });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    console.log('✓ BC-047 PASSED: transition exception after acceptance caught and returned LIFECYCLE_STORE_FAILURE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-048: transition throws after READY_FOR_REVIEW reports failure (BCORE-10 / Section 43)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-048] Testing transition exception after READY_FOR_REVIEW...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => ({
+        ok: true,
+        state: DISPATCH_STATES.READY_FOR_REVIEW,
+        dispatch_id: args.dispatch_id,
+        work_order_id: args.work_order_id
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const baseStore = createMemoryLifecycleStore();
+    const throwingStore = {
+      ...baseStore,
+      transition: (id, nextState, patch) => {
+        if (nextState === DISPATCH_STATES.READY_FOR_REVIEW) {
+          throw new Error('Store transition crashed during READY_FOR_REVIEW');
+        }
+        return baseStore.transition(id, nextState, patch);
+      }
+    };
+
+    const { broker } = createTestHarness({
+      workerPort: customWorkerPort,
+      lifecycleStore: throwingStore
+    });
+
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    assert.strictEqual(dispRes.ok, true);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    console.log('✓ BC-048 PASSED: transition exception after READY_FOR_REVIEW caught and returned LIFECYCLE_STORE_FAILURE.');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-034: 34/34 PASS)');
+  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-048: 48/48 PASS)');
   console.log('======================================================================');
 }
 
