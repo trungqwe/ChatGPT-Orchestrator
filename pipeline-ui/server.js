@@ -244,6 +244,74 @@ function saveUserProjects(projects) {
   }
 }
 
+function ensureProjectRegistered(projPath, projName) {
+  if (!projPath || !fs.existsSync(projPath)) return;
+  const projects = getUserProjects();
+  const exists = projects.find(p => p.path && p.path.toLowerCase() === projPath.toLowerCase());
+  if (!exists) {
+    const id = (projName || path.basename(projPath)).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    projects.push({
+      id,
+      name: projName || path.basename(projPath),
+      path: projPath,
+      addedAt: new Date().toISOString()
+    });
+    saveUserProjects(projects);
+  }
+}
+
+function resolveSessionProject(sessionId) {
+  if (!sessionId || sessionId === 'new' || sessionId === 'auto') return null;
+  const cleanId = sessionId.replace(/^ao:/, '').replace(/^ide:/, '').trim();
+  const brainDir = 'C:\\Users\\Admin\\.gemini\\antigravity-ide\\brain';
+  const p = path.join(brainDir, cleanId, '.system_generated', 'logs', 'transcript.jsonl');
+  const pFull = path.join(brainDir, cleanId, '.system_generated', 'logs', 'transcript_full.jsonl');
+  const targetFile = fs.existsSync(p) ? p : (fs.existsSync(pFull) ? pFull : null);
+  if (!targetFile) return null;
+
+  try {
+    const chunk = fs.readFileSync(targetFile, 'utf8').slice(0, 25000);
+    
+    // 1. URI match
+    const m1 = chunk.match(/\[URI\]\s*->\s*\[CorpusName\]:\s*([a-zA-Z]:[^\s\r\n]+)/);
+    if (m1) {
+      const full = m1[1].trim().replace(/\//g, '\\');
+      const name = path.basename(full);
+      ensureProjectRegistered(full, name);
+      return { projectId: name, projectPath: full, projectName: name };
+    }
+
+    // 2. Active Document match
+    const m2 = chunk.match(/Active Document:\s*([a-zA-Z]:\\[^\r\n\(\)]+)/i);
+    if (m2) {
+      const doc = m2[1].trim();
+      let cur = path.dirname(doc);
+      while (cur && cur !== path.dirname(cur)) {
+        if (fs.existsSync(path.join(cur, '.git')) || fs.existsSync(path.join(cur, 'package.json')) || fs.existsSync(path.join(cur, 'requirements.txt'))) {
+          const name = path.basename(cur);
+          ensureProjectRegistered(cur, name);
+          return { projectId: name, projectPath: cur, projectName: name };
+        }
+        cur = path.dirname(cur);
+      }
+      const name = path.basename(path.dirname(doc));
+      ensureProjectRegistered(path.dirname(doc), name);
+      return { projectId: name, projectPath: path.dirname(doc), projectName: name };
+    }
+
+    // 3. Cwd match
+    const m3 = chunk.match(/"Cwd":\s*"([^"]+)"/);
+    if (m3) {
+      const cwd = m3[1].replace(/\\\\/g, '\\').trim();
+      const name = path.basename(cwd);
+      ensureProjectRegistered(cwd, name);
+      return { projectId: name, projectPath: cwd, projectName: name };
+    }
+  } catch (e) {}
+
+  return null;
+}
+
 app.get('/api/projects', (req, res) => {
   const projects = getUserProjects();
   res.json({ projects });
@@ -321,6 +389,27 @@ app.delete('/api/projects/:id', (req, res) => {
 
 app.post('/api/projects/:id/configure-pipeline', async (req, res) => {
   res.json({ message: 'Pipeline configuration active', success: true });
+});
+
+app.post('/api/projects/open-folder', (req, res) => {
+  const { folderPath } = req.body;
+  if (!folderPath) return res.status(400).json({ error: 'Missing folderPath' });
+  const target = path.resolve(folderPath);
+  if (fs.existsSync(target)) {
+    execFile('explorer', [target], () => {});
+    return res.json({ success: true, path: target });
+  }
+  res.status(404).json({ error: 'Folder not found: ' + target });
+});
+
+app.get('/api/antigravity/session-info/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const info = resolveSessionProject(sessionId);
+  res.json({
+    sessionId,
+    found: !!info,
+    project: info
+  });
 });
 
 // -------------------------------------------------------------
@@ -405,17 +494,32 @@ function extractWorkerReportOnly(text) {
 // -------------------------------------------------------------
 // Dynamic Antigravity Worker Session Resolution & Local Context
 // -------------------------------------------------------------
-function getProjectLocalContext(projectId) {
+function getProjectLocalContext(projectId, sessionId) {
   let projPath = null;
-  const projects = getUserProjects();
-  const found = projects.find(p => p.id === projectId || (p.name && p.name.toLowerCase() === (projectId || '').toLowerCase()));
-  if (found && found.path) projPath = found.path;
+  if (sessionId) {
+    const auto = resolveSessionProject(sessionId);
+    if (auto && auto.projectPath && fs.existsSync(auto.projectPath)) {
+      projPath = auto.projectPath;
+    }
+  }
 
-  if (!projPath) {
+  if (!projPath && projectId) {
+    if (fs.existsSync(projectId)) {
+      projPath = projectId;
+    } else {
+      const projects = getUserProjects();
+      const found = projects.find(p => p.id === projectId || (p.name && p.name.toLowerCase() === (projectId || '').toLowerCase()));
+      if (found && found.path) projPath = found.path;
+    }
+  }
+
+  if (!projPath && projectId) {
     if (projectId === 'calc-engine') projPath = path.join(__dirname, '..', 'calc-engine');
     else if (projectId === 'ai-auto-video-creator') projPath = 'D:\\AI Auto Video Creator';
     else if (projectId === 'ai_task_manager') projPath = 'D:\\TU_CODE\\AI_Task_Manager';
     else if (projectId === 'ai_multi_task') projPath = 'D:\\TU_CODE\\AI_Multi_Task';
+    else if (fs.existsSync(path.join('d:\\TU_CODE', projectId))) projPath = path.join('d:\\TU_CODE', projectId);
+    else if (fs.existsSync(path.join('D:\\', projectId))) projPath = path.join('D:\\', projectId);
     else projPath = path.join(__dirname, '..', projectId);
   }
 
@@ -488,8 +592,12 @@ function resolveAntigravitySession(sessionId, projectId) {
   if (sessionId && sessionId !== 'auto' && sessionId !== 'default' && sessionId !== 'new' && sessionId !== 'current') {
     const cleanId = sessionId.replace(/^ao:/, '').replace(/^ide:/, '').trim();
     if (cleanId !== 'eb04834e-f388-4dd3-afd7-4001e7fa3da5') {
-      const p = path.join('C:\\Users\\Admin\\.gemini\\antigravity-ide\\brain', cleanId, '.system_generated', 'logs', 'transcript.jsonl');
-      if (fs.existsSync(p)) return cleanId;
+      const brainDir = 'C:\\Users\\Admin\\.gemini\\antigravity-ide\\brain';
+      const sessDir = path.join(brainDir, cleanId);
+      if (fs.existsSync(sessDir)) return cleanId;
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cleanId)) {
+        return cleanId;
+      }
     }
   }
 
@@ -503,9 +611,12 @@ function resolveAntigravitySession(sessionId, projectId) {
     for (const cid of fs.readdirSync(brainDir)) {
       if (cid === currentOrchId) continue;
       const p = path.join(brainDir, cid, '.system_generated', 'logs', 'transcript.jsonl');
-      if (fs.existsSync(p)) {
+      const pFull = path.join(brainDir, cid, '.system_generated', 'logs', 'transcript_full.jsonl');
+      const walkP = path.join(brainDir, cid, 'walkthrough.md');
+      const targetP = fs.existsSync(p) ? p : (fs.existsSync(pFull) ? pFull : (fs.existsSync(walkP) ? walkP : null));
+      if (targetP) {
         try {
-          candidates.push({ cid, mtime: fs.statSync(p).mtimeMs, path: p });
+          candidates.push({ cid, mtime: fs.statSync(targetP).mtimeMs, path: targetP });
         } catch (e) {}
       }
     }
@@ -514,46 +625,13 @@ function resolveAntigravitySession(sessionId, projectId) {
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.mtime - a.mtime);
 
-  if (projectId) {
-    const projects = getUserProjects();
-    const found = projects.find(p => p.id === projectId || (p.name && p.name.toLowerCase() === projectId.toLowerCase()));
-    const projName = (found ? found.name : projectId).toLowerCase();
-    const cleanId = projectId.toLowerCase();
-    const projPath = found?.path ? found.path.toLowerCase() : '';
-
-    // Pass 1: scan deep in transcript for matching project name or path
+  if (projectId && projectId !== 'default') {
     for (const cand of candidates) {
-      try {
-        const stat = fs.statSync(cand.path);
-        const readSize = Math.min(stat.size, 65536);
-        const fd = fs.openSync(cand.path, 'r');
-        const buf = Buffer.alloc(readSize);
-        fs.readSync(fd, buf, 0, buf.length, Math.max(0, stat.size - buf.length));
-        fs.closeSync(fd);
-        const text = buf.toString('utf8').toLowerCase();
-        if (text.includes(projName) || text.includes(cleanId) || (projPath && text.includes(projPath))) {
-          return cand.cid;
-        }
-      } catch (e) {}
-    }
-
-    // Pass 2: map known workspaces
-    const knownWorkspaceMap = {
-      '40caab22-8b6d-41c8-b7bc-cd41daa28b21': 'ai_task_manager',
-      '6d6845f5-7836-479a-bf37-a95f44eb417c': 'ai_task_manager',
-      'c4cbb9a8-4a91-44bc-a270-32a99cc13ac2': 'calc-engine',
-      '126614b2-2068-4c00-a35e-3d3d0958115d': 'ai_multi_task'
-    };
-    for (const cand of candidates) {
-      if (knownWorkspaceMap[cand.cid] === cleanId || knownWorkspaceMap[cand.cid] === projName) {
+      const pInfo = resolveSessionProject(cand.cid);
+      if (pInfo && (pInfo.projectId.toLowerCase() === projectId.toLowerCase() || pInfo.projectName.toLowerCase() === projectId.toLowerCase())) {
         return cand.cid;
       }
     }
-
-    // NEVER return calc-engine when user chose another project!
-    // Return a new session ID for this project instead of cross-contaminating!
-    const crypto = require('crypto');
-    return crypto.randomUUID();
   }
 
   return candidates[0].cid;
@@ -577,95 +655,163 @@ function extractAntigravityReport(sessionId, projectId) {
   const targetSessionId = resolveAntigravitySession(sessionId, projectId);
   if (!targetSessionId) return null;
 
-  const logDir = path.join('C:\\Users\\Admin\\.gemini\\antigravity-ide\\brain', targetSessionId, '.system_generated', 'logs');
+  const brainDir = path.join('C:\\Users\\Admin\\.gemini\\antigravity-ide\\brain', targetSessionId);
+  const logDir = path.join(brainDir, '.system_generated', 'logs');
   let transcriptPath = path.join(logDir, 'transcript.jsonl');
   if (!fs.existsSync(transcriptPath)) {
     transcriptPath = path.join(logDir, 'transcript_full.jsonl');
   }
-  if (!fs.existsSync(transcriptPath)) return null;
 
-  try {
-    const rawLines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
-    const steps = [];
-    for (const line of rawLines) {
-      try { steps.push(JSON.parse(line)); } catch (e) {}
-    }
-    if (steps.length === 0) return null;
+  let finalContent = '';
+  let timestamp = new Date().toISOString();
+  const filesModified = new Set();
+  let stepCount = 0;
 
-    // Find the latest final response with content (Worker Report)
-    let finalContent = '';
-    let timestamp = new Date().toISOString();
-    const filesModified = new Set();
-
-    for (let i = steps.length - 1; i >= 0; i--) {
-      const s = steps[i];
-      if ((s.type === 'PLANNER_RESPONSE' || s.type === 'MODEL') && s.content && s.content.trim()) {
-        finalContent = s.content.trim();
-        if (s.created_at) timestamp = s.created_at;
-        break;
+  // 1. Try extracting from transcript if available
+  if (fs.existsSync(transcriptPath)) {
+    try {
+      const rawLines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
+      stepCount = rawLines.length;
+      const steps = [];
+      for (const line of rawLines) {
+        try { steps.push(JSON.parse(line)); } catch (e) {}
       }
-    }
 
-    // Scan recent steps for modified files
-    for (let i = Math.max(0, steps.length - 25); i < steps.length; i++) {
-      const s = steps[i];
-      if (Array.isArray(s.tool_calls)) {
-        for (const tc of s.tool_calls) {
-          if (tc.name === 'write_to_file' || tc.name === 'replace_file_content' || tc.name === 'multi_replace_file_content') {
-            const tf = tc.args && (tc.args.TargetFile || tc.args.FilePath);
-            if (tf) filesModified.add(path.basename(tf));
+      for (let i = steps.length - 1; i >= 0; i--) {
+        const s = steps[i];
+        if ((s.type === 'PLANNER_RESPONSE' || s.type === 'MODEL') && s.content && s.content.trim()) {
+          finalContent = s.content.trim();
+          if (s.created_at) timestamp = s.created_at;
+          break;
+        }
+      }
+
+      if (!finalContent) {
+        for (let i = steps.length - 1; i >= 0; i--) {
+          const s = steps[i];
+          if (s.content && s.content.trim() && s.type !== 'USER_INPUT') {
+            finalContent = s.content.trim();
+            if (s.created_at) timestamp = s.created_at;
+            break;
           }
         }
       }
-    }
 
-    // Check project workspace for HANDOFF.md or ROADMAP.md
-    let handoffText = '';
-    let projPath = null;
-    if (projectId) {
-      const projects = getUserProjects();
-      const found = projects.find(p => p.id === projectId);
-      projPath = found ? found.path : null;
-    }
-    if (!projPath && projectId) {
-      if (projectId === 'calc-engine') projPath = path.join(__dirname, '..', 'calc-engine');
-      else if (projectId === 'ai-auto-video-creator') projPath = 'D:\\AI Auto Video Creator';
-      else projPath = path.join(__dirname, '..', projectId);
-    }
-
-    if (projPath && fs.existsSync(projPath)) {
-      for (const hf of ['HANDOFF.md', 'handoff.md']) {
-        const hp = path.join(projPath, hf);
-        if (fs.existsSync(hp)) {
-          try {
-            const content = fs.readFileSync(hp, 'utf8').trim();
-            if (content) {
-              handoffText += `\n\n### Tài Liệu Bàn Giao (${hf}):\n${content.slice(0, 3000)}`;
+      // Scan recent steps for modified files
+      for (let i = Math.max(0, steps.length - 35); i < steps.length; i++) {
+        const s = steps[i];
+        if (Array.isArray(s.tool_calls)) {
+          for (const tc of s.tool_calls) {
+            if (tc.name === 'write_to_file' || tc.name === 'replace_file_content' || tc.name === 'multi_replace_file_content') {
+              const tf = tc.args && (tc.args.TargetFile || tc.args.FilePath);
+              if (tf) filesModified.add(path.basename(tf));
             }
-          } catch (e) {}
+          }
         }
       }
+    } catch (err) {
+      console.error('Error reading transcript for report:', err);
     }
+  }
 
-    // Strictly isolate pure Worker Report (Worker Report ... Blockers: None.)
-    const cleanReport = extractWorkerReportOnly(finalContent);
-    let reportText = cleanReport || 'Antigravity Worker báo cáo hoàn thành nhiệm vụ theo yêu cầu.';
-    if (handoffText) {
-      reportText += handoffText;
+  // 2. If no finalContent from transcript, check walkthrough.md in session brain!
+  if (!finalContent) {
+    const walkPath = path.join(brainDir, 'walkthrough.md');
+    if (fs.existsSync(walkPath)) {
+      try {
+        finalContent = fs.readFileSync(walkPath, 'utf8').trim();
+        const stat = fs.statSync(walkPath);
+        timestamp = stat.mtime.toISOString();
+      } catch (e) {}
     }
+  }
 
-    return {
-      sessionId: targetSessionId,
-      filesModified: Array.from(filesModified),
-      finalContent: cleanReport,
-      reportText: reportText.trim(),
-      timestamp,
-      totalSteps: steps.length
-    };
-  } catch (err) {
-    console.error('Error extracting clean report from transcript:', err);
+  // 3. If still empty, check implementation_plan.md in session brain!
+  if (!finalContent) {
+    const planPath = path.join(brainDir, 'implementation_plan.md');
+    if (fs.existsSync(planPath)) {
+      try {
+        finalContent = fs.readFileSync(planPath, 'utf8').trim();
+      } catch (e) {}
+    }
+  }
+
+  // 4. If still empty, check overview.txt in .system_generated/logs!
+  if (!finalContent) {
+    const overPath = path.join(logDir, 'overview.txt');
+    if (fs.existsSync(overPath)) {
+      try {
+        const rawOver = fs.readFileSync(overPath, 'utf8').trim();
+        if (rawOver.startsWith('{')) {
+          const lines = rawOver.split('\n').filter(Boolean);
+          for (let i = lines.length - 1; i >= 0; i--) {
+            try {
+              const parsed = JSON.parse(lines[i]);
+              if (parsed.content && parsed.type !== 'USER_INPUT' && parsed.type !== 'CONVERSATION_HISTORY') {
+                finalContent = parsed.content.trim();
+                if (parsed.created_at) timestamp = parsed.created_at;
+                break;
+              }
+            } catch (e) {}
+          }
+        }
+        if (!finalContent) finalContent = rawOver;
+      } catch (e) {}
+    }
+  }
+
+  // 5. Check project workspace for HANDOFF.md or ROADMAP.md
+  let handoffText = '';
+  let projPath = null;
+  const autoProj = resolveSessionProject(targetSessionId);
+  if (autoProj && autoProj.projectPath && fs.existsSync(autoProj.projectPath)) {
+    projPath = autoProj.projectPath;
+  }
+  if (!projPath && projectId) {
+    const projects = getUserProjects();
+    const found = projects.find(p => p.id === projectId);
+    projPath = found ? found.path : null;
+  }
+  if (!projPath && projectId) {
+    if (projectId === 'calc-engine') projPath = path.join(__dirname, '..', 'calc-engine');
+    else if (projectId === 'ai-auto-video-creator') projPath = 'D:\\AI Auto Video Creator';
+    else if (fs.existsSync(path.join('d:\\TU_CODE', projectId))) projPath = path.join('d:\\TU_CODE', projectId);
+    else projPath = path.join(__dirname, '..', projectId);
+  }
+
+  if (projPath && fs.existsSync(projPath)) {
+    for (const hf of ['HANDOFF.md', 'handoff.md']) {
+      const hp = path.join(projPath, hf);
+      if (fs.existsSync(hp)) {
+        try {
+          const content = fs.readFileSync(hp, 'utf8').trim();
+          if (content) {
+            handoffText += `\n\n### Tài Liệu Bàn Giao (${hf}):\n${content.slice(0, 3000)}`;
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  // Strictly isolate pure Worker Report
+  const cleanReport = extractWorkerReportOnly(finalContent);
+  let reportText = cleanReport || finalContent || '';
+  if (handoffText) {
+    reportText += handoffText;
+  }
+
+  if (!reportText.trim()) {
     return null;
   }
+
+  return {
+    sessionId: targetSessionId,
+    filesModified: Array.from(filesModified),
+    finalContent: cleanReport || finalContent,
+    reportText: reportText.trim(),
+    timestamp,
+    totalSteps: stepCount
+  };
 }
 
 app.get('/api/antigravity/latest-report/:sessionId?', (req, res) => {
@@ -2052,9 +2198,42 @@ app.delete('/api/antigravity/sessions/:id', (req, res) => {
 
 app.get('/api/orchestrator/exchange-stream/:projectId', (req, res) => {
   const { projectId } = req.params;
+  const sessionId = req.query.sessionId;
+
+  let history = [];
+  if (sessionId && exchangeHistory[sessionId] && exchangeHistory[sessionId].length > 0) {
+    history = exchangeHistory[sessionId];
+  } else if (exchangeHistory[projectId] && exchangeHistory[projectId].length > 0) {
+    history = exchangeHistory[projectId];
+  }
+
+  // If history is empty but session exists and has a Worker Report, automatically seed it as the initial turn!
+  if (history.length === 0 && sessionId && sessionId !== 'new' && sessionId !== 'auto') {
+    const rep = extractAntigravityReport(sessionId, projectId);
+    if (rep && rep.reportText) {
+      history = [
+        {
+          timestamp: rep.timestamp || new Date().toISOString(),
+          antigravitySessionId: sessionId,
+          projectId: projectId,
+          workerMessage: {
+            content: rep.reportText,
+            filesModified: rep.filesModified || []
+          },
+          antigravityReport: {
+            summary: rep.reportText.slice(0, 150),
+            testOutput: rep.reportText,
+            filesModified: rep.filesModified || []
+          }
+        }
+      ];
+    }
+  }
+
   res.json({
     projectId,
-    history: exchangeHistory[projectId] || []
+    sessionId,
+    history
   });
 });
 

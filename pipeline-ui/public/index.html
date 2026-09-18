@@ -21,24 +21,17 @@
         </div>
       </div>
 
-      <!-- Context Toolbar: Only Project & Antigravity Session -->
+      <!-- Context Toolbar: Antigravity Session with Auto-Detected Project -->
       <div class="model-selection-toolbar">
         <div class="context-select-group">
-          <span class="model-role-tag">Dự Án:</span>
-          <select id="global-project-select" class="form-select form-select-sm" title="Chọn Thư Mục Dự Án">
-            <option value="">Đang nạp dự án...</option>
-          </select>
-          <button id="btn-open-project-folder" class="btn btn-secondary btn-xs" title="Mở trực tiếp thư mục dự án trên máy" style="display:flex; align-items:center; gap:4px;">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
-            <span>📂 Mở Thư Mục...</span>
-          </button>
-        </div>
-
-        <div class="context-select-group">
           <span class="model-role-tag">Phiên Antigravity:</span>
-          <select id="global-antigravity-session-select" class="form-select form-select-sm" title="Chọn Phiên Chat Antigravity" style="min-width: 280px; max-width: 420px;">
-            <option value="auto">🟢 Tự động phát hiện phiên hoạt động</option>
+          <select id="global-antigravity-session-select" class="form-select form-select-sm" title="Chọn Phiên Làm Việc Antigravity" style="min-width: 320px; max-width: 480px;">
+            <option value="auto">🟢 Đang nạp danh sách phiên...</option>
           </select>
+          <button id="btn-open-session-folder" class="btn btn-secondary btn-xs" title="Mở trực tiếp thư mục dự án tương ứng trên máy" style="display:flex; align-items:center; gap:4px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+            <span id="btn-open-folder-label">📂 Mở Thư Mục</span>
+          </button>
         </div>
       </div>
     </header>
@@ -217,11 +210,11 @@
                 <div class="chat-header-title-row">
                   <span class="chat-indicator-dot"></span>
                   <div class="chat-meta-inline">
-                    <span class="metric-lbl">Dự Án:</span>
-                    <span class="metric-val" id="disp-active-project">-</span>
-                    <span class="meta-divider">•</span>
                     <span class="metric-lbl">Phiên:</span>
                     <span class="metric-val" id="disp-active-session">-</span>
+                    <span class="meta-divider">•</span>
+                    <span class="metric-lbl">Dự Án Tự Động:</span>
+                    <span class="metric-val" id="disp-active-project">-</span>
                     <span class="status-badge badge-emerald hidden" id="disp-loop-status"></span>
                   </div>
                 </div>
@@ -480,6 +473,36 @@
       </div>
     </div>
 
+
+    <!-- Modal: Báo Cáo Cuối & Handoff Preview (Spacious & Mouse-Resizable) -->
+    <div class="modal-overlay" id="report-preview-modal">
+      <div class="modal-content report-modal-container">
+        <div class="modal-header report-modal-header">
+          <div class="report-modal-header-info">
+            <span class="bubble-avatar avatar-agent" style="width:30px; height:30px; font-size:0.95rem;">⚡</span>
+            <div>
+              <h3 class="modal-title" id="report-preview-modal-title">Báo Cáo Nghiệm Thu & Tài Liệu Bàn Giao</h3>
+              <div class="report-modal-meta" id="report-preview-modal-meta">Đang tải thông tin...</div>
+            </div>
+          </div>
+          <div class="report-modal-actions">
+            <button class="btn btn-secondary btn-xs" id="btn-copy-report-text" title="Copy toàn bộ nội dung báo cáo">
+              📋 Copy Báo Cáo
+            </button>
+            <button class="btn-close" id="btn-close-report-modal">&times;</button>
+          </div>
+        </div>
+        <div class="modal-body report-modal-scroll" id="report-preview-modal-scroll">
+          <div class="chat-markdown-content" id="report-preview-modal-content">
+            <!-- Formatted Markdown Report Content -->
+          </div>
+        </div>
+        <div class="modal-footer report-modal-footer">
+          <span class="text-muted" style="font-size:0.75rem;">💡 Kéo góc dưới phải để mở rộng hoặc thu nhỏ khung xem báo cáo tùy ý.</span>
+          <button class="btn btn-secondary btn-sm" id="btn-dismiss-report-modal">Đóng</button>
+        </div>
+      </div>
+    </div>
 
     <!-- Toast Notifications -->
     <div class="toast-container" id="toast-container"></div>

@@ -22,5 +22,35 @@
     "name": "calc-engine",
     "path": "d:\\TU_CODE\\Orchestrator\\calc-engine",
     "addedAt": "2026-09-17T12:00:00.000Z"
+  },
+  {
+    "id": "dola-render-video",
+    "name": "dola-render-video",
+    "path": "d:\\\\TU_CODE\\\\dola-render-video\\",
+    "addedAt": "2026-09-18T13:02:54.085Z"
+  },
+  {
+    "id": "",
+    "name": "",
+    "path": "\\",
+    "addedAt": "2026-09-18T13:07:22.409Z"
+  },
+  {
+    "id": "ai_multi_task",
+    "name": "AI_Multi_Task",
+    "path": "d:\\\\TU_CODE\\\\AI_Multi_Task\\",
+    "addedAt": "2026-09-18T13:07:22.411Z"
+  },
+  {
+    "id": "ai-auto-video-creator",
+    "name": "AI Auto Video Creator",
+    "path": "d:\\\\AI Auto Video Creator\\",
+    "addedAt": "2026-09-18T13:07:22.424Z"
+  },
+  {
+    "id": "admin",
+    "name": "Admin",
+    "path": "c:\\\\Users\\\\Admin\\",
+    "addedAt": "2026-09-18T13:07:22.448Z"
   }
 ]

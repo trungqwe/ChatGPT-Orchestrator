@@ -8,6 +8,40 @@ import datetime
 
 sys.stdout.reconfigure(encoding='utf-8')
 
+def detect_session_workspace(cid, brain_dir):
+    p = os.path.join(brain_dir, cid, '.system_generated', 'logs', 'transcript.jsonl')
+    if not os.path.exists(p):
+        p = os.path.join(brain_dir, cid, '.system_generated', 'logs', 'transcript_full.jsonl')
+    if not os.path.exists(p):
+        return "", ""
+    try:
+        with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+            chunk = f.read(25000)
+    except Exception:
+        return "", ""
+    
+    m1 = re.search(r'\[URI\]\s*->\s*\[CorpusName\]:\s*([a-zA-Z]:[^\s\r\n]+)', chunk)
+    if m1:
+        full = m1.group(1).strip().replace('/', '\\')
+        return os.path.basename(full.rstrip('\\')), full
+
+    m2 = re.search(r'Active Document:\s*([a-zA-Z]:\\[^\r\n\(\)]+)', chunk)
+    if m2:
+        doc = m2.group(1).strip()
+        cur = os.path.dirname(doc)
+        while cur and cur != os.path.dirname(cur):
+            if any(os.path.exists(os.path.join(cur, f)) for f in ['.git', 'package.json', 'requirements.txt']):
+                return os.path.basename(cur.rstrip('\\')), cur
+            cur = os.path.dirname(cur)
+        return os.path.basename(os.path.dirname(doc)), os.path.dirname(doc)
+
+    m3 = re.search(r'\"Cwd\":\s*\"([^\"]+)\"', chunk)
+    if m3:
+        cwd = m3.group(1).replace('\\\\', '\\').strip()
+        return os.path.basename(cwd.rstrip('\\')), cwd
+
+    return "", ""
+
 def get_conversations():
     convos_dir = r'C:\Users\Admin\.gemini\antigravity-ide\conversations'
     brain_dir = r'C:\Users\Admin\.gemini\antigravity-ide\brain'
@@ -195,13 +229,16 @@ def get_conversations():
         status_cat = "recent"
         if cid == 'eb04834e-f388-4dd3-afd7-4001e7fa3da5':
             status_cat = "running"
-
-        workspace = known_workspaces.get(cid) or workspace_map.get(cid) or ""
+        det_name, det_path = detect_session_workspace(cid, brain_dir)
+        ws_name = det_name or known_workspaces.get(cid) or workspace_map.get(cid) or ""
+        ws_path = det_path
 
         conversations.append({
             'id': cid,
             'title': title,
-            'workspace': workspace,
+            'workspace': ws_name,
+            'projectPath': ws_path,
+            'projectId': ws_name or 'default',
             'status': status_cat,
             'relativeTime': rel_time,
             'timestamp': dt.isoformat(),

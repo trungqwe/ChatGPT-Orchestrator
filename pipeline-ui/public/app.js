@@ -229,20 +229,6 @@ async function loadProjects() {
     }
   });
 
-  // Set initial selected project for Observer & Orchestrator
-  if (globalProjSelect) {
-    const savedProj = localStorage.getItem('orchestrator_selected_project');
-    let targetProj = savedProj || state.selectedProject;
-    if (!targetProj || !state.projects.find(p => p.id === targetProj)) {
-      const preferred = state.projects.find(p => p.id === 'ai_task_manager' || p.id === 'AI_Task_Manager') || state.projects[0];
-      targetProj = preferred ? preferred.id : null;
-    }
-    if (targetProj) {
-      localStorage.setItem('orchestrator_selected_project', targetProj);
-      globalProjSelect.value = targetProj;
-      onProjectSelected(targetProj);
-    }
-  }
 
   // Render Projects Grid if element exists
   const container = document.getElementById('projects-container');
@@ -341,6 +327,7 @@ async function loadAntigravitySessions(projectId) {
   if (!agySelect) return;
 
   const res = await apiGet('/api/antigravity/conversations');
+  state.conversations = res?.conversations || [];
   agySelect.innerHTML = '';
 
   const badgeNavSess = document.getElementById('badge-nav-sessions-count');
@@ -365,7 +352,7 @@ async function loadAntigravitySessions(projectId) {
       currentList.forEach(s => {
         const opt = document.createElement('option');
         opt.value = s.id;
-        const wsTag = s.workspace ? ` [${s.workspace}]` : '';
+        const wsTag = s.workspace ? ` [📁 ${s.workspace}]` : '';
         opt.textContent = `🟢 ${s.title}${wsTag} (${s.relativeTime})`;
         grp.appendChild(opt);
       });
@@ -378,7 +365,7 @@ async function loadAntigravitySessions(projectId) {
       runningList.forEach(s => {
         const opt = document.createElement('option');
         opt.value = s.id;
-        const wsTag = s.workspace ? ` [${s.workspace}]` : '';
+        const wsTag = s.workspace ? ` [📁 ${s.workspace}]` : '';
         opt.textContent = `⚡ ${s.title}${wsTag} (${s.relativeTime})`;
         grp.appendChild(opt);
       });
@@ -391,7 +378,7 @@ async function loadAntigravitySessions(projectId) {
       recentList.forEach(s => {
         const opt = document.createElement('option');
         opt.value = s.id;
-        const wsTag = s.workspace ? ` [${s.workspace}]` : '';
+        const wsTag = s.workspace ? ` [📁 ${s.workspace}]` : '';
         opt.textContent = `💬 ${s.title}${wsTag} (${s.relativeTime})`;
         grp.appendChild(opt);
       });
@@ -418,13 +405,53 @@ async function loadAntigravitySessions(projectId) {
     }
   }
 
+  if (state.selectedAgySession && state.selectedAgySession !== 'new') {
+    onAgySessionChanged(state.selectedAgySession, false);
+  } else {
+    const dispSess = document.getElementById('disp-active-session');
+    if (dispSess) dispSess.textContent = '✨ Phiên Chat Mới (Chờ nhận lệnh...)';
+  }
+}
+
+function onAgySessionChanged(sessionId, shouldReloadStream = true) {
+  if (!sessionId || sessionId === 'new') {
+    handleNewSessionSelected();
+    return;
+  }
+  state.selectedAgySession = sessionId;
+  const sess = (state.conversations || []).find(c => c.id === sessionId);
+  
+  if (sess) {
+    state.selectedProject = sess.projectId || sess.workspace || 'default';
+    state.selectedProjectPath = sess.projectPath || '';
+    state.selectedProjectName = sess.workspace || sess.projectId || 'Dự án';
+  }
+
+  const agySelect = document.getElementById('global-antigravity-session-select');
+  if (agySelect && agySelect.value !== sessionId) {
+    agySelect.value = sessionId;
+  }
+
   const dispSess = document.getElementById('disp-active-session');
   if (dispSess) {
-    if (state.selectedAgySession === 'new') {
-      dispSess.textContent = '✨ Phiên Chat Mới (Chờ nhận lệnh...)';
-    } else {
-      dispSess.textContent = agySelect.options[agySelect.selectedIndex]?.text || agySelect.value;
-    }
+    dispSess.textContent = sess ? sess.title : sessionId;
+  }
+
+  const dispProj = document.getElementById('disp-active-project');
+  if (dispProj) {
+    const wsName = sess?.workspace || state.selectedProject;
+    const wsPath = sess?.projectPath ? ` (${sess.projectPath})` : '';
+    dispProj.textContent = `${wsName}${wsPath}`;
+  }
+
+  const btnOpenFolder = document.getElementById('btn-open-session-folder');
+  if (btnOpenFolder) {
+    btnOpenFolder.title = sess?.projectPath ? `Mở thư mục: ${sess.projectPath}` : 'Mở thư mục dự án tương ứng';
+  }
+
+  if (shouldReloadStream) {
+    loadExchangeStream(state.selectedProject, sessionId);
+    pollAgentLiveSteps();
   }
 }
 
@@ -489,12 +516,14 @@ async function loadTechnicalContext(projectId) {
   });
 }
 
-async function loadExchangeStream(projectId) {
+async function loadExchangeStream(projectId, sessionId) {
   const container = document.getElementById('exchange-stream-container');
   const emptyState = document.getElementById('stream-empty-state');
   if (!container) return;
 
-  const data = await apiGet(`/api/orchestrator/exchange-stream/${projectId}`);
+  const sessParam = sessionId || state.selectedAgySession || '';
+  const projParam = projectId || state.selectedProject || 'default';
+  const data = await apiGet(`/api/orchestrator/exchange-stream/${projParam}?sessionId=${sessParam}`);
   state.activeExchangeHistory = (data && data.history) ? data.history : [];
 
   if (state.activeExchangeHistory.length === 0) {
@@ -635,75 +664,108 @@ function renderExchangeStream(history) {
     }
 
     // 3. Right Bubble: ChatGPT Web (Lead Architect & Auditor)
-    const rowGpt = document.createElement('div');
-    rowGpt.className = 'chat-bubble-row row-chatgpt exchange-turn';
-    rowGpt.innerHTML = `
-      <div class="chat-bubble bubble-chatgpt">
-        <div class="bubble-header">
-          <div class="bubble-header-left">
-            <span class="verdict-pill ${verdictClass}">${escapeHtml(verdictLabel)}</span>
-            <span class="bubble-time">${timeStr}</span>
+    if (gptContent && gptContent.trim()) {
+      const rowGpt = document.createElement('div');
+      rowGpt.className = 'chat-bubble-row row-chatgpt exchange-turn';
+      rowGpt.innerHTML = `
+        <div class="chat-bubble bubble-chatgpt">
+          <div class="bubble-header">
+            <div class="bubble-header-left">
+              <span class="verdict-pill ${verdictClass}">${escapeHtml(verdictLabel)}</span>
+              <span class="bubble-time">${timeStr}</span>
+            </div>
+            <div class="bubble-sender-group">
+              <span class="bubble-role role-architect">Auditor</span>
+              <span class="bubble-name">ChatGPT Web</span>
+              <span class="bubble-avatar avatar-chatgpt">🧠</span>
+            </div>
           </div>
-          <div class="bubble-sender-group">
-            <span class="bubble-role role-architect">Auditor</span>
-            <span class="bubble-name">ChatGPT Web</span>
-            <span class="bubble-avatar avatar-chatgpt">🧠</span>
+          <div class="bubble-body">
+            <div class="chat-markdown-content">
+              ${formatChatMarkdown(gptContent)}
+            </div>
+
+            ${directivePrompt ? `
+              <div class="bubble-directive-box">
+                <div class="directive-box-header">
+                  <div class="directive-box-title">
+                    <span class="directive-icon">🎯</span>
+                    <strong>Chỉ Đạo Tiếp Theo:</strong>
+                  </div>
+                  <div class="directive-box-actions">
+                    <button class="btn btn-secondary btn-xs btn-copy-dir" title="Sao chép prompt">📋 Copy</button>
+                    <button class="btn btn-success btn-xs btn-dispatch-dir" title="Nạp trực tiếp vào khung chat Antigravity IDE">⚡ Nạp Vào IDE</button>
+                  </div>
+                </div>
+                <pre class="directive-content-code">${escapeHtml(directivePrompt)}</pre>
+              </div>` : ''}
           </div>
         </div>
-        <div class="bubble-body">
-          <div class="chat-markdown-content">
-            ${formatChatMarkdown(gptContent)}
-          </div>
+      `;
 
-          ${directivePrompt ? `
-            <div class="bubble-directive-box">
-              <div class="directive-box-header">
-                <div class="directive-box-title">
-                  <span class="directive-icon">🎯</span>
-                  <strong>Chỉ Đạo Tiếp Theo:</strong>
-                </div>
-                <div class="directive-box-actions">
-                  <button class="btn btn-secondary btn-xs btn-copy-dir" title="Sao chép prompt">📋 Copy</button>
-                  <button class="btn btn-success btn-xs btn-dispatch-dir" title="Nạp trực tiếp vào khung chat Antigravity IDE">⚡ Nạp Vào IDE</button>
-                </div>
-              </div>
-              <pre class="directive-content-code">${escapeHtml(directivePrompt)}</pre>
-            </div>` : ''}
-        </div>
-      </div>
-    `;
-
-    // Listeners for directive box inside rowGpt
-    const copyBtn = rowGpt.querySelector('.btn-copy-dir');
-    if (copyBtn) {
-      copyBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(directivePrompt || '');
-        showToast('Đã sao chép prompt chỉ đạo vào bộ nhớ tạm!');
-      });
-    }
-
-    const dispatchBtn = rowGpt.querySelector('.btn-dispatch-dir');
-    if (dispatchBtn) {
-      dispatchBtn.addEventListener('click', async () => {
-        const agySessionId = document.getElementById('global-antigravity-session-select')?.value || state.selectedAgySession || 'auto';
-        navigator.clipboard.writeText(directivePrompt);
-
-        const dispRes = await apiPost('/api/antigravity/dispatch', {
-          sessionId: agySessionId,
-          prompt: directivePrompt,
-          projectId: state.selectedProject
+      // Listeners for directive box inside rowGpt
+      const copyBtn = rowGpt.querySelector('.btn-copy-dir');
+      if (copyBtn) {
+        copyBtn.addEventListener('click', () => {
+          navigator.clipboard.writeText(directivePrompt || '');
+          showToast('Đã sao chép prompt chỉ đạo vào bộ nhớ tạm!');
         });
+      }
 
-        if (dispRes && dispRes.dispatched) {
-          showToast(`⚡ ${dispRes.message || 'Đã nạp chỉ đạo vào khung chat Antigravity IDE!'}`, 'success');
-        } else {
-          showToast(`⚡ ${dispRes?.message || 'Đã gửi prompt sang Antigravity!'}`, 'info');
-        }
-        startObservingAntigravity();
+      const dispatchBtn = rowGpt.querySelector('.btn-dispatch-dir');
+      if (dispatchBtn) {
+        dispatchBtn.addEventListener('click', async () => {
+          const agySessionId = document.getElementById('global-antigravity-session-select')?.value || state.selectedAgySession || 'auto';
+          navigator.clipboard.writeText(directivePrompt);
+
+          const dispRes = await apiPost('/api/antigravity/dispatch', {
+            sessionId: agySessionId,
+            prompt: directivePrompt,
+            projectId: state.selectedProject
+          });
+
+          if (dispRes && dispRes.dispatched) {
+            showToast(`⚡ ${dispRes.message || 'Đã nạp chỉ đạo vào khung chat Antigravity IDE!'}`, 'success');
+          } else {
+            showToast(`⚡ ${dispRes?.message || 'Đã gửi prompt sang Antigravity!'}`, 'info');
+          }
+          startObservingAntigravity();
+        });
+      }
+
+      container.appendChild(rowGpt);
+    } else if (workerContent && workerContent.trim()) {
+      // Worker reported but ChatGPT has not audited yet: show action prompt
+      const rowAuditPrompt = document.createElement('div');
+      rowAuditPrompt.className = 'chat-bubble-row row-chatgpt exchange-turn';
+      rowAuditPrompt.innerHTML = `
+        <div class="chat-bubble bubble-chatgpt" style="background: rgba(30, 41, 59, 0.7); border: 1px dashed rgba(99, 102, 241, 0.45); padding: 0.9rem 1.1rem;">
+          <div class="bubble-header" style="margin-bottom: 0.5rem;">
+            <div class="bubble-header-left">
+              <span class="verdict-pill verdict-badge-amber">⏳ Chờ Thẩm Định</span>
+              <span class="bubble-time">${timeStr}</span>
+            </div>
+            <div class="bubble-sender-group">
+              <span class="bubble-role role-architect">Auditor</span>
+              <span class="bubble-name">ChatGPT Web</span>
+              <span class="bubble-avatar avatar-chatgpt">🧠</span>
+            </div>
+          </div>
+          <div class="bubble-body">
+            <p style="color:#cbd5e1; font-size:0.875rem; line-height:1.5; margin:0 0 0.75rem 0;">
+              Antigravity Worker đã tải xong báo cáo nghiệm thu. Bấm nút bên dưới để gửi sang <strong>ChatGPT Web thẩm định độc lập & ra chỉ đạo tiếp theo</strong>.
+            </p>
+            <button class="btn btn-primary btn-sm btn-audit-stream-btn" style="display:inline-flex; align-items:center; gap:6px; font-weight:600;">
+              <span>🧠 Bắn Báo Cáo Sang ChatGPT Web Audit Ngay</span>
+            </button>
+          </div>
+        </div>
+      `;
+      rowAuditPrompt.querySelector('.btn-audit-stream-btn').addEventListener('click', () => {
+        triggerAuditAndDirect();
       });
+      container.appendChild(rowAuditPrompt);
     }
-
-    container.appendChild(rowGpt);
   });
 
   // Track latest directive
@@ -845,7 +907,7 @@ async function loadWorkSessionsTab() {
         <div class="session-title-col">
           <div class="session-row-title">${escapeHtml(s.title || 'Phiên Chat Antigravity')}</div>
           <div class="session-row-meta">
-            <span class="meta-tag project-tag" title="Thư mục làm việc">📁 ${escapeHtml(s.workspace || state.selectedProject || 'Mặc định')}</span>
+            <span class="meta-tag project-tag" title="Thư mục làm việc: ${escapeHtml(s.projectPath || '')}">📁 ${escapeHtml(s.workspace || s.projectId || 'Tự động')}</span>
             <span class="meta-tag time-tag">🕒 ${escapeHtml(s.relativeTime || '')}</span>
             <span class="meta-tag id-tag">ID: <code>${escapeHtml(s.id.slice(0, 8))}...</code></span>
             <span class="badge ${statusClass}">${statusLabel}</span>
@@ -853,6 +915,10 @@ async function loadWorkSessionsTab() {
         </div>
       </div>
       <div class="session-row-actions">
+        <button class="btn btn-secondary btn-sm btn-preview-session-report" data-id="${s.id}" title="Xem trước nội dung báo cáo & tài liệu bàn giao của phiên này">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+          <span>Báo Cáo</span>
+        </button>
         <button class="btn btn-primary btn-sm btn-enter-session" data-id="${s.id}" data-title="${escapeHtml(s.title)}" data-ws="${escapeHtml(s.workspace || '')}">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
           <span>Vào Phiên</span>
@@ -863,6 +929,12 @@ async function loadWorkSessionsTab() {
         </button>
       </div>
     `;
+
+    // Click "Báo Cáo"
+    card.querySelector('.btn-preview-session-report').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openReportPreviewModal(s.id);
+    });
 
     // Click "Vào Phiên"
     card.querySelector('.btn-enter-session').addEventListener('click', () => {
@@ -883,35 +955,57 @@ async function loadWorkSessionsTab() {
   });
 }
 
-function enterWorkSession(session) {
-  state.selectedAgySession = session.id;
-  
-  // If session workspace matches a project, switch to it
-  if (session.workspace) {
-    const matched = state.projects.find(p => 
-      p.id.toLowerCase() === session.workspace.toLowerCase() || 
-      p.name.toLowerCase() === session.workspace.toLowerCase()
-    );
-    if (matched && matched.id !== state.selectedProject) {
-      onProjectSelected(matched.id);
+async function openReportPreviewModal(sessionId) {
+  const modal = document.getElementById('report-preview-modal');
+  const titleEl = document.getElementById('report-preview-modal-title');
+  const metaEl = document.getElementById('report-preview-modal-meta');
+  const contentEl = document.getElementById('report-preview-modal-content');
+  if (!modal) return;
+
+  const sess = (state.conversations || []).find(c => c.id === sessionId);
+  const title = sess ? sess.title : (document.getElementById('disp-active-session')?.textContent || sessionId);
+
+  if (titleEl) titleEl.textContent = `Báo Cáo Nghiệm Thu: ${title}`;
+  if (metaEl) metaEl.textContent = `Đang tải báo cáo từ Antigravity transcript...`;
+  if (contentEl) contentEl.innerHTML = '<div class="text-muted" style="text-align:center; padding:2rem;">⏳ Đang trích xuất Báo Cáo Cuối & Handoff từ Antigravity...</div>';
+  modal.classList.add('active');
+  modal.classList.remove('hidden');
+
+  const res = await apiGet(`/api/antigravity/latest-report/${sessionId}`);
+  if (!res || !res.report || !res.report.reportText) {
+    if (contentEl) {
+      contentEl.innerHTML = `
+        <div class="stream-empty-state" style="padding: 2.5rem 1.5rem; text-align:center;">
+          <span class="empty-dot" style="background:#fbbf24; box-shadow:0 0 12px #fbbf24;"></span>
+          <h4 style="color:#e2e8f0; font-size:1.05rem; margin-bottom:0.4rem; font-weight:700;">Chưa có Báo Cáo Cuối</h4>
+          <p class="empty-hint" style="max-width:560px; margin:0 auto; line-height:1.5;">
+            Phiên làm việc này chưa có nội dung báo cáo hoàn thành hoặc đang trong quá trình thực thi trên Antigravity IDE.
+          </p>
+        </div>
+      `;
     }
+    if (metaEl) metaEl.textContent = `Phiên: ${sessionId}`;
+    return;
   }
 
-  // Update top dropdown and label
-  const agySel = document.getElementById('global-antigravity-session-select');
-  if (agySel) agySel.value = session.id;
-  const dispSess = document.getElementById('disp-active-session');
-  if (dispSess) dispSess.textContent = session.title;
+  const timeStr = res.report.timestamp ? new Date(res.report.timestamp).toLocaleString('vi-VN') : '';
+  const wsText = sess?.workspace ? ` • Dự án: ${sess.workspace}` : '';
+
+  if (metaEl) metaEl.textContent = `Phiên: ${sessionId}${wsText} • Cập nhật: ${timeStr} • ${res.report.totalSteps || 0} Bước`;
+  if (contentEl) contentEl.innerHTML = formatChatMarkdown(res.report.reportText);
+
+  state.currentPreviewReportText = res.report.reportText;
+}
+window.openReportPreviewModal = openReportPreviewModal;
+
+function enterWorkSession(session) {
+  onAgySessionChanged(session.id, true);
 
   // Switch to Observer tab
   document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === 'observer'));
   state.activeTab = 'observer';
   switchMainView('observer');
 
-  if (state.selectedProject) {
-    loadExchangeStream(state.selectedProject);
-    pollAgentLiveSteps();
-  }
   showToast(`Đã chuyển vào phiên: ${session.title}`, 'success');
 }
 
@@ -1316,6 +1410,7 @@ document.addEventListener('DOMContentLoaded', () => {
   switchMainView('observer');
 
   // Immediately load initial data
+  loadAntigravitySessions().catch(e => console.error('loadAntigravitySessions error:', e));
   loadProjects().catch(e => console.error('loadProjects error:', e));
   loadModelCatalogs().catch(e => console.error('loadModelCatalogs error:', e));
   loadSessions().catch(e => console.error('loadSessions error:', e));
@@ -2010,13 +2105,6 @@ document.addEventListener('DOMContentLoaded', () => {
   // -------------------------------------------------------------
   // Observer & Orchestrator Event Listeners
   // -------------------------------------------------------------
-  const globalProjSelect = document.getElementById('global-project-select');
-  if (globalProjSelect) {
-    globalProjSelect.addEventListener('change', (e) => {
-      onProjectSelected(e.target.value);
-    });
-  }
-
   const globalAgySelect = document.getElementById('global-antigravity-session-select');
   if (globalAgySelect) {
     globalAgySelect.addEventListener('change', (e) => {
@@ -2024,15 +2112,25 @@ document.addEventListener('DOMContentLoaded', () => {
       if (val === 'new') {
         handleNewSessionSelected();
       } else {
-        state.selectedAgySession = val;
-        const dispSess = document.getElementById('disp-active-session');
-        if (dispSess) {
-          dispSess.textContent = e.target.options[e.target.selectedIndex]?.text || e.target.value;
-        }
-        if (state.selectedProject) {
-          loadExchangeStream(state.selectedProject);
-        }
-        pollAgentLiveSteps();
+        onAgySessionChanged(val, true);
+      }
+    });
+  }
+
+  const btnOpenFolder = document.getElementById('btn-open-session-folder');
+  if (btnOpenFolder) {
+    btnOpenFolder.addEventListener('click', async () => {
+      const sess = (state.conversations || []).find(c => c.id === state.selectedAgySession);
+      const targetPath = sess?.projectPath || state.selectedProjectPath;
+      if (!targetPath) {
+        showToast('Chưa xác định được đường dẫn thư mục dự án cho phiên này.', 'info');
+        return;
+      }
+      const res = await apiPost('/api/projects/open-folder', { folderPath: targetPath });
+      if (res && res.success) {
+        showToast(`📂 Đã mở thư mục: ${targetPath}`, 'success');
+      } else {
+        showToast('Không thể mở thư mục: ' + (res?.error || ''), 'error');
       }
     });
   }
@@ -2443,20 +2541,45 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnQuickPreview = document.getElementById('btn-quick-preview-report');
   if (btnQuickPreview) {
     btnQuickPreview.addEventListener('click', async () => {
-      const projectId = state.selectedProject;
-      const agySessionId = document.getElementById('global-antigravity-session-select')?.value || state.selectedAgySession || 'auto';
-      showToast('Đang tải Báo Cáo Cuối & Handoff từ Antigravity...', 'info');
-      const res = await apiGet(`/api/antigravity/latest-report/${agySessionId}?projectId=${projectId || ''}`);
-      if (!res || !res.report) {
-        showToast('Chưa tìm thấy báo cáo cho phiên này.', 'error');
+      const agySessionId = document.getElementById('global-antigravity-session-select')?.value || state.selectedAgySession;
+      if (!agySessionId || agySessionId === 'new') {
+        showToast('Vui lòng chọn một phiên làm việc có dữ liệu trước.', 'info');
         return;
       }
-      const fn = document.getElementById('preview-filename');
-      const fc = document.getElementById('preview-file-content');
-      const box = document.getElementById('tech-file-preview-box');
-      if (fn) fn.textContent = `Báo Cáo Cuối & Handoff: ${res.report.sessionId}`;
-      if (fc) fc.textContent = res.report.reportText;
-      if (box) box.classList.remove('hidden');
+      openReportPreviewModal(agySessionId);
+    });
+  }
+
+  // Report Modal Close & Copy Event Handlers
+  const btnCloseRep = document.getElementById('btn-close-report-modal');
+  const btnDismissRep = document.getElementById('btn-dismiss-report-modal');
+  const modalRep = document.getElementById('report-preview-modal');
+  const btnCopyRep = document.getElementById('btn-copy-report-text');
+
+  const closeModalRep = () => {
+    if (modalRep) {
+      modalRep.classList.remove('active');
+      modalRep.classList.add('hidden');
+    }
+  };
+  if (btnCloseRep) btnCloseRep.addEventListener('click', closeModalRep);
+  if (btnDismissRep) btnDismissRep.addEventListener('click', closeModalRep);
+  if (modalRep) {
+    modalRep.addEventListener('click', (e) => {
+      if (e.target === modalRep) closeModalRep();
+    });
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modalRep && modalRep.classList.contains('active')) {
+      closeModalRep();
+    }
+  });
+  if (btnCopyRep) {
+    btnCopyRep.addEventListener('click', () => {
+      if (state.currentPreviewReportText) {
+        navigator.clipboard.writeText(state.currentPreviewReportText);
+        showToast('📋 Đã copy toàn bộ nội dung báo cáo vào clipboard!', 'success');
+      }
     });
   }
 
