@@ -1,12 +1,19 @@
 /**
  * Dedicated Regression Test Suite for WP-V3-01: Legacy Transport Correctness Seal
  * Tests:
- * - L-NT-029: Generic JSON stdout cannot activate exact transport authority (B-03)
- * - L-NT-030: Contradictory queued=false + turn_id JSON fails closed (B-03)
+ * - L-NT-029: Generic JSON stdout cannot activate exact transport or queue authority (B-03 / B-03B)
+ * - L-NT-030: Contradictory queued=false + turn_id JSON fails closed (B-03 / B-03B)
  * - L-NT-031: Unrelated error event for Turn A does not fail Target Turn B (B-04)
  * - L-NT-032: Matching error event for Target Turn B returns exact target failure (B-04)
  * - L-NT-033: Error event without turn_id returns session/unknown failure, not target turn proof (B-04)
  * - L-NT-034: Cross-session timeout diagnostic remains strictly session-bound (B-05)
+ * - L-NT-035: JSON without queued field does not establish queue acceptance (B-03B)
+ * - L-NT-036: JSON with queued=true cannot create queue authority or overwrite IDs (B-03B)
+ * - L-NT-037: Loose text (e.g. 'for thread ...') does not establish queue acceptance (B-03B)
+ * - Positive ACK: Exact CLI textual acknowledgement creates valid queue acceptance
+ * - L-NT-038: Mixed turn/report provenance rejected; report strictly bound to task_complete (B-06)
+ * - L-NT-039: Incomplete new turn response_item does not rewrite completed report (B-06)
+ * - L-NT-040: Empty task_complete does not borrow text from response_item (B-06)
  */
 
 const fs = require('fs');
@@ -27,8 +34,11 @@ function compileMockCodexExe(targetExePath, defaultOutputMessage) {
     'using System.IO;',
     'class P {',
     '  static void Main(string[] args) {',
+    '    string txtOut = Environment.GetEnvironmentVariable("MOCK_STDOUT_TEXT");',
     '    string jsonOut = Environment.GetEnvironmentVariable("MOCK_EXACT_TRANSPORT_JSON");',
-    '    if (!string.IsNullOrEmpty(jsonOut)) {',
+    '    if (!string.IsNullOrEmpty(txtOut)) {',
+    '      Console.WriteLine(txtOut);',
+    '    } else if (!string.IsNullOrEmpty(jsonOut)) {',
     '      Console.WriteLine(jsonOut);',
     '    } else {',
     `      Console.WriteLine(@"${defaultOutputMessage.replace(/"/g, '""')}");`,
@@ -54,7 +64,7 @@ function cleanLock() {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING WP-V3-01 REGRESSION TEST SUITE (L-NT-029 .. L-NT-034)');
+  console.log('RUNNING WP-V3-01 REGRESSION TEST SUITE (L-NT-029 .. L-NT-040)');
   console.log('======================================================================');
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch_wp01_reg_'));
@@ -77,7 +87,7 @@ async function runAllTests() {
       .join(path.delimiter);
 
     // -----------------------------------------------------------------------
-    // L-NT-029: Generic JSON stdout cannot activate exact transport (B-03)
+    // L-NT-029: Generic JSON stdout cannot activate exact transport or queue authority (B-03 / B-03B)
     // -----------------------------------------------------------------------
     console.log('\n[L-NT-029] Testing generic JSON stdout cannot activate exact transport authority...');
     cleanLock();
@@ -107,16 +117,17 @@ async function runAllTests() {
     assert.strictEqual(proc29.status, 0, `Script failed: ${proc29.stderr}`);
     const res29 = JSON.parse((proc29.stdout || '').trim());
 
-    assert.strictEqual(res29.queued, true, 'queued must be true when acknowledged');
+    assert.strictEqual(res29.queued, false, 'queued must be false: generic JSON is not an ACK (B-03B)');
+    assert.strictEqual(res29.success, false, 'success must be false without recognized ACK');
     assert.strictEqual(res29.verified, false, 'verified must be false: generic JSON cannot create authority');
     assert.strictEqual(res29.turn_started, false, 'turn_started must be false');
     assert.strictEqual(res29.turn_id, null, 'fake-turn-from-json must NEVER become authoritative turn_id');
     assert.strictEqual(res29.correlation_method, 'unavailable', 'correlation_method must be unavailable');
-    assert.strictEqual(res29.queued_submission_id, 'fake-sub', 'queued_submission_id preserved as diagnostic');
-    console.log('✓ L-NT-029 PASSED: Generic JSON stdout rejected as transport authority.');
+    assert.strictEqual(res29.queued_submission_id, null, 'fake-sub must not become queued_submission_id');
+    console.log('✓ L-NT-029 PASSED: Generic JSON stdout rejected as transport and queue authority.');
 
     // -----------------------------------------------------------------------
-    // L-NT-030: Contradictory queued=false + turn_id fails closed (B-03)
+    // L-NT-030: Contradictory queued=false + turn_id fails closed (B-03 / B-03B)
     // -----------------------------------------------------------------------
     console.log('\n[L-NT-030] Testing contradictory queued=false + turn_id fails closed...');
     cleanLock();
@@ -283,7 +294,6 @@ async function runAllTests() {
     // Invocation: --session-id A --target-turn B
     // -----------------------------------------------------------------------
     console.log('\n[L-NT-034] Testing timeout diagnostic remains strictly session-bound to Session A...');
-    // Create Session A (older timestamp)
     const rolloutFileA = path.join(sessDir, 'rollout-2026-09-19T00-00-04-sess_A.jsonl');
     fs.writeFileSync(
       rolloutFileA,
@@ -301,7 +311,6 @@ async function runAllTests() {
       ].join('\n') + '\n'
     );
 
-    // Create Session X (newer timestamp) with different report
     const rolloutFileX = path.join(sessDir, 'rollout-2026-09-19T00-00-05-sess_X.jsonl');
     fs.writeFileSync(
       rolloutFileX,
@@ -319,7 +328,6 @@ async function runAllTests() {
       ].join('\n') + '\n'
     );
 
-    // Ensure session X has newer mtime
     const now = Date.now() / 1000;
     fs.utimesSync(rolloutFileA, now - 100, now - 100);
     fs.utimesSync(rolloutFileX, now, now);
@@ -347,8 +355,302 @@ async function runAllTests() {
     assert.notStrictEqual(res34.diagnostic_latest_report.session_id, 'sess_X', 'diagnostic report must NEVER leak from newer session X');
     console.log('✓ L-NT-034 PASSED: Timeout diagnostic remained strictly session-bound to Session A.');
 
+    // -----------------------------------------------------------------------
+    // L-NT-035: JSON without queued field does not establish queue acceptance (B-03B)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-035] Testing JSON without queued field does not establish queue acceptance...');
+    cleanLock();
+    const env35 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_EXACT_TRANSPORT_JSON: JSON.stringify({
+        id: 'random-json-object'
+      })
+    };
+
+    const proc35 = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-035', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env35,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc35.status, 0, `Script failed: ${proc35.stderr}`);
+    const res35 = JSON.parse((proc35.stdout || '').trim());
+
+    assert.strictEqual(res35.success, false, 'success must be false for arbitrary JSON');
+    assert.strictEqual(res35.queued, false, 'queued must be false without recognized ACK');
+    assert.strictEqual(res35.verified, false, 'verified must be false');
+    assert.strictEqual(res35.turn_started, false, 'turn_started must be false');
+    assert.strictEqual(res35.turn_id, null, 'turn_id must be null');
+    assert.strictEqual(res35.correlation_method, 'unavailable', 'correlation_method must be unavailable');
+    console.log('✓ L-NT-035 PASSED: JSON without queued field rejected as queue acceptance.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-036: JSON with queued=true cannot create queue authority or overwrite IDs (B-03B)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-036] Testing JSON queued=true cannot create queue authority or overwrite IDs...');
+    cleanLock();
+    const env36 = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_EXACT_TRANSPORT_JSON: JSON.stringify({
+        queued: true,
+        turn_id: 'fake-turn',
+        queued_submission_id: 'fake-sub',
+        client_user_message_id: 'attacker-controlled'
+      })
+    };
+
+    const proc36 = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-036', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env36,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc36.status, 0, `Script failed: ${proc36.stderr}`);
+    const res36 = JSON.parse((proc36.stdout || '').trim());
+
+    assert.strictEqual(res36.success, false, 'success must be false');
+    assert.strictEqual(res36.queued, false, 'queued must be false: JSON cannot create queue authority');
+    assert.strictEqual(res36.verified, false, 'verified must be false');
+    assert.strictEqual(res36.turn_id, null, 'turn_id must be null');
+    assert.strictEqual(res36.queued_submission_id, null, 'fake-sub must not become queued_submission_id');
+    assert.strictEqual(res36.client_user_message_id, `orchestrator:${res36.dispatch_id}`, 'client_user_message_id must remain local diagnostic');
+    console.log('✓ L-NT-036 PASSED: JSON queued=true rejected; IDs not overwritten.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-037: Loose text (e.g. 'for thread ...') does not establish queue acceptance (B-03B)
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-037] Testing loose text does not establish queue acceptance...');
+    cleanLock();
+    const env37A = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'warning generated for thread session-123'
+    };
+
+    const proc37A = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-037 A', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env37A,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc37A.status, 0, `Script failed: ${proc37A.stderr}`);
+    const res37A = JSON.parse((proc37A.stdout || '').trim());
+    assert.strictEqual(res37A.success, false, 'success must be false for loose text');
+    assert.strictEqual(res37A.queued, false, 'queued must be false for loose text');
+
+    cleanLock();
+    const env37B = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'for thread session-123'
+    };
+
+    const proc37B = spawnSync('python', [SEND_TO_CODEX, 'test prompt L-NT-037 B', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: env37B,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(proc37B.status, 0, `Script failed: ${proc37B.stderr}`);
+    const res37B = JSON.parse((proc37B.stdout || '').trim());
+    assert.strictEqual(res37B.success, false, 'success must be false for loose text');
+    assert.strictEqual(res37B.queued, false, 'queued must be false for loose text');
+    console.log('✓ L-NT-037 PASSED: Loose text patterns rejected as queue acceptance.');
+
+    // -----------------------------------------------------------------------
+    // POSITIVE ACK TEST: Exact CLI textual acknowledgement creates valid queue acceptance
+    // -----------------------------------------------------------------------
+    console.log('\n[POSITIVE ACK] Testing valid recognized textual ACK pattern...');
+    cleanLock();
+    const envPos = {
+      ...process.env,
+      USERPROFILE: tmpDir,
+      PATH: `${tmpDir}${path.delimiter}${cleanPath}`,
+      MOCK_STDOUT_TEXT: 'Queued message msg_test_123 for thread sess_001'
+    };
+
+    const procPos = spawnSync('python', [SEND_TO_CODEX, 'test prompt positive', 'AI_Multi_Task'], {
+      cwd: PIPELINE_UI_DIR,
+      env: envPos,
+      timeout: 10000,
+      encoding: 'utf-8'
+    });
+
+    assert.strictEqual(procPos.status, 0, `Script failed: ${procPos.stderr}`);
+    const resPos = JSON.parse((procPos.stdout || '').trim());
+
+    assert.strictEqual(resPos.success, true, 'success must be true on recognized textual ACK');
+    assert.strictEqual(resPos.queued, true, 'queued must be true on recognized textual ACK');
+    assert.strictEqual(resPos.verified, false, 'verified must remain false (fail-closed legacy contract)');
+    assert.strictEqual(resPos.turn_started, false, 'turn_started must remain false');
+    assert.strictEqual(resPos.turn_id, null, 'turn_id must remain null');
+    assert.strictEqual(resPos.correlation_method, 'unavailable', 'correlation_method must be unavailable');
+    assert.strictEqual(resPos.queued_submission_id, 'msg_test_123', 'queued_submission_id preserved as diagnostic');
+    console.log('✓ POSITIVE ACK PASSED: Exact textual ACK acknowledged with diagnostic queued_submission_id.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-038: Mixed turn/report provenance rejected (B-06)
+    // Fixture: task_complete A with REPORT A; later response_item assistant with TEXT FROM LATER TURN B
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-038] Testing mixed turn/report provenance rejected...');
+    const rolloutFile38 = path.join(sessDir, 'rollout-2026-09-19T00-00-06-sess_38.jsonl');
+    fs.writeFileSync(
+      rolloutFile38,
+      [
+        JSON.stringify({ payload: { id: 'sess_38', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-A',
+            duration_ms: 1500,
+            last_agent_message: 'REPORT A'
+          }
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ text: 'TEXT FROM LATER TURN B' }]
+          }
+        })
+      ].join('\n') + '\n'
+    );
+
+    const proc38 = spawnSync(
+      'python',
+      [WATCH_CODEX_SESSION, '--session-id', 'sess_38', '--latest'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env: { ...process.env, USERPROFILE: tmpDir },
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(proc38.status, 0, `Watcher failed: ${proc38.stderr}`);
+    const res38 = JSON.parse((proc38.stdout || '').trim());
+
+    assert.strictEqual(res38.success, true, 'success must be true');
+    assert.strictEqual(res38.turn_id, 'turn-A', 'turn_id must be turn-A');
+    assert.strictEqual(res38.report_text, 'REPORT A', 'report_text MUST come from task_complete A, never later response_item');
+    assert.notStrictEqual(res38.report_text, 'TEXT FROM LATER TURN B', 'Must not borrow text from response_item');
+    console.log('✓ L-NT-038 PASSED: Report text strictly bound to matching task_complete record.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-039: Incomplete new turn must not rewrite completed report (B-06)
+    // Fixture: task_complete A with REPORT A; task_started B; response_item B with "PARTIAL B"
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-039] Testing incomplete new turn does not rewrite completed report...');
+    const rolloutFile39 = path.join(sessDir, 'rollout-2026-09-19T00-00-07-sess_39.jsonl');
+    fs.writeFileSync(
+      rolloutFile39,
+      [
+        JSON.stringify({ payload: { id: 'sess_39', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-A',
+            duration_ms: 1500,
+            last_agent_message: 'REPORT A'
+          }
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'turn-B' }
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ text: 'PARTIAL B' }]
+          }
+        })
+      ].join('\n') + '\n'
+    );
+
+    const proc39 = spawnSync(
+      'python',
+      [WATCH_CODEX_SESSION, '--session-id', 'sess_39', '--latest'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env: { ...process.env, USERPROFILE: tmpDir },
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(proc39.status, 0, `Watcher failed: ${proc39.stderr}`);
+    const res39 = JSON.parse((proc39.stdout || '').trim());
+
+    assert.strictEqual(res39.success, true, 'success must be true for completed turn A');
+    assert.strictEqual(res39.turn_id, 'turn-A', 'turn_id must remain turn-A');
+    assert.strictEqual(res39.report_text, 'REPORT A', 'report_text must remain REPORT A');
+    console.log('✓ L-NT-039 PASSED: Incomplete turn B did not rewrite completed report A.');
+
+    // -----------------------------------------------------------------------
+    // L-NT-040: Empty complete must not borrow assistant text (B-06)
+    // Fixture: task_complete B with last_agent_message=""; response_item assistant "some text"
+    // -----------------------------------------------------------------------
+    console.log('\n[L-NT-040] Testing empty complete does not borrow assistant text...');
+    const rolloutFile40 = path.join(sessDir, 'rollout-2026-09-19T00-00-08-sess_40.jsonl');
+    fs.writeFileSync(
+      rolloutFile40,
+      [
+        JSON.stringify({ payload: { id: 'sess_40', cwd: 'D:\\TU_CODE\\AI_Multi_Task' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-B',
+            duration_ms: 1000,
+            last_agent_message: ''
+          }
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ text: 'some text' }]
+          }
+        })
+      ].join('\n') + '\n'
+    );
+
+    const proc40 = spawnSync(
+      'python',
+      [WATCH_CODEX_SESSION, '--session-id', 'sess_40', '--latest'],
+      {
+        cwd: PIPELINE_UI_DIR,
+        env: { ...process.env, USERPROFILE: tmpDir },
+        timeout: 10000,
+        encoding: 'utf-8'
+      }
+    );
+
+    assert.strictEqual(proc40.status, 0, `Watcher failed: ${proc40.stderr}`);
+    const res40 = JSON.parse((proc40.stdout || '').trim());
+
+    assert.strictEqual(res40.success, false, 'success must be false when task_complete has empty report');
+    assert.strictEqual(res40.report_text, null, 'report_text must be null (no borrowing from response_item)');
+    console.log('✓ L-NT-040 PASSED: Empty complete failed closed without borrowing assistant text.');
+
     console.log('\n======================================================================');
-    console.log('ALL WP-V3-01 REGRESSION TESTS PASSED (L-NT-029 .. L-NT-034: 6/6 PASS)');
+    console.log('ALL WP-V3-01 REGRESSION TESTS PASSED (L-NT-029 .. L-NT-040: 12/12 PASS)');
     console.log('======================================================================');
 
   } finally {

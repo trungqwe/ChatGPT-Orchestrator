@@ -219,57 +219,27 @@ def dispatch_prompt_to_codex(prompt_text, project_keyword="AI_Multi_Task"):
 
         # 4. Post-flight Verification: Inspect transport output
         # Active legacy adapter: codex_cli_queue (supports_exact_turn_correlation = False)
-        # CRITICAL (B-03): Generic JSON stdout must NEVER manufacture exact_transport authority.
+        # CRITICAL (B-03B / WO-V3-001F Section 5-8):
+        # Unnegotiated generic JSON stdout must NEVER manufacture queue acceptance authority
+        # (queued=true / success=true) or populate transport diagnostic IDs.
+        # Only the recognized narrow textual acknowledgement shape establishes queue acceptance.
         queue_output = proc.stdout.strip()
-        parsed_transport_json = None
 
-        for line in queue_output.splitlines():
-            line_str = line.strip()
-            if line_str.startswith("{") and line_str.endswith("}"):
-                try:
-                    parsed_transport_json = json.loads(line_str)
-                    break
-                except Exception:
-                    continue
-
-        exact_sub_id = None
-
-        if parsed_transport_json and isinstance(parsed_transport_json, dict):
-            # Generic JSON stdout must not manufacture exact_transport authority (B-03 / L-NT-029).
-            # If queued is explicitly false, fail closed immediately (L-NT-030).
-            is_queued = parsed_transport_json.get("queued", True)
-            if not is_queued:
-                result["queued"] = False
-                result["success"] = False
-                result["verified"] = False
-                result["turn_started"] = False
-                result["turn_id"] = None
-                result["correlation_method"] = "unavailable"
-                result["error"] = "Hàng đợi từ chối lệnh (queued=false trong JSON stdout)"
-                return result
-
+        # Narrow regex match: "Queued message <id> for thread <thread_id>"
+        ack_match = re.search(r"Queued message\s+(\S+)\s+for thread\s+(\S+)", queue_output)
+        if ack_match:
             result["queued"] = True
-            exact_sub_id = parsed_transport_json.get("queued_submission_id") or parsed_transport_json.get("submission_id") or parsed_transport_json.get("id")
-            if parsed_transport_json.get("client_user_message_id"):
-                result["client_user_message_id"] = parsed_transport_json.get("client_user_message_id")
+            # Preserved from recognized text ACK for diagnostic purposes only (never turn proof)
+            result["queued_submission_id"] = ack_match.group(1)
         else:
-            if "Queued message" in queue_output or "for thread" in queue_output:
-                result["queued"] = True
-                m = re.search(r"Queued message\s+([^\s]+)\s+for thread", queue_output)
-                if m:
-                    exact_sub_id = m.group(1)
-            else:
-                result["queued"] = False
-                result["success"] = False
-                result["verified"] = False
-                result["turn_started"] = False
-                result["turn_id"] = None
-                result["correlation_method"] = "unavailable"
-                result["error"] = f"Không nhận được tín hiệu xác thực hàng đợi: {queue_output}"
-                return result
-
-        if exact_sub_id:
-            result["queued_submission_id"] = str(exact_sub_id)
+            result["queued"] = False
+            result["success"] = False
+            result["verified"] = False
+            result["turn_started"] = False
+            result["turn_id"] = None
+            result["correlation_method"] = "unavailable"
+            result["error"] = f"Không nhận diện được tín hiệu xác nhận hàng đợi hợp lệ (không khớp mẫu 'Queued message <id> for thread <id>'): {queue_output}"
+            return result
 
         # 5. Diagnostic observation: observe whether a new task_started appeared in rollout
         # CRITICAL (B-01 / Section 15): Heuristic observation of rollout lines is strictly DIAGNOSTIC.

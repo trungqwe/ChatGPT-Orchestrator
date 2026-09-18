@@ -78,7 +78,7 @@ def extract_latest_report_from_rollout_file(file_path, session_id=None):
     detected_session_id = session_id
     last_message = ""
     duration_ms = 0
-    turn_id = ""
+    turn_id = None
 
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -89,18 +89,12 @@ def extract_latest_report_from_rollout_file(file_path, session_id=None):
                     p = data.get('payload', {})
                     if not detected_session_id and isinstance(p, dict) and p.get('id'):
                         detected_session_id = p.get('id')
+                    # B-06 (WO-V3-001F Section 16-19): Report text and turn_id MUST come from the same
+                    # authoritative task_complete event. Never overwrite or borrow from response_item.
                     if t == 'event_msg' and isinstance(p, dict) and p.get('type') == 'task_complete':
                         last_message = p.get('last_agent_message', '')
                         duration_ms = p.get('duration_ms', 0)
-                        turn_id = p.get('turn_id', '')
-                    elif t == 'response_item' and isinstance(p, dict) and p.get('type') == 'message' and p.get('role') == 'assistant':
-                        content = p.get('content', [])
-                        txt = ""
-                        for c in content:
-                            if isinstance(c, dict):
-                                txt += c.get('text', '')
-                        if txt.strip():
-                            last_message = txt.strip()
+                        turn_id = p.get('turn_id') or None
                 except Exception:
                     continue
 
@@ -109,8 +103,8 @@ def extract_latest_report_from_rollout_file(file_path, session_id=None):
             "success": is_valid,
             "session_file": file_path,
             "session_id": detected_session_id,
-            "turn_id": turn_id,
-            "duration_ms": duration_ms,
+            "turn_id": turn_id if is_valid else (turn_id or None),
+            "duration_ms": duration_ms if is_valid else 0,
             "report_text": last_message if is_valid else None,
             "error": None if is_valid else "Chưa có phản hồi hợp lệ từ agent trong rollout"
         }

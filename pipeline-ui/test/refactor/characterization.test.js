@@ -244,21 +244,23 @@ function testF02_CodexDispatchStateModel() {
     assert.strictEqual(procB.status, 0, `Script executes: ${procB.stderr}`);
     const resB = JSON.parse((procB.stdout || '').trim());
 
-    assert.strictEqual(resB.queued, true, 'Queue accepted');
+    assert.strictEqual(resB.queued, false, 'queued must be false: generic JSON cannot create queue authority (B-03B)');
+    assert.strictEqual(resB.success, false, 'success must be false: generic JSON is not recognized ACK');
     assert.strictEqual(resB.verified, false, 'verified must be false: generic JSON cannot create authority (B-03 / L-NT-029)');
     assert.strictEqual(resB.turn_started, false, 'turn_started must be false');
     assert.strictEqual(resB.turn_id, null, 'turn_id must be null (fake turn from JSON ignored)');
     assert.strictEqual(resB.correlation_method, 'unavailable', 'correlation_method must be unavailable');
-    assert.strictEqual(resB.queued_submission_id, 'sub-active-001', 'queued_submission_id preserved as diagnostic');
-    console.log('✓ L-NT-029 / F-02-B PASSED: Generic JSON stdout cannot activate exact transport (verified=false, turn_id=null).');
+    assert.strictEqual(resB.queued_submission_id, null, 'queued_submission_id must not be populated from generic JSON');
+    assert.strictEqual(resB.client_user_message_id, `orchestrator:${resB.dispatch_id}`, 'client_user_message_id must not be overwritten by JSON');
+    console.log('✓ L-NT-029 / B-03B PASSED: Generic JSON stdout cannot activate queue or exact transport authority (queued=false, verified=false).');
 
     recordResult('L-NT-029', 'Generic JSON stdout cannot activate exact transport', 'INVARIANT_ENFORCED', {
-      queueAccepted: 'YES',
+      queueAccepted: 'NO',
       turnStarted: 'NO',
       turnCompleted: 'NO',
       reportTargetMatch: 'N/A',
-      observed: 'queued=true, verified=false, turn_started=false, turn_id=null, correlation_method=unavailable',
-      desiredSafe: 'verified=false, turn_id=null when transport output is generic unnegotiated JSON',
+      observed: 'queued=false, success=false, verified=false, turn_started=false, turn_id=null, correlation_method=unavailable',
+      desiredSafe: 'queued=false, verified=false, turn_id=null when transport output is generic unnegotiated JSON',
       testFile: __filename
     });
 
