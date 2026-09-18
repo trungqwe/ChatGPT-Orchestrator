@@ -2126,6 +2126,20 @@ document.addEventListener('DOMContentLoaded', () => {
         showToast('Chưa xác định được đường dẫn thư mục dự án cho phiên này.', 'info');
         return;
       }
+
+      // Priority 1: Native Electron shell API (Instant & 100% reliable in Desktop App)
+      if (window.electronAPI && typeof window.electronAPI.openFolder === 'function') {
+        const elRes = await window.electronAPI.openFolder(targetPath);
+        if (elRes && elRes.success) {
+          showToast(`📂 Đã mở thư mục: ${targetPath}`, 'success');
+          return;
+        } else if (elRes && elRes.error) {
+          showToast(`Không thể mở thư mục: ${elRes.error}`, 'error');
+          return;
+        }
+      }
+
+      // Priority 2: Backend server launch via PowerShell / explorer.exe
       const res = await apiPost('/api/projects/open-folder', { folderPath: targetPath });
       if (res && res.success) {
         showToast(`📂 Đã mở thư mục: ${targetPath}`, 'success');

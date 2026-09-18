@@ -4,7 +4,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { app, BrowserWindow, Menu, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require('electron');
 const http = require('http');
 
 let mainWindow = null;
@@ -22,6 +22,20 @@ ipcMain.handle('dialog:openDirectory', async () => {
     return null;
   }
   return result.filePaths[0];
+});
+
+// Native OS Folder Opener (Windows Explorer / macOS Finder)
+ipcMain.handle('shell:openPath', async (event, folderPath) => {
+  if (!folderPath) return { success: false, error: 'Chưa có đường dẫn thư mục' };
+  const cleanTarget = path.resolve(folderPath.trim().replace(/[\\\/]+$/, ''));
+  if (!fs.existsSync(cleanTarget)) {
+    return { success: false, error: `Thư mục không tồn tại trên máy: ${cleanTarget}` };
+  }
+  const err = await shell.openPath(cleanTarget);
+  if (err) {
+    return { success: false, error: err };
+  }
+  return { success: true, path: cleanTarget };
 });
 
 // Auto-Send Keystrokes (Ctrl+V + Enter) to Antigravity IDE Window

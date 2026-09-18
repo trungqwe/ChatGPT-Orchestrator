@@ -394,12 +394,24 @@ app.post('/api/projects/:id/configure-pipeline', async (req, res) => {
 app.post('/api/projects/open-folder', (req, res) => {
   const { folderPath } = req.body;
   if (!folderPath) return res.status(400).json({ error: 'Missing folderPath' });
-  const target = path.resolve(folderPath);
-  if (fs.existsSync(target)) {
-    execFile('explorer', [target], () => {});
-    return res.json({ success: true, path: target });
+  const cleanTarget = path.resolve(folderPath.trim().replace(/[\\\/]+$/, ''));
+  if (fs.existsSync(cleanTarget)) {
+    if (process.platform === 'win32') {
+      exec(`powershell -NoProfile -Command "Start-Process explorer.exe -ArgumentList '${cleanTarget.replace(/'/g, "''")}'"`, (err) => {
+        if (err) {
+          const { spawn } = require('child_process');
+          const p = spawn('explorer.exe', [cleanTarget], { detached: true, stdio: 'ignore' });
+          p.unref();
+        }
+      });
+    } else if (process.platform === 'darwin') {
+      execFile('open', [cleanTarget], () => {});
+    } else {
+      execFile('xdg-open', [cleanTarget], () => {});
+    }
+    return res.json({ success: true, path: cleanTarget });
   }
-  res.status(404).json({ error: 'Folder not found: ' + target });
+  res.status(404).json({ error: 'Folder not found: ' + cleanTarget });
 });
 
 app.get('/api/antigravity/session-info/:sessionId', (req, res) => {
