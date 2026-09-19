@@ -193,8 +193,8 @@ class CodexAppServerClient extends EventEmitter {
         { timeoutMs: this._defaultTimeouts.initialize, isSideEffecting: false }
       );
 
-      // Step 2: send initialized notification (no id)
-      this._sendNotification('initialized');
+      // Step 2: send initialized notification (with params: {})
+      await this._sendNotification('initialized', {});
 
       // Step 3: transition to READY
       this._state = CLIENT_STATES.READY;
@@ -368,22 +368,49 @@ class CodexAppServerClient extends EventEmitter {
   }
 
   /**
-   * Send a notification message (no ID).
+   * Send an authoritative notification message (no ID).
+   * Awaitable to guarantee bytes are successfully written.
+   * @param {string} method
+   * @param {Object} [params={}]
+   * @returns {Promise<void>}
    * @private
    */
-  _sendNotification(method, params) {
-    if (!this._child || !this._child.stdin || this._child.stdin.destroyed) {
-      return;
-    }
-    const message = { method };
-    if (params !== undefined) {
-      message.params = params;
-    }
-    try {
-      this._child.stdin.write(JSON.stringify(message) + '\n', 'utf8');
-    } catch {
-      // Notification send failure non-fatal
-    }
+  _sendNotification(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      if (!this._child || !this._child.stdin || this._child.stdin.destroyed) {
+        return reject(
+          createError(
+            'CODEX_APP_SERVER_STDIN_ERROR',
+            `Cannot send notification '${method}': stdin is unavailable or destroyed`
+          )
+        );
+      }
+      const message = { method, params: params !== undefined ? params : {} };
+      let line;
+      try {
+        line = JSON.stringify(message) + '\n';
+      } catch (err) {
+        return reject(
+          createError(
+            'CODEX_APP_SERVER_SERIALIZE_ERROR',
+            `Failed to serialize notification '${method}': ${err.message}`,
+            { originalError: err }
+          )
+        );
+      }
+      this._child.stdin.write(line, 'utf8', (err) => {
+        if (err) {
+          return reject(
+            createError(
+              'CODEX_APP_SERVER_WRITE_FAILED',
+              `Failed to write notification '${method}' to stdin: ${err.message}`,
+              { originalError: err }
+            )
+          );
+        }
+        resolve();
+      });
+    });
   }
 
   /**
@@ -519,14 +546,23 @@ class CodexAppServerClient extends EventEmitter {
       return;
     }
 
-    // Default: Fail closed immediately. Never auto-approve.
+    // Known command or file approval methods: respond with decline (Section 29)
+    if (
+      msg.method === 'item/commandExecution/requestApproval' ||
+      msg.method === 'item/command/requestApproval' ||
+      msg.method === 'item/fileChange/requestApproval'
+    ) {
+      this._sendServerResponse(msg.id, { decision: 'decline' }, undefined);
+      return;
+    }
+
+    // Default: Fail closed immediately. Never auto-approve. Do not log full approval payloads.
     this._sendServerResponse(msg.id, undefined, {
       code: -32000,
       message: 'SERVER_REQUEST_REJECTED_FAIL_CLOSED',
       data: {
         reason: 'NO_OPERATOR_APPROVAL_UI',
-        method: msg.method,
-        params: msg.params || {}
+        method: msg.method
       }
     });
   }
@@ -554,6 +590,18 @@ class CodexAppServerClient extends EventEmitter {
         `Response received with unknown request ID '${id}'`
       );
       this._failConnection(unknownErr);
+      return;
+    }
+
+    // Validate response shape: exactly one of result or error (Section 27)
+    const hasResult = msg.result !== undefined;
+    const hasError = msg.error !== undefined;
+    if ((hasResult && hasError) || (!hasResult && !hasError)) {
+      const protoErr = createError(
+        'CODEX_APP_SERVER_PROTOCOL_ERROR',
+        `Response for request ID '${id}' must contain exactly one of 'result' or 'error', not both or neither`
+      );
+      this._failConnection(protoErr);
       return;
     }
 
@@ -794,16 +842,26 @@ class CodexAppServerClient extends EventEmitter {
     this._state = CLIENT_STATES.CLOSING;
 
     this._closePromise = (async () => {
-      // Reject any pending requests that were not sent
+      // Reject pending requests: sent side-effecting requests are UNCERTAIN (Sections 34, 35)
       for (const [id, pending] of this._pendingRequests.entries()) {
         if (pending.timer) clearTimeout(pending.timer);
         this._recordCompletedId(id);
-        pending.reject(
-          createError(
-            'CODEX_APP_SERVER_CLOSED',
-            `Client closed before response arrived for '${pending.method}'`
-          )
-        );
+        if (pending.isSideEffecting && pending.sent) {
+          pending.reject(
+            createError(
+              'CODEX_APP_SERVER_REQUEST_UNCERTAIN',
+              `Client closed while side-effecting request '${pending.method}' was sent; outcome is uncertain`,
+              { id, method: pending.method }
+            )
+          );
+        } else {
+          pending.reject(
+            createError(
+              'CODEX_APP_SERVER_CLOSED',
+              `Client closed before response arrived for '${pending.method}'`
+            )
+          );
+        }
       }
       this._pendingRequests.clear();
 

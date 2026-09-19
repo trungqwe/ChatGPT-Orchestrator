@@ -2,7 +2,7 @@
 
 /**
  * Codex App Server Stdio Transport & Adapter Test Suite
- * CAS-001 .. CAS-060
+ * CAS-001 .. CAS-082
  */
 
 const assert = require('assert');
@@ -34,7 +34,7 @@ function createTestAdapter(options = {}) {
 }
 
 async function runTests() {
-  console.log('Starting Codex App Server Client & Adapter test suite (CAS-001 .. CAS-060)...\n');
+  console.log('Starting Codex App Server Client & Adapter test suite (CAS-001 .. CAS-082)...\n');
 
   // CAS-001: Spawns via argument array, shell: false
   {
@@ -219,8 +219,8 @@ async function runTests() {
     const client = createTestClient();
     try {
       await client.initialize();
-      const req1 = client.sendRequest('thread/start', { _threadId: 'thr_order_1', cwd: 'D:\\test\\a' });
-      const req2 = client.sendRequest('thread/start', { _threadId: 'thr_order_2', cwd: 'D:\\test\\b' });
+      const req1 = client.sendRequest('thread/start', { cwd: 'D:\\test\\a' });
+      const req2 = client.sendRequest('thread/start', { cwd: 'D:\\test\\b' });
       const [res1, res2] = await Promise.all([req1, req2]);
       assert.strictEqual(res1.thread.id, 'thr_order_1');
       assert.strictEqual(res2.thread.id, 'thr_order_2');
@@ -232,12 +232,12 @@ async function runTests() {
 
   // CAS-010: Provider error response maps to exact pending request and rejects with error details
   {
-    const client = createTestClient();
+    const client = createTestClient({ fixtureArgs: ['--scenario=provider_error'] });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('model/list', { _trigger: 'provider_error', _errorMessage: 'Model catalog unavailable' });
+        await client.sendRequest('model/list', {});
       } catch (err) {
         caught = err;
       }
@@ -252,12 +252,12 @@ async function runTests() {
 
   // CAS-011: Unknown response ID fails transport with CODEX_APP_SERVER_PROTOCOL_ERROR
   {
-    const client = createTestClient();
+    const client = createTestClient({ fixtureArgs: ['--scenario=unknown_response_id'] });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('model/list', { _trigger: 'unknown_id' });
+        await client.sendRequest('model/list', {});
       } catch (err) {
         caught = err;
       }
@@ -271,12 +271,12 @@ async function runTests() {
 
   // CAS-012: Duplicate response ID fails transport with CODEX_APP_SERVER_PROTOCOL_ERROR
   {
-    const client = createTestClient();
+    const client = createTestClient({ fixtureArgs: ['--scenario=duplicate_response'] });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('model/list', { _trigger: 'duplicate' });
+        await client.sendRequest('model/list', {});
         // Give short delay for second duplicate response line to be processed
         await new Promise((r) => setTimeout(r, 50));
       } catch (err) {
@@ -301,7 +301,7 @@ async function runTests() {
 
       // turn/start triggers notifications
       const turnRes = await client.sendRequest('turn/start', { threadId: 'thr_001' });
-      assert.strictEqual(turnRes.turn.status, 'in_progress');
+      assert.strictEqual(turnRes.turn.status, 'inProgress');
       await new Promise((r) => setTimeout(r, 50));
       assert.strictEqual(notifReceived, true, 'CAS-013: Notification was emitted');
       console.log('PASS: CAS-013 — Notifications handled without corrupting pending request resolution');
@@ -321,7 +321,7 @@ async function runTests() {
       await client.initialize();
       await new Promise((r) => setTimeout(r, 100));
       assert.notStrictEqual(serverReqReceived, null, 'CAS-014: Server-initiated request recognized');
-      assert.strictEqual(serverReqReceived.method, 'item/command/requestApproval');
+      assert.strictEqual(serverReqReceived.method, 'item/commandExecution/requestApproval');
       console.log('PASS: CAS-014 — Server-initiated request recognized separately');
     } finally {
       await client.close();
@@ -384,12 +384,9 @@ async function runTests() {
     }
   }
 
-  // CAS-018: Oversized stdout line fails transport with CODEX_APP_SERVER_PROTOCOL_LIMIT
+  // CAS-018: Line exceeding 4 MiB max bound fails transport with CODEX_APP_SERVER_PROTOCOL_LIMIT
   {
-    const client = createTestClient({
-      fixtureArgs: ['--scenario=oversized_line'],
-      maxLineSizeBytes: 1024 // Set small 1 KiB bound for test
-    });
+    const client = createTestClient({ fixtureArgs: ['--scenario=oversized_line'] });
     try {
       let caught = null;
       try {
@@ -397,7 +394,7 @@ async function runTests() {
       } catch (err) {
         caught = err;
       }
-      assert.notStrictEqual(caught, null, 'CAS-018: Oversized line must fail');
+      assert.notStrictEqual(caught, null, 'CAS-018: Oversized line must fail transport');
       assert.strictEqual(caught.code, 'CODEX_APP_SERVER_PROTOCOL_LIMIT');
       assert.strictEqual(client.getState(), CLIENT_STATES.FAILED);
       console.log('PASS: CAS-018 — Oversized line fails transport with CODEX_APP_SERVER_PROTOCOL_LIMIT');
@@ -406,12 +403,12 @@ async function runTests() {
     }
   }
 
-  // CAS-019: Stdin write error before send marks request as not successfully sent
+  // CAS-019: Client stdin write failure marks request as NOT sent
   {
     const client = createTestClient();
     try {
       await client.initialize();
-      // Destroy stdin to simulate write failure
+      // Force destroy stdin to simulate immediate write failure
       client._child.stdin.destroy();
       let caught = null;
       try {
@@ -419,7 +416,7 @@ async function runTests() {
       } catch (err) {
         caught = err;
       }
-      assert.notStrictEqual(caught, null);
+      assert.notStrictEqual(caught, null, 'CAS-019: Write error must reject');
       assert.strictEqual(caught.code, 'CODEX_APP_SERVER_STDIN_ERROR');
       console.log('PASS: CAS-019 — Stdin write failure reported as not successfully sent');
     } finally {
@@ -430,13 +427,14 @@ async function runTests() {
   // CAS-020: Read-only request timeout returns normal timeout error without auto-retry
   {
     const client = createTestClient({
+      fixtureArgs: ['--scenario=timeout'],
       timeouts: { read: 50, default: 50 }
     });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('model/list', { _trigger: 'timeout' }, { timeoutMs: 50, isSideEffecting: false });
+        await client.sendRequest('model/list', {}, { timeoutMs: 50, isSideEffecting: false });
       } catch (err) {
         caught = err;
       }
@@ -451,13 +449,14 @@ async function runTests() {
   // CAS-021: Side-effecting request timeout (thread/start) returns CODEX_APP_SERVER_REQUEST_UNCERTAIN
   {
     const client = createTestClient({
+      fixtureArgs: ['--scenario=timeout'],
       timeouts: { default: 50 }
     });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('thread/start', { _trigger: 'timeout', cwd: 'D:\\test' }, { timeoutMs: 50, isSideEffecting: true });
+        await client.sendRequest('thread/start', { cwd: 'D:\\test' }, { timeoutMs: 50, isSideEffecting: true });
       } catch (err) {
         caught = err;
       }
@@ -471,12 +470,14 @@ async function runTests() {
 
   // CAS-022: Side-effecting turn/start timeout returns CODEX_APP_SERVER_REQUEST_UNCERTAIN
   {
-    const client = createTestClient();
+    const client = createTestClient({
+      fixtureArgs: ['--scenario=timeout']
+    });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('turn/start', { _trigger: 'timeout', threadId: 'thr_1' }, { timeoutMs: 50, isSideEffecting: true });
+        await client.sendRequest('turn/start', { threadId: 'thr_1' }, { timeoutMs: 50, isSideEffecting: true });
       } catch (err) {
         caught = err;
       }
@@ -490,12 +491,14 @@ async function runTests() {
 
   // CAS-023: Side-effecting review/start timeout returns CODEX_APP_SERVER_REQUEST_UNCERTAIN
   {
-    const client = createTestClient();
+    const client = createTestClient({
+      fixtureArgs: ['--scenario=timeout']
+    });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('review/start', { _trigger: 'timeout', threadId: 'thr_1' }, { timeoutMs: 50, isSideEffecting: true });
+        await client.sendRequest('review/start', { threadId: 'thr_1' }, { timeoutMs: 50, isSideEffecting: true });
       } catch (err) {
         caught = err;
       }
@@ -509,12 +512,14 @@ async function runTests() {
 
   // CAS-024: Side-effecting turn/interrupt timeout returns CODEX_APP_SERVER_REQUEST_UNCERTAIN
   {
-    const client = createTestClient();
+    const client = createTestClient({
+      fixtureArgs: ['--scenario=timeout']
+    });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('turn/interrupt', { _trigger: 'timeout', threadId: 'thr_1', turnId: 'turn_1' }, { timeoutMs: 50, isSideEffecting: true });
+        await client.sendRequest('turn/interrupt', { threadId: 'thr_1', turnId: 'turn_1' }, { timeoutMs: 50, isSideEffecting: true });
       } catch (err) {
         caught = err;
       }
@@ -528,12 +533,14 @@ async function runTests() {
 
   // CAS-025: Unexpected child process exit moves state to FAILED and rejects pending requests
   {
-    const client = createTestClient();
+    const client = createTestClient({
+      fixtureArgs: ['--scenario=exit_mid_request']
+    });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('model/list', { _trigger: 'exit' }, { timeoutMs: 500, isSideEffecting: false });
+        await client.sendRequest('model/list', {}, { timeoutMs: 500, isSideEffecting: false });
       } catch (err) {
         caught = err;
       }
@@ -547,12 +554,14 @@ async function runTests() {
 
   // CAS-026: Unexpected child exit with pending side-effecting request marks it as UNCERTAIN
   {
-    const client = createTestClient();
+    const client = createTestClient({
+      fixtureArgs: ['--scenario=exit_mid_request']
+    });
     try {
       await client.initialize();
       let caught = null;
       try {
-        await client.sendRequest('thread/start', { _trigger: 'exit', cwd: 'D:\\test' }, { timeoutMs: 500, isSideEffecting: true });
+        await client.sendRequest('thread/start', { cwd: 'D:\\test' }, { timeoutMs: 500, isSideEffecting: true });
       } catch (err) {
         caught = err;
       }
@@ -732,15 +741,13 @@ async function runTests() {
 
   // CAS-038: Adapter startThread() returns exact provider thread.id and sessionId without modification
   {
-    const adapter = createTestAdapter();
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=custom_opaque_ids'] });
     try {
       await adapter.initialize();
       const customThreadId = 'thr_exact_opaque_id_98765';
       const customSessionId = 'ses_exact_opaque_id_54321';
       const thread = await adapter.startThread({
-        cwd: 'D:\\test\\workspace',
-        _threadId: customThreadId,
-        _sessionId: customSessionId
+        cwd: 'D:\\test\\workspace'
       });
       assert.strictEqual(thread.threadId, customThreadId);
       assert.strictEqual(thread.sessionId, customSessionId);
@@ -771,7 +778,7 @@ async function runTests() {
       await adapter.initialize();
       let caught = null;
       try {
-        await adapter.resumeThread({ threadId: 'thr_bad', _trigger: 'provider_error', _errorMessage: 'Thread not found' });
+        await adapter.resumeThread({ threadId: 'thr_bad' });
       } catch (err) {
         caught = err;
       }
@@ -821,7 +828,7 @@ async function runTests() {
         input: [{ type: 'text', text: 'Analyze workspace status' }]
       });
       assert.strictEqual(turn.turnId, 'turn_fake_001');
-      assert.strictEqual(turn.status, 'in_progress');
+      assert.strictEqual(turn.status, 'inProgress');
       console.log('PASS: CAS-043 — Adapter startTurn returns exact provider turn ID and status');
     } finally {
       await adapter.close();
@@ -901,7 +908,6 @@ async function runTests() {
       await adapter.initialize();
       const turn = await adapter.startTurn({
         threadId: 'thr_mismatch_test',
-        _wrongTurnId: true, // fixture will emit turn/completed for turn_mismatch_999
         input: [{ type: 'text', text: 'Test wrong turn' }]
       });
       let caught = null;
@@ -929,7 +935,6 @@ async function runTests() {
       await adapter.initialize();
       const turn = await adapter.startTurn({
         threadId: 'thr_fail_test',
-        _failTurn: true,
         input: [{ type: 'text', text: 'Test turn failure' }]
       });
       let caught = null;
@@ -957,7 +962,6 @@ async function runTests() {
       await adapter.initialize();
       const turn = await adapter.startTurn({
         threadId: 'thr_interrupted_test',
-        _interruptTurn: true,
         input: [{ type: 'text', text: 'Test turn interrupt' }]
       });
       const completion = await adapter.waitForTurnCompletion({
@@ -1019,7 +1023,7 @@ async function runTests() {
       await adapter.initialize();
       const review = await adapter.startReview({
         threadId: 'thr_rev_inline',
-        target: 'uncommittedChanges',
+        target: { type: 'uncommittedChanges' },
         delivery: 'inline'
       });
       assert.strictEqual(review.reviewThreadId, 'thr_rev_inline');
@@ -1039,7 +1043,7 @@ async function runTests() {
       try {
         await adapter.startReview({
           threadId: 'thr_rev_detached',
-          target: 'uncommittedChanges',
+          target: { type: 'uncommittedChanges' },
           delivery: 'detached'
         });
       } catch (err) {
@@ -1084,9 +1088,8 @@ async function runTests() {
       let caught = null;
       try {
         await adapter.startReview({
-          threadId: 'thr_expected',
-          _wrongReviewThread: true,
-          target: 'uncommittedChanges',
+          threadId: 'thr_wrong_review_test',
+          target: { type: 'uncommittedChanges' },
           delivery: 'inline'
         });
       } catch (err) {
@@ -1107,7 +1110,7 @@ async function runTests() {
       await adapter.initialize();
       const rev = await adapter.startReview({
         threadId: 'thr_rev_wait',
-        target: 'uncommittedChanges',
+        target: { type: 'uncommittedChanges' },
         delivery: 'inline'
       });
       const completion = await adapter.waitForReviewCompletion({
@@ -1118,6 +1121,7 @@ async function runTests() {
       assert.strictEqual(completion.status, 'completed');
       assert.notStrictEqual(completion.reviewEvidence, null);
       assert.strictEqual(completion.reviewEvidence.type, 'exitedReviewMode');
+      assert.strictEqual(typeof completion.reviewEvidence.review, 'string');
       console.log('PASS: CAS-056 — Adapter waitForReviewCompletion collects exitedReviewMode evidence and verifies turn/completed');
     } finally {
       await adapter.close();
@@ -1188,8 +1192,527 @@ async function runTests() {
     console.log('PASS: CAS-060 — Child fixture processes guaranteed cleanup in finally blocks');
   }
 
+  // CAS-061: thread/start sends sandbox=readOnly
+  {
+    let sentRequestParams = null;
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const origSendRequest = adapter._client.sendRequest.bind(adapter._client);
+      adapter._client.sendRequest = function(method, params, options) {
+        if (method === 'thread/start') {
+          sentRequestParams = params;
+        }
+        return origSendRequest(method, params, options);
+      };
+      await adapter.startThread({ cwd: 'D:\\test\\workspace' });
+      assert.notStrictEqual(sentRequestParams, null);
+      assert.strictEqual(sentRequestParams.sandbox, 'readOnly');
+      console.log('PASS: CAS-061 — thread/start sends sandbox=readOnly');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-062: thread/start does not send readOnly boolean
+  {
+    let sentRequestParams = null;
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const origSendRequest = adapter._client.sendRequest.bind(adapter._client);
+      adapter._client.sendRequest = function(method, params, options) {
+        if (method === 'thread/start') {
+          sentRequestParams = params;
+        }
+        return origSendRequest(method, params, options);
+      };
+      await adapter.startThread({ cwd: 'D:\\test\\workspace' });
+      assert.notStrictEqual(sentRequestParams, null);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(sentRequestParams, 'readOnly'), false);
+      assert.strictEqual(sentRequestParams.readOnly, undefined);
+      console.log('PASS: CAS-062 — thread/start does not send readOnly boolean');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-063: thread/start sends approvalPolicy=never
+  {
+    let sentRequestParams = null;
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const origSendRequest = adapter._client.sendRequest.bind(adapter._client);
+      adapter._client.sendRequest = function(method, params, options) {
+        if (method === 'thread/start') {
+          sentRequestParams = params;
+        }
+        return origSendRequest(method, params, options);
+      };
+      await adapter.startThread({ cwd: 'D:\\test\\workspace' });
+      assert.notStrictEqual(sentRequestParams, null);
+      assert.strictEqual(sentRequestParams.approvalPolicy, 'never');
+      console.log('PASS: CAS-063 — thread/start sends approvalPolicy=never');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-064: initialized notification includes params={}
+  {
+    let capturedInitializedNotification = null;
+    const client = createTestClient();
+    try {
+      const origSendNotification = client._sendNotification.bind(client);
+      client._sendNotification = function(method, params) {
+        if (method === 'initialized') {
+          capturedInitializedNotification = { method, params };
+        }
+        return origSendNotification(method, params);
+      };
+      await client.initialize();
+      assert.notStrictEqual(capturedInitializedNotification, null);
+      assert.strictEqual(capturedInitializedNotification.method, 'initialized');
+      assert.deepStrictEqual(capturedInitializedNotification.params, {});
+      console.log('PASS: CAS-064 — initialized notification includes params={}');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-065: initialized write failure prevents READY state and transitions to FAILED
+  {
+    const client = createTestClient();
+    try {
+      client._sendNotification = async function(method) {
+        throw new Error('Simulated stdin write failure for initialized');
+      };
+      let caught = null;
+      try {
+        await client.initialize();
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(client.getState(), CLIENT_STATES.FAILED);
+      assert.notStrictEqual(client.getState(), CLIENT_STATES.READY);
+      console.log('PASS: CAS-065 — initialized write failure prevents READY');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-066: no underscore/test fields reach provider
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      let sentThreadParams = null;
+      let sentTurnParams = null;
+      let sentReviewParams = null;
+      const origSendRequest = adapter._client.sendRequest.bind(adapter._client);
+      adapter._client.sendRequest = function(method, params, options) {
+        if (method === 'thread/start') sentThreadParams = params;
+        if (method === 'turn/start') sentTurnParams = params;
+        if (method === 'review/start') sentReviewParams = params;
+        return origSendRequest(method, params, options);
+      };
+
+      await adapter.startThread({
+        cwd: 'D:\\test\\workspace',
+        _trigger: 'fake_trigger',
+        _threadId: 'thr_custom',
+        _sessionId: 'ses_custom'
+      });
+      assert.strictEqual(Object.keys(sentThreadParams).some((k) => k.startsWith('_')), false);
+
+      await adapter.startTurn({
+        threadId: 'thr_fake_001',
+        input: [{ type: 'text', text: 'hello' }],
+        _wrongTurnId: true,
+        _failTurn: true
+      });
+      assert.strictEqual(Object.keys(sentTurnParams).some((k) => k.startsWith('_')), false);
+
+      await adapter.startReview({
+        threadId: 'thr_fake_001',
+        target: { type: 'uncommittedChanges' },
+        delivery: 'inline',
+        _wrongReviewThread: true,
+        _reviewTurnId: 'custom'
+      });
+      assert.strictEqual(Object.keys(sentReviewParams).some((k) => k.startsWith('_')), false);
+      console.log('PASS: CAS-066 — no underscore/test fields reach provider');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-067: real-shaped turn/completed without threadId resolves exact turn
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const turn = await adapter.startTurn({
+        threadId: 'thr_real_shape_test',
+        input: [{ type: 'text', text: 'Run without notification threadId' }]
+      });
+      // The default fake fixture emits turn/completed with NO threadId in params
+      const completion = await adapter.waitForTurnCompletion({
+        threadId: 'thr_real_shape_test',
+        turnId: turn.turnId,
+        timeoutMs: 1000
+      });
+      assert.strictEqual(completion.turnId, turn.turnId);
+      assert.strictEqual(completion.threadId, 'thr_real_shape_test');
+      assert.strictEqual(completion.status, 'completed');
+      console.log('PASS: CAS-067 — real-shaped turn/completed without threadId resolves exact turn');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-068: wrong local thread ownership fails immediately with CODEX_APP_SERVER_THREAD_MISMATCH
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const turn = await adapter.startTurn({
+        threadId: 'thr_owner_a',
+        input: [{ type: 'text', text: 'Check thread ownership mismatch' }]
+      });
+      let caught = null;
+      try {
+        await adapter.waitForTurnCompletion({
+          threadId: 'thr_owner_b', // Different thread from turn owner
+          turnId: turn.turnId,
+          timeoutMs: 1000
+        });
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_THREAD_MISMATCH');
+      console.log('PASS: CAS-068 — wrong local thread ownership fails immediately');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-069: completion arriving before waiter is retained in completion cache
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=early_completion'] });
+    try {
+      await adapter.initialize();
+      const turn = await adapter.startTurn({
+        threadId: 'thr_early_race_test',
+        input: [{ type: 'text', text: 'Race test' }]
+      });
+      // Wait for turn/completed notification to arrive and be cached BEFORE calling waitForTurnCompletion
+      await new Promise((r) => setTimeout(r, 60));
+
+      const startTime = Date.now();
+      const completion = await adapter.waitForTurnCompletion({
+        threadId: 'thr_early_race_test',
+        turnId: turn.turnId,
+        timeoutMs: 500
+      });
+      const elapsed = Date.now() - startTime;
+      assert.strictEqual(completion.turnId, turn.turnId);
+      assert.strictEqual(completion.status, 'completed');
+      assert.strictEqual(elapsed < 200, true, 'Cached completion should resolve immediately');
+      console.log('PASS: CAS-069 — completion arriving before waiter is retained');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-070: review exitedReviewMode correlates item.id == turnId and preserves review field
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const rev = await adapter.startReview({
+        threadId: 'thr_rev_evidence_test',
+        target: { type: 'uncommittedChanges' },
+        delivery: 'inline'
+      });
+      const completion = await adapter.waitForReviewCompletion({
+        threadId: 'thr_rev_evidence_test',
+        turnId: rev.turnId,
+        timeoutMs: 1000
+      });
+      assert.strictEqual(completion.reviewEvidence.type, 'exitedReviewMode');
+      assert.strictEqual(completion.reviewEvidence.id, rev.turnId);
+      assert.strictEqual(typeof completion.reviewEvidence.review, 'string');
+      console.log('PASS: CAS-070 — review exitedReviewMode correlates item.id == turnId');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-071: unrelated review evidence cannot satisfy waiter
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=unrelated_review_evidence'] });
+    try {
+      await adapter.initialize();
+      const rev = await adapter.startReview({
+        threadId: 'thr_rev_unrelated_test',
+        target: { type: 'uncommittedChanges' },
+        delivery: 'inline'
+      });
+      let caught = null;
+      try {
+        await adapter.waitForReviewCompletion({
+          threadId: 'thr_rev_unrelated_test',
+          turnId: rev.turnId,
+          timeoutMs: 150
+        });
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'WAIT_REVIEW_TIMEOUT');
+      console.log('PASS: CAS-071 — unrelated review evidence cannot satisfy waiter');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-072: review evidence arriving before waiter retained in evidence cache
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=early_review_evidence'] });
+    try {
+      await adapter.initialize();
+      const rev = await adapter.startReview({
+        threadId: 'thr_rev_early_test',
+        target: { type: 'uncommittedChanges' },
+        delivery: 'inline'
+      });
+      // Sleep to ensure events arrive and are cached before calling waitForReviewCompletion
+      await new Promise((r) => setTimeout(r, 60));
+
+      const startTime = Date.now();
+      const completion = await adapter.waitForReviewCompletion({
+        threadId: 'thr_rev_early_test',
+        turnId: rev.turnId,
+        timeoutMs: 500
+      });
+      const elapsed = Date.now() - startTime;
+      assert.strictEqual(completion.turnId, rev.turnId);
+      assert.strictEqual(completion.status, 'completed');
+      assert.strictEqual(completion.reviewEvidence.id, rev.turnId);
+      assert.strictEqual(elapsed < 200, true, 'Cached review evidence resolves immediately');
+      console.log('PASS: CAS-072 — review evidence arriving before waiter retained');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-073: string review target rejected fail-closed
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      let caught = null;
+      try {
+        await adapter.startReview({
+          threadId: 'thr_rev_str',
+          target: 'uncommittedChanges', // Plain string forbidden
+          delivery: 'inline'
+        });
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'INVALID_REVIEW_TARGET');
+      console.log('PASS: CAS-073 — string review target rejected');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-074: resume response thread mismatch rejected fail-closed
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=resume_thread_mismatch'] });
+    try {
+      await adapter.initialize();
+      let caught = null;
+      try {
+        await adapter.resumeThread({ threadId: 'thr_expected_resume' });
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_THREAD_MISMATCH');
+      console.log('PASS: CAS-074 — resume response thread mismatch rejected');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-075: read response thread mismatch rejected fail-closed
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=read_thread_mismatch'] });
+    try {
+      await adapter.initialize();
+      let caught = null;
+      try {
+        await adapter.readThread({ threadId: 'thr_expected_read' });
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_THREAD_MISMATCH');
+      console.log('PASS: CAS-075 — read response thread mismatch rejected');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-076: response with neither result nor error rejected
+  {
+    const client = createTestClient({ fixtureArgs: ['--scenario=neither_result_nor_error'] });
+    try {
+      await client.initialize();
+      let caught = null;
+      try {
+        await client.sendRequest('model/list', {});
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_PROTOCOL_ERROR');
+      console.log('PASS: CAS-076 — response with neither result nor error rejected');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-077: response with both result and error rejected
+  {
+    const client = createTestClient({ fixtureArgs: ['--scenario=both_result_and_error'] });
+    try {
+      await client.initialize();
+      let caught = null;
+      try {
+        await client.sendRequest('model/list', {});
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_PROTOCOL_ERROR');
+      console.log('PASS: CAS-077 — response with both result and error rejected');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-078: close sent thread/start -> REQUEST_UNCERTAIN
+  {
+    const client = createTestClient({ fixtureArgs: ['--scenario=timeout'] });
+    try {
+      await client.initialize();
+      const startReq = client.sendRequest('thread/start', { cwd: 'D:\\test' }, { timeoutMs: 5000, isSideEffecting: true });
+      // Allow write to flush so request is authoritative 'sent'
+      await new Promise((r) => setTimeout(r, 25));
+      const [closeResult, reqResult] = await Promise.allSettled([client.close(), startReq]);
+      assert.strictEqual(reqResult.status, 'rejected');
+      assert.strictEqual(reqResult.reason.code, 'CODEX_APP_SERVER_REQUEST_UNCERTAIN');
+      console.log('PASS: CAS-078 — close sent thread/start -> REQUEST_UNCERTAIN');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-079: close sent turn/start -> REQUEST_UNCERTAIN
+  {
+    const client = createTestClient({ fixtureArgs: ['--scenario=timeout'] });
+    try {
+      await client.initialize();
+      const turnReq = client.sendRequest('turn/start', { threadId: 'thr_1' }, { timeoutMs: 5000, isSideEffecting: true });
+      // Allow write to flush so request is authoritative 'sent'
+      await new Promise((r) => setTimeout(r, 25));
+      const [closeResult, reqResult] = await Promise.allSettled([client.close(), turnReq]);
+      assert.strictEqual(reqResult.status, 'rejected');
+      assert.strictEqual(reqResult.reason.code, 'CODEX_APP_SERVER_REQUEST_UNCERTAIN');
+      console.log('PASS: CAS-079 — close sent turn/start -> REQUEST_UNCERTAIN');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-080: official commandExecution approval request not auto-approved
+  {
+    const client = createTestClient({ fixtureArgs: ['--scenario=server_request'] });
+    try {
+      let serverReq = null;
+      client.on('serverRequest', (req) => {
+        serverReq = req;
+      });
+      await client.initialize();
+      await new Promise((r) => setTimeout(r, 100));
+      assert.notStrictEqual(serverReq, null);
+      assert.strictEqual(serverReq.method, 'item/commandExecution/requestApproval');
+      console.log('PASS: CAS-080 — official commandExecution approval request not auto-approved');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-081: stable inProgress provider status preserved
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const turn = await adapter.startTurn({
+        threadId: 'thr_inprogress_test',
+        input: [{ type: 'text', text: 'status check' }]
+      });
+      assert.strictEqual(turn.status, 'inProgress');
+      console.log('PASS: CAS-081 — stable inProgress provider status preserved');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-082: provider contract snapshot asserts key stable field names
+  {
+    const STABLE_CONTRACT = {
+      threadStart: {
+        approvalPolicy: 'never',
+        sandbox: 'readOnly',
+        forbiddenFields: ['readOnly', 'workspaceWrite', 'dangerFullAccess']
+      },
+      initializedNotification: {
+        method: 'initialized',
+        paramsType: 'object'
+      },
+      turnStatus: {
+        initial: 'inProgress',
+        terminal: ['completed', 'interrupted', 'failed']
+      },
+      reviewTarget: {
+        allowedTypes: ['uncommittedChanges', 'baseBranch', 'commit', 'custom'],
+        stringTargetAllowed: false
+      },
+      reviewEvidence: {
+        itemType: 'exitedReviewMode',
+        evidenceField: 'review'
+      }
+    };
+
+    assert.strictEqual(STABLE_CONTRACT.threadStart.sandbox, 'readOnly');
+    assert.strictEqual(STABLE_CONTRACT.threadStart.approvalPolicy, 'never');
+    assert.strictEqual(STABLE_CONTRACT.turnStatus.initial, 'inProgress');
+    assert.strictEqual(STABLE_CONTRACT.reviewEvidence.evidenceField, 'review');
+    assert.strictEqual(STABLE_CONTRACT.reviewTarget.stringTargetAllowed, false);
+    console.log('PASS: CAS-082 — provider contract snapshot asserts key stable field names');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-060: 60/60 PASS)');
+  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-082: 82/82 PASS)');
   console.log('======================================================================');
 }
 

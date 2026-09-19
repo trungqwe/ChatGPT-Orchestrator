@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const { EventEmitter } = require('events');
 const { CodexAppServerClient, createError } = require('./codex-app-server-client');
 
 const ALLOWED_REVIEW_TARGET_TYPES = new Set([
@@ -30,6 +31,16 @@ class CodexAuditorAdapter {
     this._options = options;
     this._client = options.client || new CodexAppServerClient(options);
     this._initialized = false;
+
+    // Bounded maps (Sections 12, 14, 15, 18)
+    this._turnOwnership = new Map(); // turnId -> threadId (max 4,096)
+    this._turnCompletionCache = new Map(); // turnId -> { threadId, turnId, status, turn } (max 4,096)
+    this._reviewEvidenceCache = new Map(); // turnId -> item (max 4,096)
+    this._emitter = new EventEmitter();
+
+    // Listen to client notifications for early completion / evidence caching
+    this._client.on('turn/completed', (notifParams) => this._onTurnCompleted(notifParams));
+    this._client.on('item/completed', (itemParams) => this._onItemCompleted(itemParams));
   }
 
   /**
@@ -38,6 +49,74 @@ class CodexAuditorAdapter {
    */
   getClient() {
     return this._client;
+  }
+
+  /**
+   * Bounded map insertion helper.
+   * @private
+   */
+  _recordBounded(map, key, value, limit = 4096) {
+    if (map.size >= limit) {
+      const firstKey = map.keys().next().value;
+      map.delete(firstKey);
+    }
+    map.set(key, value);
+  }
+
+  /**
+   * Handle turn/completed notification from client.
+   * @private
+   */
+  _onTurnCompleted(notifParams) {
+    if (!notifParams || typeof notifParams !== 'object') return;
+    const turn = notifParams.turn || notifParams;
+    const turnId = turn.id || turn.turnId;
+    if (!turnId) return;
+
+    const notifThreadId = notifParams.threadId;
+    const localThreadId = this._turnOwnership.get(turnId);
+
+    // Section 13: validate optional threadId against local ownership
+    if (notifThreadId && localThreadId && notifThreadId !== localThreadId) {
+      const mismatchRecord = {
+        turnId,
+        threadId: notifThreadId,
+        mismatch: true,
+        error: createError(
+          'CODEX_APP_SERVER_THREAD_MISMATCH',
+          `Notification threadId '${notifThreadId}' does not match local threadId '${localThreadId}'`
+        )
+      };
+      this._recordBounded(this._turnCompletionCache, turnId, mismatchRecord);
+      this._emitter.emit('turn_completed_' + turnId, mismatchRecord);
+      return;
+    }
+
+    const resolvedThreadId = localThreadId || notifThreadId || null;
+    const record = {
+      threadId: resolvedThreadId,
+      turnId,
+      status: turn.status,
+      turn: deepDetach(turn)
+    };
+
+    this._recordBounded(this._turnCompletionCache, turnId, record);
+    this._emitter.emit('turn_completed_' + turnId, record);
+  }
+
+  /**
+   * Handle item/completed notification from client for review evidence.
+   * @private
+   */
+  _onItemCompleted(itemParams) {
+    if (!itemParams || typeof itemParams !== 'object') return;
+    const item = itemParams.item || itemParams;
+    if (item && item.type === 'exitedReviewMode' && item.id) {
+      const turnId = item.id;
+      const evidence = deepDetach(item);
+      this._recordBounded(this._reviewEvidenceCache, turnId, evidence);
+      this._emitter.emit('review_evidence_' + turnId, evidence);
+    }
   }
 
   /**
@@ -79,11 +158,12 @@ class CodexAuditorAdapter {
   }
 
   /**
-   * Start a new auditor thread with read-only security defaults.
-   * Requires absolute cwd. Never writes to Registry.
+   * Start a new auditor thread with stable security defaults.
+   * Requires absolute cwd.
+   * Sends approvalPolicy="never" and sandbox="readOnly" (CASPROTO-01).
+   * Never writes to Registry.
    * @param {Object} params
    * @param {string} params.cwd
-   * @param {boolean} [params.readOnly=true]
    * @returns {Promise<{ threadId: string, sessionId: string|null, raw: Object }>}
    */
   async startThread(params = {}) {
@@ -94,7 +174,7 @@ class CodexAuditorAdapter {
       );
     }
 
-    const { cwd, readOnly = true } = params;
+    const { cwd } = params;
 
     if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) {
       throw createError(
@@ -103,23 +183,23 @@ class CodexAuditorAdapter {
       );
     }
 
-    // Security check: reject privilege escalation attempts in auditor defaults
-    if (params.dangerFullAccess === true || params.workspaceWrite === true) {
+    // Security check: reject invented boolean fields (Sections 3, 53)
+    if (
+      params.readOnly !== undefined ||
+      params.workspaceWrite !== undefined ||
+      params.dangerFullAccess !== undefined
+    ) {
       throw createError(
         'CODEX_APP_SERVER_SECURITY_VIOLATION',
-        'Auditor default policy rejects dangerFullAccess and workspaceWrite capability'
+        'Invented boolean protocol fields (readOnly, workspaceWrite, dangerFullAccess) are forbidden'
       );
     }
 
     const requestParams = {
       cwd,
-      readOnly: readOnly !== false
+      approvalPolicy: 'never',
+      sandbox: 'readOnly'
     };
-    for (const [k, v] of Object.entries(params)) {
-      if (k.startsWith('_')) {
-        requestParams[k] = v;
-      }
-    }
 
     const result = await this._client.sendRequest('thread/start', requestParams, {
       isSideEffecting: true
@@ -153,6 +233,7 @@ class CodexAuditorAdapter {
 
   /**
    * Resume an existing thread by exact ID.
+   * Validates provider response matches requested ID (Section 24).
    * Propagates error on failure; never creates a replacement thread automatically.
    * @param {Object} params
    * @param {string} params.threadId
@@ -167,15 +248,18 @@ class CodexAuditorAdapter {
     }
 
     const { threadId } = params;
-    const requestParams = { threadId };
-    for (const [k, v] of Object.entries(params)) {
-      if (k.startsWith('_')) {
-        requestParams[k] = v;
-      }
-    }
-    const result = await this._client.sendRequest('thread/resume', requestParams, {
+    const result = await this._client.sendRequest('thread/resume', { threadId }, {
       isSideEffecting: false
     });
+
+    // Exact-ID verification on response (Section 24)
+    const returnedId = result?.thread?.id || result?.id || result?.threadId;
+    if (returnedId !== threadId) {
+      throw createError(
+        'CODEX_APP_SERVER_THREAD_MISMATCH',
+        `thread/resume returned threadId '${returnedId}', expected '${threadId}'`
+      );
+    }
 
     return {
       threadId,
@@ -186,6 +270,7 @@ class CodexAuditorAdapter {
 
   /**
    * Read thread by exact ID.
+   * Validates provider response matches requested ID (Section 25).
    * Default includeTurns = false. No implicit resume.
    * @param {Object} params
    * @param {string} params.threadId
@@ -201,18 +286,21 @@ class CodexAuditorAdapter {
     }
 
     const { threadId, includeTurns = false } = params;
-    const requestParams = {
+    const result = await this._client.sendRequest('thread/read', {
       threadId,
       includeTurns: Boolean(includeTurns)
-    };
-    for (const [k, v] of Object.entries(params)) {
-      if (k.startsWith('_')) {
-        requestParams[k] = v;
-      }
-    }
-    const result = await this._client.sendRequest('thread/read', requestParams, {
+    }, {
       isSideEffecting: false
     });
+
+    // Exact-ID verification on response (Section 25)
+    const returnedId = result?.thread?.id || result?.id || result?.threadId;
+    if (returnedId !== threadId) {
+      throw createError(
+        'CODEX_APP_SERVER_THREAD_MISMATCH',
+        `thread/read returned threadId '${returnedId}', expected '${threadId}'`
+      );
+    }
 
     return deepDetach(result);
   }
@@ -220,6 +308,7 @@ class CodexAuditorAdapter {
   /**
    * Start turn on an existing thread.
    * Input is restricted to bounded text. Forward outputSchema if supplied.
+   * Records local turn ownership (Section 12).
    * @param {Object} params
    * @param {string} params.threadId
    * @param {Array<{ type: string, text: string }>} params.input
@@ -264,11 +353,6 @@ class CodexAuditorAdapter {
       threadId,
       input
     };
-    for (const [k, v] of Object.entries(params)) {
-      if (k.startsWith('_')) {
-        requestParams[k] = v;
-      }
-    }
 
     if (outputSchema !== undefined) {
       if (!outputSchema || typeof outputSchema !== 'object' || Array.isArray(outputSchema)) {
@@ -308,7 +392,10 @@ class CodexAuditorAdapter {
       );
     }
 
-    const status = turnObj.status || 'in_progress';
+    // Record local turn ownership (Section 12)
+    this._recordBounded(this._turnOwnership, turnId, threadId);
+
+    const status = turnObj.status || 'inProgress';
 
     return {
       turnId,
@@ -318,7 +405,36 @@ class CodexAuditorAdapter {
   }
 
   /**
-   * Wait for turn to complete by correlating exact threadId and turnId from turn/completed notification.
+   * Helper to resolve a completed turn record.
+   * @private
+   */
+  _resolveTurnRecord(record, expectedThreadId, turnId) {
+    const status = record.status;
+    if (status === 'completed' || status === 'interrupted') {
+      return {
+        threadId: expectedThreadId,
+        turnId,
+        status,
+        turn: record.turn
+      };
+    }
+    if (status === 'failed') {
+      throw createError(
+        'TURN_FAILED',
+        `Turn '${turnId}' failed: ${record.turn?.error?.message || 'unknown failure'}`,
+        { turn: record.turn }
+      );
+    }
+    throw createError(
+      'UNRECOGNIZED_TURN_STATUS',
+      `Turn completed with unrecognized status '${status}'`,
+      { turn: record.turn }
+    );
+  }
+
+  /**
+   * Wait for turn to complete by correlating exact turnId and local thread ownership.
+   * Eliminates early completion race via bounded cache (Sections 11, 12, 14, 16).
    * @param {Object} params
    * @param {string} params.threadId
    * @param {string} params.turnId
@@ -335,57 +451,44 @@ class CodexAuditorAdapter {
       );
     }
 
+    // Section 16: validate local ownership immediately
+    const ownedThread = this._turnOwnership.get(turnId);
+    if (ownedThread && ownedThread !== threadId) {
+      throw createError(
+        'CODEX_APP_SERVER_THREAD_MISMATCH',
+        `Turn '${turnId}' belongs to thread '${ownedThread}', not '${threadId}'`
+      );
+    }
+
+    // Section 14: check already-cached completion
+    const cached = this._turnCompletionCache.get(turnId);
+    if (cached) {
+      if (cached.mismatch) throw cached.error;
+      return this._resolveTurnRecord(cached, threadId, turnId);
+    }
+
     return new Promise((resolve, reject) => {
       let timer = null;
 
       const cleanup = () => {
         if (timer) clearTimeout(timer);
-        this._client.removeListener('turn/completed', onTurnCompleted);
+        this._emitter.removeListener('turn_completed_' + turnId, onCompleted);
       };
 
-      const onTurnCompleted = (notifParams) => {
-        if (!notifParams || typeof notifParams !== 'object') return;
-
-        // Correlate exact threadId and turnId
-        const notifThreadId = notifParams.threadId;
-        const turnObj = notifParams.turn || notifParams;
-        const notifTurnId = turnObj.id || turnObj.turnId;
-
-        if (notifThreadId !== threadId || notifTurnId !== turnId) {
-          // Unrelated turn completion; ignore
-          return;
-        }
-
+      const onCompleted = (record) => {
         cleanup();
-
-        const status = turnObj.status;
-        if (status === 'completed' || status === 'interrupted') {
-          resolve({
-            threadId,
-            turnId,
-            status,
-            turn: deepDetach(turnObj)
-          });
-        } else if (status === 'failed') {
-          reject(
-            createError(
-              'TURN_FAILED',
-              `Turn '${turnId}' failed: ${turnObj.error?.message || 'unknown failure'}`,
-              { turn: deepDetach(turnObj) }
-            )
-          );
-        } else {
-          reject(
-            createError(
-              'UNRECOGNIZED_TURN_STATUS',
-              `Turn completed with unrecognized status '${status}'`,
-              { turn: deepDetach(turnObj) }
-            )
-          );
+        if (record.mismatch) {
+          return reject(record.error);
+        }
+        try {
+          const res = this._resolveTurnRecord(record, threadId, turnId);
+          resolve(res);
+        } catch (err) {
+          reject(err);
         }
       };
 
-      this._client.on('turn/completed', onTurnCompleted);
+      this._emitter.once('turn_completed_' + turnId, onCompleted);
 
       if (timeoutMs > 0 && timeoutMs !== Infinity) {
         timer = setTimeout(() => {
@@ -425,16 +528,18 @@ class CodexAuditorAdapter {
       isSideEffecting: true
     });
 
+    this._turnOwnership.set(turnId, threadId);
+
     return deepDetach(result);
   }
 
   /**
    * Start a review turn.
    * For v4 primary architecture, allows only inline delivery.
-   * Validates target type and ensures returned reviewThreadId matches requested threadId.
+   * Target must be a strict structured object (Sections 21, 22).
    * @param {Object} params
    * @param {string} params.threadId
-   * @param {string|Object} params.target
+   * @param {Object} params.target
    * @param {string} [params.delivery='inline']
    * @returns {Promise<{ turnId: string, reviewThreadId: string, status: string, raw: Object }>}
    */
@@ -456,19 +561,55 @@ class CodexAuditorAdapter {
       );
     }
 
-    // Validate review target
-    let targetType;
-    if (typeof target === 'string') {
-      targetType = target;
-    } else if (target && typeof target === 'object' && typeof target.type === 'string') {
-      targetType = target.type;
+    // Section 21: Target must be a structured object (reject strings)
+    if (!target || typeof target !== 'object' || Array.isArray(target)) {
+      throw createError(
+        'INVALID_REVIEW_TARGET',
+        'Review target must be a structured object'
+      );
     }
 
-    if (!targetType || !ALLOWED_REVIEW_TARGET_TYPES.has(targetType)) {
+    const targetType = target.type;
+    if (!ALLOWED_REVIEW_TARGET_TYPES.has(targetType)) {
       throw createError(
         'INVALID_REVIEW_TARGET',
         `Unsupported review target type '${targetType}'. Allowed: ${[...ALLOWED_REVIEW_TARGET_TYPES].join(', ')}`
       );
+    }
+
+    // Section 22: Strict field validation
+    const targetKeys = Object.keys(target);
+    if (targetType === 'uncommittedChanges') {
+      if (targetKeys.length !== 1) {
+        throw createError('INVALID_REVIEW_TARGET', 'uncommittedChanges target must not contain extra fields');
+      }
+    } else if (targetType === 'baseBranch') {
+      if (typeof target.branch !== 'string' || !target.branch) {
+        throw createError('INVALID_REVIEW_TARGET', 'baseBranch target requires a non-empty branch string');
+      }
+      for (const k of targetKeys) {
+        if (k !== 'type' && k !== 'branch') {
+          throw createError('INVALID_REVIEW_TARGET', `Unknown field '${k}' in baseBranch target`);
+        }
+      }
+    } else if (targetType === 'commit') {
+      if (typeof target.sha !== 'string' || !target.sha) {
+        throw createError('INVALID_REVIEW_TARGET', 'commit target requires a non-empty sha string');
+      }
+      for (const k of targetKeys) {
+        if (k !== 'type' && k !== 'sha' && k !== 'title') {
+          throw createError('INVALID_REVIEW_TARGET', `Unknown field '${k}' in commit target`);
+        }
+      }
+    } else if (targetType === 'custom') {
+      if (typeof target.instructions !== 'string' || !target.instructions) {
+        throw createError('INVALID_REVIEW_TARGET', 'custom target requires a non-empty instructions string');
+      }
+      for (const k of targetKeys) {
+        if (k !== 'type' && k !== 'instructions') {
+          throw createError('INVALID_REVIEW_TARGET', `Unknown field '${k}' in custom target`);
+        }
+      }
     }
 
     const requestParams = {
@@ -476,11 +617,6 @@ class CodexAuditorAdapter {
       target,
       delivery
     };
-    for (const [k, v] of Object.entries(params)) {
-      if (k.startsWith('_')) {
-        requestParams[k] = v;
-      }
-    }
 
     const result = await this._client.sendRequest('review/start', requestParams, {
       isSideEffecting: true
@@ -511,22 +647,26 @@ class CodexAuditorAdapter {
       );
     }
 
+    // Record turn ownership
+    this._recordBounded(this._turnOwnership, turnId, threadId);
+
     return {
       turnId,
       reviewThreadId,
-      status: turnObj.status || 'in_progress',
+      status: turnObj.status || 'inProgress',
       raw: deepDetach(result)
     };
   }
 
   /**
    * Wait for review completion.
-   * Requires matching exitedReviewMode evidence and matching turn/completed notification.
+   * Requires BOTH exact exitedReviewMode evidence and terminal turn/completed notification (Sections 17, 18, 19, 20).
+   * Eliminates early evidence / early completion race via bounded caches.
    * @param {Object} params
    * @param {string} params.threadId
    * @param {string} params.turnId
    * @param {number} [params.timeoutMs=60000]
-   * @returns {Promise<{ threadId: string, turnId: string, status: string, reviewEvidence: Object|null, turn: Object }>}
+   * @returns {Promise<{ threadId: string, turnId: string, status: string, reviewEvidence: Object, turn: Object }>}
    */
   async waitForReviewCompletion(params = {}) {
     const { threadId, turnId, timeoutMs = 60000 } = params;
@@ -538,67 +678,84 @@ class CodexAuditorAdapter {
       );
     }
 
+    // Validate ownership
+    const ownedThread = this._turnOwnership.get(turnId);
+    if (ownedThread && ownedThread !== threadId) {
+      throw createError(
+        'CODEX_APP_SERVER_THREAD_MISMATCH',
+        `Review turn '${turnId}' belongs to thread '${ownedThread}', not '${threadId}'`
+      );
+    }
+
+    const checkReady = (evidence, completion) => {
+      if (evidence && completion) {
+        if (completion.status === 'failed') {
+          throw createError(
+            'TURN_FAILED',
+            `Review turn '${turnId}' failed: ${completion.turn?.error?.message || 'unknown failure'}`,
+            { turn: completion.turn }
+          );
+        }
+        return {
+          threadId,
+          turnId,
+          status: completion.status,
+          reviewEvidence: evidence,
+          turn: completion.turn
+        };
+      }
+      return null;
+    };
+
+    let existingEvidence = this._reviewEvidenceCache.get(turnId) || null;
+    let existingCompletion = this._turnCompletionCache.get(turnId) || null;
+
+    const readyNow = checkReady(existingEvidence, existingCompletion);
+    if (readyNow) return readyNow;
+
     return new Promise((resolve, reject) => {
       let timer = null;
-      let capturedReviewEvidence = null;
 
       const cleanup = () => {
         if (timer) clearTimeout(timer);
-        this._client.removeListener('item/completed', onItemCompleted);
-        this._client.removeListener('turn/completed', onTurnCompleted);
+        this._emitter.removeListener('review_evidence_' + turnId, onEvidence);
+        this._emitter.removeListener('turn_completed_' + turnId, onCompleted);
       };
 
-      const onItemCompleted = (itemParams) => {
-        if (!itemParams || typeof itemParams !== 'object') return;
-        const item = itemParams.item || itemParams;
-        if (item.type === 'exitedReviewMode') {
-          capturedReviewEvidence = deepDetach(item);
+      const onEvidence = (evidence) => {
+        existingEvidence = evidence;
+        try {
+          const res = checkReady(existingEvidence, existingCompletion);
+          if (res) {
+            cleanup();
+            resolve(res);
+          }
+        } catch (err) {
+          cleanup();
+          reject(err);
         }
       };
 
-      const onTurnCompleted = (notifParams) => {
-        if (!notifParams || typeof notifParams !== 'object') return;
-
-        const notifThreadId = notifParams.threadId;
-        const turnObj = notifParams.turn || notifParams;
-        const notifTurnId = turnObj.id || turnObj.turnId;
-
-        if (notifThreadId !== threadId || notifTurnId !== turnId) {
-          return;
+      const onCompleted = (record) => {
+        if (record.mismatch) {
+          cleanup();
+          return reject(record.error);
         }
-
-        cleanup();
-
-        const status = turnObj.status;
-        if (status === 'completed' || status === 'interrupted') {
-          resolve({
-            threadId,
-            turnId,
-            status,
-            reviewEvidence: capturedReviewEvidence,
-            turn: deepDetach(turnObj)
-          });
-        } else if (status === 'failed') {
-          reject(
-            createError(
-              'TURN_FAILED',
-              `Review turn '${turnId}' failed`,
-              { turn: deepDetach(turnObj) }
-            )
-          );
-        } else {
-          reject(
-            createError(
-              'UNRECOGNIZED_TURN_STATUS',
-              `Review turn completed with unexpected status '${status}'`,
-              { turn: deepDetach(turnObj) }
-            )
-          );
+        existingCompletion = record;
+        try {
+          const res = checkReady(existingEvidence, existingCompletion);
+          if (res) {
+            cleanup();
+            resolve(res);
+          }
+        } catch (err) {
+          cleanup();
+          reject(err);
         }
       };
 
-      this._client.on('item/completed', onItemCompleted);
-      this._client.on('turn/completed', onTurnCompleted);
+      this._emitter.on('review_evidence_' + turnId, onEvidence);
+      this._emitter.on('turn_completed_' + turnId, onCompleted);
 
       if (timeoutMs > 0 && timeoutMs !== Infinity) {
         timer = setTimeout(() => {
@@ -620,6 +777,7 @@ class CodexAuditorAdapter {
    */
   async close() {
     this._initialized = false;
+    this._emitter.removeAllListeners();
     await this._client.close();
   }
 }
