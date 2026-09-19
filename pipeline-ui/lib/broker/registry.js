@@ -471,6 +471,17 @@ function validateRegistryDocument(doc) {
   return doc;
 }
 
+function sameMigrationFileIdentity(a, b) {
+  return !!(
+    a && b &&
+    typeof a.isFile === 'function' && a.isFile() &&
+    typeof b.isFile === 'function' && b.isFile() &&
+    a.dev != null && a.ino != null &&
+    b.dev != null && b.ino != null &&
+    a.dev === b.dev && a.ino === b.ino
+  );
+}
+
 function readMigrationSource(registryFilePath, customFs) {
   if (!path.isAbsolute(registryFilePath)) {
     throw new RegistryError(REGISTRY_ERROR_CODES.INVALID_REQUEST, 'registryFilePath must be absolute');
@@ -481,10 +492,10 @@ function readMigrationSource(registryFilePath, customFs) {
     if (!before.isFile() || before.isSymbolicLink()) throw new Error('Source must be a regular non-symlink file');
     descriptor = customFs.openSync(registryFilePath, 'r');
     const opened = customFs.fstatSync(descriptor);
-    if (!opened.isFile() || (before.ino && opened.ino && (before.ino !== opened.ino || before.dev !== opened.dev))) throw new Error('Source identity changed');
+    if (!sameMigrationFileIdentity(before, opened)) throw new Error('Source identity unavailable or changed before read');
     const raw = customFs.readFileSync(descriptor);
     const after = customFs.lstatSync(registryFilePath);
-    if (!after.isFile() || after.isSymbolicLink() || (opened.ino && after.ino && (opened.ino !== after.ino || opened.dev !== after.dev))) throw new Error('Source identity changed');
+    if (after.isSymbolicLink() || !sameMigrationFileIdentity(opened, after)) throw new Error('Source identity unavailable or changed after read');
     return { raw, sha256: crypto.createHash('sha256').update(raw).digest('hex') };
   } catch (error) {
     throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_CORRUPT, `Cannot safely read registry migration source: ${error.message}`);
@@ -590,7 +601,7 @@ function applyV1ToV2Migration(options = {}) {
   } catch (error) {
     if (tempFd !== undefined) try { customFs.closeSync(tempFd); } catch {}
     try { customFs.unlinkSync(tempPath); } catch {}
-    if (error instanceof RegistryError && error.code === REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_SOURCE_CHANGED) throw error;
+    if (error instanceof RegistryError && [REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_SOURCE_CHANGED, REGISTRY_ERROR_CODES.REGISTRY_CORRUPT].includes(error.code)) throw error;
     throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_PERSIST_FAILED, `Cannot atomically persist v2 Registry: ${error.message}`);
   }
   try {

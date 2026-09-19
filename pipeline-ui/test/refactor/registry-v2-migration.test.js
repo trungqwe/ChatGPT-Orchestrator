@@ -169,7 +169,67 @@ async function run() {
       expectCode(() => createProjectRegistry({ registryFilePath: target }), 'AUDITOR_CWD_MISMATCH');
     });
   } finally { bound.cleanup(); }
-  console.log(`ALL REGISTRY V2 MIGRATION TESTS PASSED (RV2-001 .. RV2-045: ${count}/45 PASS)`);
+  function identityFaultTest(id, description, injectedFs) {
+    const source = fixture();
+    try {
+      check(id, description, () => {
+        expectCode(() => previewV1ToV2Migration({ registryFilePath: source.file, fs: injectedFs }), 'REGISTRY_CORRUPT');
+        assert.deepStrictEqual(fs.readFileSync(source.file), source.raw);
+        assert.deepStrictEqual(fs.readdirSync(source.dir).sort(), ['project', 'projects.json']);
+      });
+    } finally { source.cleanup(); }
+  }
+  identityFaultTest('RV2-046', 'missing pre-lstat inode fails before reading', { ...fs,
+    lstatSync: (file) => Object.assign(Object.create(fs.lstatSync(file)), { ino: undefined })
+  });
+  identityFaultTest('RV2-047', 'missing fd device fails before reading', { ...fs,
+    fstatSync: (fd) => Object.assign(Object.create(fs.fstatSync(fd)), { dev: undefined })
+  });
+  {
+    let calls = 0;
+    identityFaultTest('RV2-048', 'missing post-lstat inode fails closed', { ...fs,
+      lstatSync: (file) => ++calls === 2 ? Object.assign(Object.create(fs.lstatSync(file)), { ino: null }) : fs.lstatSync(file)
+    });
+  }
+  identityFaultTest('RV2-049', 'pre and fd identity mismatch fails closed', { ...fs,
+    fstatSync: (fd) => { const original = fs.fstatSync(fd); return Object.assign(Object.create(original), { ino: BigInt(original.ino) + 1n }); }
+  });
+  {
+    let calls = 0;
+    identityFaultTest('RV2-050', 'fd and post identity mismatch fails closed', { ...fs,
+      lstatSync: (file) => { const original = fs.lstatSync(file); return ++calls === 2 ? Object.assign(Object.create(original), { ino: BigInt(original.ino) + 1n }) : original; }
+    });
+  }
+  identityFaultTest('RV2-051', 'zero-valued identity does not bypass mismatch', { ...fs,
+    lstatSync: (file) => Object.assign(Object.create(fs.lstatSync(file)), { dev: 0, ino: 0 }),
+    fstatSync: (fd) => Object.assign(Object.create(fs.fstatSync(fd)), { dev: 0, ino: 1 })
+  });
+  const applySource = fixture();
+  try {
+    const expectedHash = preview(applySource).source_sha256;
+    let lstatCalls = 0;
+    let renames = 0;
+    let writes = 0;
+    const injectedFs = { ...fs,
+      writeFileSync: (...args) => { writes++; return fs.writeFileSync(...args); },
+      lstatSync: (file) => {
+        const original = fs.lstatSync(file);
+        if (file === applySource.file && ++lstatCalls === 3) return Object.assign(Object.create(original), { ino: undefined });
+        return original;
+      },
+      renameSync: (...args) => { renames++; return fs.renameSync(...args); }
+    };
+    check('RV2-052', 'apply pre-rename read rejects missing identity after backup and temp write', () => {
+      expectCode(() => apply(applySource, expectedHash, { fs: injectedFs }), 'REGISTRY_CORRUPT');
+      assert.deepStrictEqual(fs.readFileSync(applySource.file), applySource.raw);
+      assert.strictEqual(renames, 0);
+      assert.strictEqual(writes, 2, 'backup and candidate temp must both have been written');
+      const backups = fs.readdirSync(applySource.dir).filter((name) => name.endsWith('.bak'));
+      assert.strictEqual(backups.length, 1);
+      assert.deepStrictEqual(fs.readFileSync(path.join(applySource.dir, backups[0])), applySource.raw);
+    });
+  } finally { applySource.cleanup(); }
+  console.log(`ALL REGISTRY V2 MIGRATION TESTS PASSED (RV2-001 .. RV2-052: ${count}/52 PASS)`);
 }
 
 if (require.main === module) run().catch((error) => { console.error(error); process.exitCode = 1; });
