@@ -96,13 +96,13 @@ async function loadStatus() {
     }
   }
 
-  // ChatGPT Web Proxy
+  // Native auditor migration state
   const gptPill = document.getElementById('pill-chatgpt');
   const gptVal = document.getElementById('val-chatgpt');
   if (gptPill && gptVal) {
     if (data.chatgptProxy && data.chatgptProxy.status === 'ready') {
       gptPill.className = 'status-pill ready';
-      gptVal.textContent = 'Ready (Port 17841)';
+      gptVal.textContent = 'Native Codex ready';
     } else {
       gptPill.className = 'status-pill offline';
       gptVal.textContent = 'Offline';
@@ -1245,7 +1245,7 @@ async function openSessionDrawer(session, targetTab = 'overview') {
       <div><strong>Dự án:</strong> ${escapeHtml(session.projectId)}</div>
       <div><strong>Harness:</strong> <code>${escapeHtml(session.harness)}</code></div>
       <div><strong>Trạng thái:</strong> <span class="badge badge-cyan">${escapeHtml(session.activityState)}</span></div>
-      <div><strong>Model:</strong> <code>${escapeHtml(session.model || 'chatgpt-web/medium')}</code></div>
+      <div><strong>Model:</strong> <code>${escapeHtml(session.model || 'native-auditor-unavailable')}</code></div>
       ${session.branch ? `<div><strong>Nhánh Git:</strong> <code>${escapeHtml(session.branch)}</code></div>` : ''}
       ${session.workspacePath ? `<div><strong>Worktree:</strong> <code style="word-break: break-all;">${escapeHtml(session.workspacePath)}</code></div>` : ''}
       ${session.prompt ? `<div style="margin-top:0.4rem;"><strong>Prompt ban đầu:</strong><pre class="code-preview-box" style="margin-top:0.2rem; max-height:100px;">${escapeHtml(session.prompt)}</pre></div>` : ''}
@@ -1865,7 +1865,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const btn = document.getElementById('btn-start-orchestrator-plan');
     const project = document.getElementById('workflow-project-select').value;
     const goal = document.getElementById('workflow-goal-input').value.trim();
-    const model = document.getElementById('select-model-chatgpt')?.value || 'chatgpt-web/high';
+    const model = document.getElementById('select-model-chatgpt')?.value || 'native-auditor-unavailable';
 
     if (!project) {
       showToast('Vui lòng chọn repository dự án trước!', 'error');
@@ -2027,7 +2027,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!workflowState.workOrder || !workflowState.workerReport) return;
     const btn = document.getElementById('btn-submit-to-review-gate');
     const stage4 = document.getElementById('stage-4');
-    const gptModel = document.getElementById('select-model-chatgpt')?.value || 'chatgpt-web/high';
+    const gptModel = document.getElementById('select-model-chatgpt')?.value || 'native-auditor-unavailable';
 
     btn.disabled = true;
     btn.innerHTML = '<span>ChatGPT Web đang thẩm định chứng cứ...</span>';
@@ -2527,7 +2527,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const agySessionId = document.getElementById('global-antigravity-session-select')?.value || state.selectedAgySession || 'auto';
-    const chatgptModel = document.getElementById('select-model-chatgpt')?.value || 'chatgpt-web/high';
+    const chatgptModel = document.getElementById('select-model-chatgpt')?.value || 'native-auditor-unavailable';
     const statusText = document.getElementById('chat-status-text');
     const btnSend = document.getElementById('btn-chat-send');
     const btnQuick = document.getElementById('btn-quick-fire-report');
@@ -2807,7 +2807,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     const agySessionId = document.getElementById('global-antigravity-session-select')?.value || state.selectedAgySession || 'auto';
-    const chatgptModel = document.getElementById('select-codex-imported-models')?.value || document.getElementById('select-model-chatgpt')?.value || 'chatgpt-web/high';
+    const chatgptModel = document.getElementById('select-codex-imported-models')?.value || document.getElementById('select-model-chatgpt')?.value || 'native-auditor-unavailable';
     const statusText = document.getElementById('chat-status-text');
     const btnSend = document.getElementById('btn-chat-send');
     if (btnSend) btnSend.disabled = true;
@@ -2982,8 +2982,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (cfgAccount) cfgAccount.textContent = data.accountType || (data.authenticated ? 'Đang Đăng Nhập' : 'Chưa Đăng Nhập');
-    if (cfgRoute) cfgRoute.textContent = data.codexRouteInstalled ? 'Đã Kết Nối (127.0.0.1:17841)' : 'Chưa Cài Đặt Route';
-    if (cfgProxy) cfgProxy.textContent = data.status === 'ready' ? 'Online (Port 17841)' : 'Offline';
+    if (cfgRoute) cfgRoute.textContent = 'Đang chuyển sang Native Codex';
+    if (cfgProxy) cfgProxy.textContent = 'Chưa triển khai';
     if (cfgVerify) {
       cfgVerify.textContent = data.verified ? '✓ Xác Thực Thành Công' : 'Chưa Xác Thực';
       cfgVerify.className = data.verified ? 'meta-value text-emerald' : 'meta-value text-amber';
@@ -2995,7 +2995,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const opt = document.createElement('option');
         opt.value = m.id;
         opt.textContent = m.name;
-        if (m.active || m.id === 'chatgpt-web/high') opt.selected = true;
+        if (m.active) opt.selected = true;
         modelSelect.appendChild(opt);
       });
     }
@@ -3057,7 +3057,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnVerifyModel = document.getElementById('btn-verify-model');
   if (btnVerifyModel) {
     btnVerifyModel.addEventListener('click', async () => {
-      const selModel = document.getElementById('select-codex-imported-models')?.value || 'chatgpt-web/high';
+      const selModel = document.getElementById('select-codex-imported-models')?.value || 'native-auditor-unavailable';
       showToast(`Đang kiểm tra model ${selModel}...`, 'info');
       const res = await apiPost('/api/models/test', { provider: 'chatgpt', model: selModel });
       if (res.success) {

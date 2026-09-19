@@ -1,12 +1,12 @@
 {
   "name": "pipeline-ui",
   "version": "1.0.0",
-  "description": "Custom Management & Extraction Portal for ChatGPT Web Orchestrator + Antigravity Worker Pipeline",
+  "description": "Local orchestration portal for Native Codex auditor and Antigravity workers",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "desktop": "electron desktop-main.js",
-    "test": "node test/pipeline-api.test.js && node test/closed-loop.test.js"
+    "test": "node test/refactor/legacy-auditor-quarantine.test.js && node test/native-transition.test.js"
   },
   "dependencies": {
     "express": "^4.22.3"

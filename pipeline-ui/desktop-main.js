@@ -135,7 +135,7 @@ function createMainWindow(port) {
     height: 920,
     minWidth: 1080,
     minHeight: 680,
-    title: 'Pipeline Observer & Orchestrator (ChatGPT Web ⇄ Antigravity)',
+    title: 'Pipeline Observer & Orchestrator (Native Codex ⇄ Antigravity)',
     backgroundColor: '#0a0d14',
     show: false,
     webPreferences: {

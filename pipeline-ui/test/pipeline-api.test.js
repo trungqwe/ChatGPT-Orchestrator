@@ -59,9 +59,12 @@ async function runTests() {
     assert.strictEqual(statusRes.statusCode, 200);
     assert.ok(statusRes.json, 'Status returned JSON');
     assert.ok(statusRes.json.aoDaemon, 'Has aoDaemon field');
-    assert.ok(statusRes.json.chatgptProxy, 'Has chatgptProxy field');
+    assert.deepStrictEqual(statusRes.json.auditor, {
+      status: 'unavailable',
+      state: 'NATIVE_AUDITOR_NOT_IMPLEMENTED'
+    }, 'Reports the Native Codex migration state without probing the removed bridge');
     assert.ok(statusRes.json.agents.agy.installed, 'Antigravity agy installed');
-    console.log(`✓ PASS: Health status verified. AO: ${statusRes.json.aoDaemon.status}, ChatGPT: ${statusRes.json.chatgptProxy.status}, Agy: ${statusRes.json.agents.agy.version}`);
+    console.log(`✓ PASS: Health status verified. AO: ${statusRes.json.aoDaemon.status}, Auditor: ${statusRes.json.auditor.state}, Agy: ${statusRes.json.agents.agy.version}`);
 
     // 3. Projects API
     console.log('[TEST 3] Testing projects API (GET /api/projects)...');

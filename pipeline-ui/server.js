@@ -2,13 +2,11 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const { exec, execSync, execFile } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const AO_BASE_URL = 'http://127.0.0.1:3001';
-const CHATGPT_PROXY_URL = 'http://127.0.0.1:17841';
 const AO_DATA_DIR = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', '.ao', 'data');
 const CODEX_DIR = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', '.codex');
 const DB_PATH = path.join(AO_DATA_DIR, 'ao.db');
@@ -273,40 +271,6 @@ function fetchJson(url, options = {}) {
   });
 }
 
-// Helper: Format Doctor Report to accurately reflect ChatGPT Web Proxy runtime
-function formatDoctorReport(raw) {
-  if (!raw || typeof raw !== 'string') return 'Đang đọc thông tin chẩn đoán...';
-  let report = raw;
-
-  const proxyHealthy = report.includes('Responses proxy is healthy on 127.0.0.1:17841') || report.includes('Responses proxy is healthy');
-  const launcherOwns = report.includes('Launcher owns the background runtime');
-  const runningTurn = report.includes('running Codex turn') || report.includes('ChatGPT browser is running Codex turn');
-
-  if (proxyHealthy && (launcherOwns || runningTurn)) {
-    report = report.replace(
-      /✗ Embedded launcher browser is unavailable[\s\S]*?ChatGPT browser is running Codex turn [^\r\n]+/g,
-      '✓ Trình duyệt nền ChatGPT Web đang hoạt động & sẵn sàng (đang phục vụ phiên Codex)'
-    );
-    report = report.replace(
-      /✗ Embedded launcher browser is unavailable/g,
-      '✓ Trình duyệt nền ChatGPT Web đang hoạt động trên tiến trình nền'
-    );
-    report = report.replace(
-      /Doctor result: not ready/g,
-      'Doctor result: ready (ChatGPT Web Bridge Hoạt Động Bình Thường)'
-    );
-  }
-  return report;
-}
-
-function isDoctorReady(raw) {
-  if (!raw || typeof raw !== 'string') return false;
-  if (raw.includes('Doctor result: ready')) return true;
-  const proxyHealthy = raw.includes('Responses proxy is healthy');
-  const launcherOwns = raw.includes('Launcher owns the background runtime') || raw.includes('running Codex turn');
-  return proxyHealthy && launcherOwns;
-}
-
 // -------------------------------------------------------------
 // 1. System Status & Health
 // -------------------------------------------------------------
@@ -314,7 +278,7 @@ app.get('/api/status', async (req, res) => {
   const result = {
     timestamp: new Date().toISOString(),
     aoDaemon: { status: 'offline', port: 3001, details: null },
-    chatgptProxy: { status: 'offline', port: 17841, doctor: null },
+    auditor: { status: 'unavailable', state: 'NATIVE_AUDITOR_NOT_IMPLEMENTED' },
     agents: {
       agy: { installed: false, version: null },
       codex: { installed: false, version: null },
@@ -331,27 +295,6 @@ app.get('/api/status', async (req, res) => {
     }
   } catch (e) {
     result.aoDaemon.status = 'offline';
-  }
-
-  // Check ChatGPT Web Proxy
-  try {
-    const proxyRes = await fetchJson(`${CHATGPT_PROXY_URL}/v1/responses`, { method: 'POST', body: '{}' });
-    // Proxy responds with status (even if unauthorized or bad payload, it proves server is up)
-    result.chatgptProxy.status = 'ready';
-  } catch (e) {
-    // If connection refused, offline
-    result.chatgptProxy.status = 'offline';
-  }
-
-  // Doctor check
-  const doc = await runCmd('codex-chatgpt-web doctor');
-  const docReady = isDoctorReady(doc.stdout);
-  result.chatgptProxy.doctor = {
-    ready: docReady,
-    output: formatDoctorReport(doc.stdout)
-  };
-  if (docReady) {
-    result.chatgptProxy.status = 'ready';
   }
 
   // Check CLI tools
@@ -1590,15 +1533,32 @@ app.post('/api/extract/worktree/:sessionId/test', async (req, res) => {
 // -------------------------------------------------------------
 // 7. Model Catalogs & Model Testing
 // -------------------------------------------------------------
+const LEGACY_AUDITOR_RESPONSE = Object.freeze({
+  ok: false,
+  code: 'LEGACY_AUDITOR_REMOVED',
+  state: 'NATIVE_AUDITOR_NOT_IMPLEMENTED',
+  message: 'Auditor Web cũ đã được gỡ. Native Codex auditor chưa được triển khai.'
+});
+
+function legacyAuditorRemoved(req, res) {
+  return res.status(410).json(LEGACY_AUDITOR_RESPONSE);
+}
+
+app.use([
+  '/api/chatgpt',
+  '/api/orchestrator/create-workorder',
+  '/api/orchestrator/audit',
+  '/api/orchestrator/audit-and-direct',
+  '/api/orchestrator/user-directive'
+], legacyAuditorRemoved);
+
 app.get('/api/models', (req, res) => {
   res.json({
     chatgpt: {
-      defaultModel: 'chatgpt-web/high',
-      models: [
-        { id: 'chatgpt-web/high', name: 'ChatGPT Web (High Reasoning) - Highest', recommended: true },
-        { id: 'chatgpt-web/medium', name: 'ChatGPT Web (Medium Reasoning)', recommended: false },
-        { id: 'chatgpt-web/light', name: 'ChatGPT Web (Light / Fast)', recommended: false }
-      ]
+      status: 'unavailable',
+      state: 'NATIVE_AUDITOR_NOT_IMPLEMENTED',
+      defaultModel: null,
+      models: []
     },
     antigravity: {
       defaultModel: 'gemini-3.8-flash-high',
@@ -1614,51 +1574,14 @@ app.get('/api/models', (req, res) => {
   });
 });
 
-// Helper to execute Codex prompt cleanly via stdin pipe and -o temp file
-function runCodexWithPrompt(targetModel, promptText, timeout = 180000) {
-  return new Promise((resolve) => {
-    const tmpFile = path.join(os.tmpdir(), `codex_out_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.txt`);
-    const child = exec(`codex exec --ephemeral --skip-git-repo-check -m ${targetModel} -o "${tmpFile}" -`, { timeout }, (error, stdout, stderr) => {
-      let finalMessage = '';
-      if (fs.existsSync(tmpFile)) {
-        try {
-          finalMessage = fs.readFileSync(tmpFile, 'utf8').trim();
-          fs.unlinkSync(tmpFile);
-        } catch (e) {}
-      }
-
-      let effectiveStdout = finalMessage || (stdout || '').trim();
-
-      // If stdout/tmpFile is empty but stderr has output, check if stderr contains assistant message
-      if (!effectiveStdout && stderr) {
-        const lines = stderr.split('\n');
-        let collected = [];
-        for (const line of lines) {
-          if (line.startsWith('codex') || line.startsWith('--------') || line.startsWith('user') || line.startsWith('OpenAI Codex') || line.startsWith('workdir:') || line.startsWith('model:') || line.startsWith('provider:') || line.startsWith('approval:') || line.startsWith('sandbox:') || line.startsWith('reasoning effort:') || line.startsWith('reasoning summaries:') || line.startsWith('session id:')) {
-            continue;
-          }
-          if (line.includes('Local tools unavailable') || line.includes('Action: Open') || line.includes('cannot access the local Codex computer') || line.includes('accumulated context does not contain')) {
-            continue;
-          }
-          collected.push(line);
-        }
-        const cleaned = collected.join('\n').trim();
-        if (cleaned) effectiveStdout = cleaned;
-      }
-
-      resolve({
-        exitCode: error && error.code !== undefined ? error.code : (error ? 1 : 0),
-        stdout: effectiveStdout,
-        stderr: (stderr || '').trim(),
-        error: error ? error.message : null
-      });
-    });
-
-    if (child.stdin) {
-      child.stdin.write(promptText + '\n');
-      child.stdin.end();
-    }
-  });
+// Temporary fail-closed stub. WP-V4-03 will replace this with the App Server transport.
+async function runCodexWithPrompt() {
+  return {
+    exitCode: 1,
+    stdout: '',
+    stderr: 'NATIVE_AUDITOR_NOT_IMPLEMENTED',
+    error: 'LEGACY_AUDITOR_REMOVED'
+  };
 }
 
 app.post('/api/models/test', async (req, res) => {
@@ -1666,18 +1589,7 @@ app.post('/api/models/test', async (req, res) => {
   const start = Date.now();
 
   if (provider === 'chatgpt') {
-    const targetModel = model || 'chatgpt-web/high';
-    const out = await runCodexWithPrompt(targetModel, 'Respond strictly with: PING_OK', 90000);
-    const duration = Date.now() - start;
-    const success = out.exitCode === 0 && (out.stdout.includes('PING_OK') || out.stdout.includes('PING\\_OK'));
-    return res.json({
-      provider: 'chatgpt',
-      model: targetModel,
-      success,
-      durationMs: duration,
-      output: out.stdout,
-      error: success ? null : (out.stderr || out.stdout)
-    });
+    return legacyAuditorRemoved(req, res);
   } else if (provider === 'antigravity') {
     const targetModel = model || 'gemini-3.8-flash-high';
     // Verify model in agy CLI catalog
@@ -1705,7 +1617,7 @@ app.post('/api/models/test', async (req, res) => {
 // -------------------------------------------------------------
 app.get('/api/chatgpt/status', async (req, res) => {
   try {
-    const configDir = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', '.codex-chatgpt-web');
+    const configDir = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', '.removed-web-auditor');
     const configFile = path.join(configDir, 'config.json');
     let configData = {};
     if (fs.existsSync(configFile)) {
@@ -1714,29 +1626,28 @@ app.get('/api/chatgpt/status', async (req, res) => {
       } catch (e) {}
     }
 
-    // Check proxy responsiveness on 127.0.0.1:17841
+    // Legacy route retained below only as unreachable compatibility code.
     let proxyStatus = 'offline';
     try {
-      await fetchJson(`${CHATGPT_PROXY_URL}/v1/responses`, { method: 'POST', body: '{}' });
-      proxyStatus = 'ready';
+      proxyStatus = 'removed';
     } catch (e) {
       proxyStatus = 'offline';
     }
 
     // Check doctor report
-    const doc = await runCmd('codex-chatgpt-web doctor');
-    const docReady = isDoctorReady(doc.stdout);
-    const cleanDoctor = formatDoctorReport(doc.stdout);
+    const doc = { stdout: '' };
+    const docReady = false;
+    const cleanDoctor = 'NATIVE_AUDITOR_NOT_IMPLEMENTED';
 
     // Check if authenticated
     const hasStorage = configData.storageStatePath && fs.existsSync(configData.storageStatePath);
     const authenticated = docReady || proxyStatus === 'ready' || hasStorage || doc.stdout.includes('Running Codex turn') || doc.stdout.includes('Responses proxy is healthy');
 
-    // Available / imported models from codex-chatgpt-web
+    // Legacy model metadata retained below only as unreachable compatibility code.
     const importedModels = [
-      { id: 'chatgpt-web/high', name: 'ChatGPT Web (High Reasoning) - Khuyên dùng', reasoning: 'high', active: true },
-      { id: 'chatgpt-web/medium', name: 'ChatGPT Web (Medium Reasoning)', reasoning: 'medium', active: false },
-      { id: 'chatgpt-web/light', name: 'ChatGPT Web (Light / Fast)', reasoning: 'low', active: false },
+      { id: 'removed-web-auditor-high', name: 'Legacy auditor removed', reasoning: 'high', active: false },
+      { id: 'removed-web-auditor-medium', name: 'Legacy auditor removed', reasoning: 'medium', active: false },
+      { id: 'removed-web-auditor-light', name: 'Legacy auditor removed', reasoning: 'low', active: false },
       { id: 'gpt-5.6-sol', name: 'GPT 5.6 Sol (Deep Audit Backend)', reasoning: 'sol', active: false },
       { id: 'gpt-5.6-luna', name: 'GPT 5.6 Luna (Extended Context)', reasoning: 'luna', active: false }
     ];
@@ -1746,9 +1657,9 @@ app.get('/api/chatgpt/status', async (req, res) => {
       status: authenticated ? 'ready' : 'needs_login',
       verified: docReady || proxyStatus === 'ready',
       accountType: 'ChatGPT Web (Authenticated)',
-      proxyUrl: CHATGPT_PROXY_URL,
+      proxyUrl: null,
       codexRouteInstalled: doc.stdout.includes('Codex native model route is installed'),
-      activeModel: 'chatgpt-web/high',
+      activeModel: null,
       models: importedModels,
       doctorReport: cleanDoctor
     });
@@ -1767,7 +1678,7 @@ app.post('/api/chatgpt/login', async (req, res) => {
     }
 
     // Run verification check
-    const out = await runCodexWithPrompt('chatgpt-web/high', 'Respond strictly with: PING_OK', 45000);
+    const out = { exitCode: 1, stdout: '', stderr: 'Legacy auditor removed' };
     const success = out.exitCode === 0 && (out.stdout.includes('PING_OK') || out.stdout.includes('PING\\_OK'));
 
     res.json({
@@ -1775,9 +1686,9 @@ app.post('/api/chatgpt/login', async (req, res) => {
       verified: success,
       message: success ? 'Đăng nhập & Verify Codex thành công!' : 'Đã mở cửa sổ đăng nhập ChatGPT Web. Vui lòng hoàn tất đăng nhập.',
       models: [
-        { id: 'chatgpt-web/high', name: 'ChatGPT Web (High Reasoning) - Khuyên dùng', active: true },
-        { id: 'chatgpt-web/medium', name: 'ChatGPT Web (Medium Reasoning)', active: false },
-        { id: 'chatgpt-web/light', name: 'ChatGPT Web (Light / Fast)', active: false },
+        { id: 'removed-web-auditor-high', name: 'Legacy auditor removed', active: false },
+        { id: 'removed-web-auditor-medium', name: 'Legacy auditor removed', active: false },
+        { id: 'removed-web-auditor-light', name: 'Legacy auditor removed', active: false },
         { id: 'gpt-5.6-sol', name: 'GPT 5.6 Sol (Deep Audit Backend)', active: false },
         { id: 'gpt-5.6-luna', name: 'GPT 5.6 Luna (Extended Context)', active: false }
       ]
@@ -1789,7 +1700,7 @@ app.post('/api/chatgpt/login', async (req, res) => {
 
 app.post('/api/chatgpt/logout', async (req, res) => {
   try {
-    const configDir = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', '.codex-chatgpt-web');
+    const configDir = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', '.removed-web-auditor');
     const storageState = path.join(configDir, 'browser', 'storage-state.json');
     const marker = path.join(configDir, 'browser', 'storage-state.verification.json');
     if (fs.existsSync(storageState)) fs.unlinkSync(storageState);
@@ -1807,24 +1718,24 @@ app.post('/api/chatgpt/logout', async (req, res) => {
 app.post('/api/chatgpt/verify', async (req, res) => {
   const start = Date.now();
   try {
-    const out = await runCodexWithPrompt('chatgpt-web/high', 'Respond strictly with: PING_OK', 90000);
+    const out = { exitCode: 1, stdout: '', stderr: 'Legacy auditor removed' };
     const duration = Date.now() - start;
     const success = out.exitCode === 0 && (out.stdout.includes('PING_OK') || out.stdout.includes('PING\\_OK'));
     
-    const doc = await runCmd('codex-chatgpt-web doctor');
-    const cleanDoctor = formatDoctorReport(doc.stdout);
+    const doc = { stdout: '' };
+    const cleanDoctor = 'NATIVE_AUDITOR_NOT_IMPLEMENTED';
 
     res.json({
       success,
       verified: success,
       durationMs: duration,
-      model: 'chatgpt-web/high',
+      model: null,
       output: out.stdout,
       doctorOutput: cleanDoctor,
       models: [
-        { id: 'chatgpt-web/high', name: 'ChatGPT Web (High Reasoning) - Khuyên dùng', active: true },
-        { id: 'chatgpt-web/medium', name: 'ChatGPT Web (Medium Reasoning)', active: false },
-        { id: 'chatgpt-web/light', name: 'ChatGPT Web (Light / Fast)', active: false },
+        { id: 'removed-web-auditor-high', name: 'Legacy auditor removed', active: false },
+        { id: 'removed-web-auditor-medium', name: 'Legacy auditor removed', active: false },
+        { id: 'removed-web-auditor-light', name: 'Legacy auditor removed', active: false },
         { id: 'gpt-5.6-sol', name: 'GPT 5.6 Sol (Deep Audit Backend)', active: false },
         { id: 'gpt-5.6-luna', name: 'GPT 5.6 Luna (Extended Context)', active: false }
       ],
@@ -1842,7 +1753,7 @@ app.post('/api/orchestrator/create-workorder', async (req, res) => {
   const { goal, model, projectId } = req.body;
   if (!goal) return res.status(400).json({ error: 'goal is required' });
 
-  const targetModel = model || 'chatgpt-web/high';
+  const targetModel = model || 'native-auditor-unavailable';
   const prompt = `You are the AI Orchestrator. The user has given this project goal:
 "${goal}"
 
@@ -1894,7 +1805,7 @@ app.post('/api/orchestrator/audit', async (req, res) => {
     return res.status(400).json({ error: 'workOrder and workerReport are required' });
   }
 
-  const targetModel = model || 'chatgpt-web/high';
+  const targetModel = model || 'native-auditor-unavailable';
   const prompt = `You are the AI Orchestrator performing a strict audit of the Antigravity Worker's implementation.
 
 WorkOrder:
@@ -1996,7 +1907,7 @@ app.post('/api/orchestrator/audit-and-direct', async (req, res) => {
     effectiveReportText = `${userPrompt.trim()}\n\n---\n${effectiveReportText}`;
   }
 
-  const targetModel = model || 'chatgpt-web/high';
+  const targetModel = model || 'native-auditor-unavailable';
 
   // 2. Gather local technical context and project structure from disk
   const localContext = getProjectLocalContext(projectId);
@@ -2143,7 +2054,7 @@ app.post('/api/orchestrator/user-directive', async (req, res) => {
   if (!projectId) return res.status(400).json({ error: 'projectId is required' });
   if (!userPrompt || !userPrompt.trim()) return res.status(400).json({ error: 'userPrompt is required' });
 
-  const targetModel = model || 'chatgpt-web/high';
+  const targetModel = model || 'native-auditor-unavailable';
   const targetAgySession = resolveAntigravitySession(antigravitySessionId, projectId);
   const baselineStepCount = getSessionStepCount(targetAgySession);
 
@@ -2617,7 +2528,7 @@ if (require.main === module) {
     console.log(`=======================================================`);
     console.log(`🚀 Pipeline Portal UI running at: http://localhost:${PORT}`);
     console.log(`- AO Daemon connected on: ${AO_BASE_URL}`);
-    console.log(`- ChatGPT Web Proxy connected on: ${CHATGPT_PROXY_URL}`);
+    console.log('- Auditor state: NATIVE_AUDITOR_NOT_IMPLEMENTED');
     console.log(`=======================================================`);
   });
 
