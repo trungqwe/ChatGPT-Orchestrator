@@ -202,7 +202,7 @@ All 11 deterministic test suites passed with exit code 0:
 8. `registry.test.js`: RG-001..RG-039: 39/39 PASS
 9. `registry-v2-migration.test.js`: RV2-001..RV2-052: 52/52 PASS
 10. `codex-app-server-client.test.js`: CAS-001..CAS-084: 84/84 PASS
-11. `audit-decision.test.js`: AD-001..AD-078: 78/78 PASS
+11. `audit-decision.test.js`: AD-001..AD-110: 110/110 PASS
 
 ---
 
@@ -235,7 +235,7 @@ All 11 deterministic test suites passed with exit code 0:
 
 `WP-V4-04` has met all quality gates, architectural invariants, and negative test requirements. The structured semantic authority contract `AuditDecisionV1` is fully verified and ready for external review.
 
-**Status**: `READY_FOR_WP_V4_04_EXTERNAL_REVIEW`
+**Status**: `READY_FOR_WP_V4_04_SEAL_EXTERNAL_REVIEW`
 
 ---
 
@@ -250,3 +250,17 @@ All 11 deterministic test suites passed with exit code 0:
   - `AD-AUTH-02`: Error diagnostics in duplicate keys, extra keys, and context mismatches echoed unvalidated model-controlled keys or actual values without finite bounds. Adapter `waitForTurnCompletion` failure attached raw turn objects.
 - **Resolution**:
   Resolved in `WO-V4-04F` via prototype-free `Object.create(null)` representation, `isPlainJsonObject` validation, centralized `MAX_ERROR_MESSAGE_BYTES = 1024`, safe field-only context diagnostics, and full test expansion (AD-001..AD-095).
+
+---
+
+### 18. External Review Final Seal (WO-V4-04G)
+
+- **Blocker Identified**:
+  - `AD-AUTH-03`: Inherited required authority field. Top-level required-field presence logic used `!hasOwnProperty.call(value, key) && !(key in value)`, which allowed required fields to be satisfied through prototype chain (e.g. `Object.prototype.blocker = null`).
+- **Resolution**:
+  - Replaced prototype chain lookups with exact own-property checking (`Object.prototype.hasOwnProperty.call(value, key)` only; no `key in value`).
+  - Introduced `inspectPlainJsonDataObject` using `Reflect.ownKeys` to detect and reject symbol properties, non-enumerable hidden properties, and accessor properties (`get`, `set`).
+  - Inspected property descriptors prior to property access, ensuring attacker-controlled getters are never executed (counter remains 0).
+  - Applied the same own-property and plain JSON data object rules to nested `work_order` and `independent_verification[i]`.
+  - Hardened `expectedContext` to plain objects with exact own data properties and no accessors.
+  - Expanded test suite to AD-001..AD-110 (110/110 PASS) with strict `Object.prototype` pollution cleanup in `finally` blocks.

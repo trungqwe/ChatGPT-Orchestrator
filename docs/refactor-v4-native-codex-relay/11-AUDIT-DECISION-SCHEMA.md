@@ -57,7 +57,11 @@ Exactly five allowed decision values. No aliases, no lowercase compatibility, no
 }
 ```
 
-All 11 top-level keys are **REQUIRED**. No omission. `additionalProperties: false` is strictly enforced.
+All 11 top-level keys are **REQUIRED OWN PROPERTIES**. No omission. Inherited replacement via the prototype chain is strictly rejected (`Object.prototype.hasOwnProperty.call(value, key)` is required; `key in value` is forbidden). `additionalProperties: false` is strictly enforced.
+
+Authority objects (top-level, `work_order`, and `independent_verification[i]`) must be plain JSON data objects (`prototype === Object.prototype || prototype === null`) inspected via `Reflect.ownKeys(...)`. Direct inputs containing symbol properties, non-enumerable properties, or accessor properties (`get`, `set`) are rejected fail-closed with `AUDIT_DECISION_SCHEMA_INVALID` without invoking getters.
+
+Trusted `expectedContext` is similarly hardened: must be a plain object (`Object.prototype` or `null` prototype) where the 4 authority fields (`project_id`, `audit_subject_id`, `auditor_thread_id`, `workspace_state_observed`) are own non-accessor string data properties.
 
 ---
 

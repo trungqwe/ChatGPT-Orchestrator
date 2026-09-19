@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * AuditDecisionV1 Test Suite (AD-001 .. AD-078)
+ * AuditDecisionV1 Test Suite (AD-001 .. AD-110)
  * Verifies strict schema validation, duplicate key detection, exact context binding,
  * branch semantics, terminal turn snapshot extraction, and fake adapter integration.
  */
@@ -75,7 +75,7 @@ function makeValidDecision(overrides = {}) {
 }
 
 async function runTests() {
-  console.log('Starting AuditDecisionV1 test suite (AD-001 .. AD-078)...');
+  console.log('Starting AuditDecisionV1 test suite (AD-001 .. AD-110)...');
 
   // =========================================================================
   // CATEGORY 1: VALID DECISIONS (AD-001 .. AD-005)
@@ -1536,8 +1536,328 @@ async function runTests() {
     console.log('PASS: AD-095 — Adapter TURN_FAILED wrapped into bounded AUDIT_DECISION_TURN_NOT_COMPLETED without raw turn leakage');
   }
 
+  // =========================================================================
+  // CATEGORY 14: OWN-PROPERTY & PLAIN-DATA AUTHORITY (AD-096 .. AD-110)
+  // =========================================================================
+
+  // AD-096: Missing own blocker under Object.prototype.blocker pollution fails
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    delete d.blocker;
+    const originalDesc = Object.getOwnPropertyDescriptor(Object.prototype, 'blocker');
+    try {
+      Object.prototype.blocker = null;
+      assert.throws(
+        () => validateAuditDecisionV1(d, ctx),
+        { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+      );
+    } finally {
+      if (originalDesc) {
+        Object.defineProperty(Object.prototype, 'blocker', originalDesc);
+      } else {
+        delete Object.prototype.blocker;
+      }
+    }
+    console.log('PASS: AD-096 — Decision missing own blocker under Object.prototype.blocker pollution rejected');
+  }
+
+  // AD-097: Missing own decision under Object.prototype.decision pollution fails
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    delete d.decision;
+    const originalDesc = Object.getOwnPropertyDescriptor(Object.prototype, 'decision');
+    try {
+      Object.prototype.decision = AUDIT_DECISIONS.STOP;
+      assert.throws(
+        () => validateAuditDecisionV1(d, ctx),
+        { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+      );
+    } finally {
+      if (originalDesc) {
+        Object.defineProperty(Object.prototype, 'decision', originalDesc);
+      } else {
+        delete Object.prototype.decision;
+      }
+    }
+    console.log('PASS: AD-097 — Decision missing own decision under Object.prototype.decision pollution rejected');
+  }
+
+  // AD-098: Missing own workspace_state_observed under Object.prototype pollution fails
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    delete d.workspace_state_observed;
+    const originalDesc = Object.getOwnPropertyDescriptor(Object.prototype, 'workspace_state_observed');
+    try {
+      Object.prototype.workspace_state_observed = ctx.workspace_state_observed;
+      assert.throws(
+        () => validateAuditDecisionV1(d, ctx),
+        { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+      );
+    } finally {
+      if (originalDesc) {
+        Object.defineProperty(Object.prototype, 'workspace_state_observed', originalDesc);
+      } else {
+        delete Object.prototype.workspace_state_observed;
+      }
+    }
+    console.log('PASS: AD-098 — Decision missing own workspace_state_observed under Object.prototype pollution rejected');
+  }
+
+  // AD-099: Expected context missing own auditor_thread_id under Object.prototype pollution fails
+  {
+    const ctx = makeContext();
+    delete ctx.auditor_thread_id;
+    const originalDesc = Object.getOwnPropertyDescriptor(Object.prototype, 'auditor_thread_id');
+    try {
+      Object.prototype.auditor_thread_id = 'thr_opaque_12345';
+      const d = makeValidDecision();
+      assert.throws(
+        () => validateAuditDecisionV1(d, ctx),
+        { code: ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH }
+      );
+    } finally {
+      if (originalDesc) {
+        Object.defineProperty(Object.prototype, 'auditor_thread_id', originalDesc);
+      } else {
+        delete Object.prototype.auditor_thread_id;
+      }
+    }
+    console.log('PASS: AD-099 — Expected context missing own auditor_thread_id under Object.prototype pollution rejected');
+  }
+
+  // AD-100: Top-level decision containing own symbol property rejected
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    d[Symbol('hidden')] = 'secret_value';
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-100 — Top-level decision containing own symbol property rejected');
+  }
+
+  // AD-101: Top-level decision containing non-enumerable hidden own property rejected
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    Object.defineProperty(d, 'hidden', {
+      value: true,
+      enumerable: false,
+      configurable: true
+    });
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-101 — Top-level decision containing non-enumerable property rejected');
+  }
+
+  // AD-102: Required decision implemented as getter rejected without getter invocation
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    let getterCounter = 0;
+    Object.defineProperty(d, 'decision', {
+      get() {
+        getterCounter++;
+        return AUDIT_DECISIONS.STOP;
+      },
+      enumerable: true,
+      configurable: true
+    });
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    assert.strictEqual(getterCounter, 0, 'Getter must not be invoked during rejection');
+    console.log('PASS: AD-102 — Required decision implemented as getter rejected without invocation');
+  }
+
+  // AD-103: work_order with inherited required field or accessor rejected
+  {
+    const ctx = makeContext();
+    // Test inherited field
+    const originalDesc = Object.getOwnPropertyDescriptor(Object.prototype, 'directive');
+    try {
+      Object.prototype.directive = 'inherited directive';
+      const d1 = makeValidDecision();
+      delete d1.work_order.directive;
+      assert.throws(
+        () => validateAuditDecisionV1(d1, ctx),
+        { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+      );
+    } finally {
+      if (originalDesc) {
+        Object.defineProperty(Object.prototype, 'directive', originalDesc);
+      } else {
+        delete Object.prototype.directive;
+      }
+    }
+
+    // Test accessor field
+    const d2 = makeValidDecision();
+    let getterCount = 0;
+    Object.defineProperty(d2.work_order, 'directive', {
+      get() {
+        getterCount++;
+        return 'directive from getter';
+      },
+      enumerable: true,
+      configurable: true
+    });
+    assert.throws(
+      () => validateAuditDecisionV1(d2, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    assert.strictEqual(getterCount, 0, 'work_order getter must not be invoked during rejection');
+    console.log('PASS: AD-103 — work_order with inherited required field or accessor rejected');
+  }
+
+  // AD-104: independent_verification[0] with inherited or accessor authority field rejected
+  {
+    const ctx = makeContext();
+    // Test inherited field
+    const originalDesc = Object.getOwnPropertyDescriptor(Object.prototype, 'evidence');
+    try {
+      Object.prototype.evidence = 'inherited evidence';
+      const d1 = makeValidDecision();
+      delete d1.independent_verification[0].evidence;
+      assert.throws(
+        () => validateAuditDecisionV1(d1, ctx),
+        { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+      );
+    } finally {
+      if (originalDesc) {
+        Object.defineProperty(Object.prototype, 'evidence', originalDesc);
+      } else {
+        delete Object.prototype.evidence;
+      }
+    }
+
+    // Test accessor field
+    const d2 = makeValidDecision();
+    let getterCount = 0;
+    Object.defineProperty(d2.independent_verification[0], 'evidence', {
+      get() {
+        getterCount++;
+        return 'evidence from getter';
+      },
+      enumerable: true,
+      configurable: true
+    });
+    assert.throws(
+      () => validateAuditDecisionV1(d2, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    assert.strictEqual(getterCount, 0, 'independent_verification getter must not be invoked');
+    console.log('PASS: AD-104 — independent_verification[0] with inherited or accessor field rejected');
+  }
+
+  // AD-105: Valid decision under unrelated Object.prototype pollution validates to same frozen authority
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const originalDesc = Object.getOwnPropertyDescriptor(Object.prototype, 'unrelatedPollution');
+    try {
+      Object.prototype.unrelatedPollution = 'polluted_value';
+      const validated = validateAuditDecisionV1(d, ctx);
+      assert.strictEqual(validated.decision, AUDIT_DECISIONS.DISPATCH_WORKER);
+      assert.strictEqual(validated.unrelatedPollution, undefined);
+      assert.strictEqual(Object.isFrozen(validated), true);
+      const proto = Object.getPrototypeOf(validated);
+      assert.ok(proto === null || proto === Object.prototype);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(validated, 'unrelatedPollution'), false);
+    } finally {
+      if (originalDesc) {
+        Object.defineProperty(Object.prototype, 'unrelatedPollution', originalDesc);
+      } else {
+        delete Object.prototype.unrelatedPollution;
+      }
+    }
+    console.log('PASS: AD-105 — Valid decision under unrelated Object.prototype pollution validates correctly');
+  }
+
+  // AD-106: Non-enumerable required top-level property rejected
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    Object.defineProperty(d, 'summary', {
+      value: 'non-enumerable summary text',
+      enumerable: false,
+      configurable: true,
+      writable: true
+    });
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-106 — Non-enumerable required top-level property rejected');
+  }
+
+  // AD-107: Symbol property on work_order rejected
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    d.work_order[Symbol('woHidden')] = 'hidden_wo';
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-107 — Symbol property on nested work_order rejected');
+  }
+
+  // AD-108: Symbol property on independent_verification item rejected
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    d.independent_verification[0][Symbol('ivHidden')] = 'hidden_iv';
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-108 — Symbol property on independent_verification item rejected');
+  }
+
+  // AD-109: Custom prototype on expectedContext rejected with AUDIT_DECISION_CONTEXT_MISMATCH
+  {
+    const baseContext = makeContext();
+    const customProtoContext = Object.create({ inheritedMeta: true });
+    Object.assign(customProtoContext, baseContext);
+    const d = makeValidDecision();
+    assert.throws(
+      () => validateAuditDecisionV1(d, customProtoContext),
+      { code: ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH }
+    );
+    console.log('PASS: AD-109 — Custom prototype on expectedContext rejected with AUDIT_DECISION_CONTEXT_MISMATCH');
+  }
+
+  // AD-110: Getter on expectedContext authority field rejected without invocation
+  {
+    const ctx = makeContext();
+    let getterCounter = 0;
+    Object.defineProperty(ctx, 'auditor_thread_id', {
+      get() {
+        getterCounter++;
+        return 'thr_from_getter';
+      },
+      enumerable: true,
+      configurable: true
+    });
+    const d = makeValidDecision();
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH }
+    );
+    assert.strictEqual(getterCounter, 0, 'Context getter must not be invoked');
+    console.log('PASS: AD-110 — Getter on expectedContext authority field rejected without invocation');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITDECISION TESTS PASSED (AD-001 .. AD-095: 95/95 PASS)');
+  console.log('ALL AUDITDECISION TESTS PASSED (AD-001 .. AD-110: 110/110 PASS)');
   console.log('======================================================================\n');
 }
 

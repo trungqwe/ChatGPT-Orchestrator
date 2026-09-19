@@ -24,3 +24,8 @@
    - Single active worker dispatch per project.
    - Corrupt state, stale workspace state, ambiguous transport results, or duplicate keys immediately fail closed.
    - Model names in configuration or output policy are logical (`worker_standard`, `worker_economy`); availability is determined by runtime discovery, never model assertion.
+
+6. **Own-Property Authority Invariant (WO-V4-04G / AD-AUTH-03)**:
+   - Inherited property ≠ JSON decision field. Required fields on top-level `AuditDecisionV1`, nested `work_order`, `independent_verification[i]`, and `expectedContext` must be exact own properties (`Object.prototype.hasOwnProperty.call(obj, key)`).
+   - Prototype-chain authority (`key in obj`) is strictly forbidden.
+   - Authority objects must be plain JSON data objects (`Object.prototype` or `null` prototype) with zero symbol properties, zero non-enumerable hidden properties, and zero accessor properties (`get`, `set`). Descriptors are inspected prior to field access to avoid invoking getters.

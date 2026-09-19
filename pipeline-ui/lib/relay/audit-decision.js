@@ -140,6 +140,68 @@ function isPlainJsonObject(val) {
 }
 
 /**
+ * Inspect a candidate JSON data object to enforce:
+ * 1. Plain object (Object.prototype or null prototype).
+ * 2. No symbol own properties (Reflect.ownKeys).
+ * 3. No accessor properties (getter or setter) — inspected via descriptors without invoking getters.
+ * 4. No non-enumerable properties.
+ *
+ * Returns an array of valid own enumerable string property names.
+ *
+ * @param {any} val
+ * @param {string} path - path for diagnostic context
+ * @returns {string[]} array of own string property names
+ */
+function inspectPlainJsonDataObject(val, path = '$') {
+  if (!isPlainJsonObject(val)) {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
+      `Value at ${path} must be a plain JSON object`,
+      { path }
+    );
+  }
+
+  const ownKeys = Reflect.ownKeys(val);
+  const stringKeys = [];
+
+  for (const key of ownKeys) {
+    if (typeof key === 'symbol') {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
+        `AuditDecision contains forbidden symbol property at ${path}`,
+        { path }
+      );
+    }
+
+    const desc = Object.getOwnPropertyDescriptor(val, key);
+    if (!desc) {
+      continue;
+    }
+
+    // AD-AUTH-03: Inspect descriptors before any access to prevent invoking getters
+    if (desc.get !== undefined || desc.set !== undefined) {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
+        `AuditDecision contains forbidden accessor property at ${path}`,
+        { path, property: key }
+      );
+    }
+
+    if (!desc.enumerable) {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
+        `AuditDecision contains forbidden non-enumerable property at ${path}`,
+        { path, property: key }
+      );
+    }
+
+    stringKeys.push(key);
+  }
+
+  return stringKeys;
+}
+
+/**
  * Recursively clone an object into a clean, prototype-free representation.
  * @param {any} obj
  * @returns {any}
@@ -462,29 +524,50 @@ function parseStrictJson(rawText, maxBytes = AUDIT_DECISION_LIMITS.MAX_RAW_JSON_
 
 /**
  * Validate that expected trusted context contains all 4 required identity fields.
+ * Enforces plain object (Object.prototype or null), own data properties, and no accessors.
  * @param {Object} expectedContext
  */
 function assertExpectedContext(expectedContext) {
-  if (!expectedContext || typeof expectedContext !== 'object' || Array.isArray(expectedContext)) {
+  if (!isPlainJsonObject(expectedContext)) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
-      'expectedContext must be a non-null object'
+      'expectedContext must be a plain object with Object.prototype or null prototype'
     );
   }
 
-  const { project_id, audit_subject_id, auditor_thread_id, workspace_state_observed } = expectedContext;
+  const requiredFields = [
+    'project_id',
+    'audit_subject_id',
+    'auditor_thread_id',
+    'workspace_state_observed'
+  ];
 
-  if (typeof project_id !== 'string' || project_id.trim().length === 0) {
-    throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH, 'expectedContext.project_id must be a non-empty string');
-  }
-  if (typeof audit_subject_id !== 'string' || audit_subject_id.trim().length === 0) {
-    throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH, 'expectedContext.audit_subject_id must be a non-empty string');
-  }
-  if (typeof auditor_thread_id !== 'string' || auditor_thread_id.trim().length === 0) {
-    throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH, 'expectedContext.auditor_thread_id must be a non-empty string');
-  }
-  if (typeof workspace_state_observed !== 'string' || workspace_state_observed.trim().length === 0) {
-    throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH, 'expectedContext.workspace_state_observed must be a non-empty string');
+  for (const field of requiredFields) {
+    if (!Object.prototype.hasOwnProperty.call(expectedContext, field)) {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
+        `expectedContext missing required own property '${field}'`,
+        { field }
+      );
+    }
+
+    const desc = Object.getOwnPropertyDescriptor(expectedContext, field);
+    if (desc && (desc.get !== undefined || desc.set !== undefined)) {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
+        `expectedContext property '${field}' cannot be an accessor`,
+        { field }
+      );
+    }
+
+    const val = expectedContext[field];
+    if (typeof val !== 'string' || val.trim().length === 0) {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
+        `expectedContext.${field} must be a non-empty string`,
+        { field }
+      );
+    }
   }
 }
 
@@ -627,17 +710,9 @@ const REQUIRED_TOP_LEVEL_KEYS_SET = new Set(REQUIRED_TOP_LEVEL_KEYS);
 function validateAuditDecisionV1(value, expectedContext) {
   assertExpectedContext(expectedContext);
 
-  // AD-AUTH-01: Must be a plain JSON object (Object.prototype or null prototype)
-  if (!isPlainJsonObject(value)) {
-    throw createAuditDecisionError(
-      ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      'AuditDecisionV1 must be a plain JSON object',
-      { path: '$' }
-    );
-  }
+  // AD-AUTH-01 & AD-AUTH-03: Plain JSON data object with own keys inventory (no symbols, no non-enumerable, no accessors)
+  const actualKeys = inspectPlainJsonDataObject(value, '$');
 
-  // Exact top-level keys check (no extra keys, all required keys present)
-  const actualKeys = Object.keys(value);
   const extraKeys = actualKeys.filter(k => !REQUIRED_TOP_LEVEL_KEYS_SET.has(k));
   if (extraKeys.length > 0) {
     // AD-AUTH-02: Bounded diagnostic, do not echo arbitrary extra key
@@ -649,7 +724,7 @@ function validateAuditDecisionV1(value, expectedContext) {
   }
 
   for (const key of REQUIRED_TOP_LEVEL_KEYS) {
-    if (!Object.prototype.hasOwnProperty.call(value, key) && !(key in value)) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
         `AuditDecisionV1 missing required top-level key '${key}'`,
@@ -751,21 +826,24 @@ function validateAuditDecisionV1(value, expectedContext) {
   const REQUIRED_IV_KEYS_SET = new Set(REQUIRED_IV_KEYS);
   for (let i = 0; i < ivCount; i++) {
     const iv = value.independent_verification[i];
-    // AD-AUTH-01: verification items must be plain JSON objects
-    if (!isPlainJsonObject(iv)) {
-      throw createAuditDecisionError(
-        ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `independent_verification[${i}] must be a plain JSON object`,
-        { index: i, path: `independent_verification[${i}]` }
-      );
-    }
-    const ivKeys = Object.keys(iv);
+    const ivPath = `independent_verification[${i}]`;
+    // AD-AUTH-01 & AD-AUTH-03: verification items must be plain JSON data objects with exact own keys
+    const ivKeys = inspectPlainJsonDataObject(iv, ivPath);
     if (ivKeys.length !== 3 || !ivKeys.every(k => REQUIRED_IV_KEYS_SET.has(k))) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
         `independent_verification[${i}] contains invalid or forbidden keys`,
-        { index: i, path: `independent_verification[${i}]` }
+        { index: i, path: ivPath }
       );
+    }
+    for (const key of REQUIRED_IV_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(iv, key)) {
+        throw createAuditDecisionError(
+          ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
+          `independent_verification[${i}] missing required key '${key}'`,
+          { index: i, path: ivPath, missing_property: key }
+        );
+      }
     }
     if (!Object.values(INDEPENDENT_VERIFICATION_KINDS).includes(iv.kind)) {
       throw createAuditDecisionError(
@@ -806,22 +884,26 @@ function validateAuditDecisionV1(value, expectedContext) {
 
   // 6. work_order
   if (value.work_order !== null) {
-    // AD-AUTH-01: work_order must be a plain JSON object
-    if (!isPlainJsonObject(value.work_order)) {
-      throw createAuditDecisionError(
-        ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        'work_order must be a plain JSON object or null',
-        { path: 'work_order' }
-      );
-    }
-    const REQUIRED_WO_KEYS = new Set(['work_order_id', 'directive', 'verification', 'worker_model_policy']);
-    const woKeys = Object.keys(value.work_order);
-    if (woKeys.length !== 4 || !woKeys.every(k => REQUIRED_WO_KEYS.has(k))) {
+    const woPath = 'work_order';
+    // AD-AUTH-01 & AD-AUTH-03: work_order must be a plain JSON data object with exact own keys
+    const woKeys = inspectPlainJsonDataObject(value.work_order, woPath);
+    const REQUIRED_WO_KEYS = ['work_order_id', 'directive', 'verification', 'worker_model_policy'];
+    const REQUIRED_WO_KEYS_SET = new Set(REQUIRED_WO_KEYS);
+    if (woKeys.length !== 4 || !woKeys.every(k => REQUIRED_WO_KEYS_SET.has(k))) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
         'work_order contains invalid or forbidden keys',
-        { path: 'work_order' }
+        { path: woPath }
       );
+    }
+    for (const key of REQUIRED_WO_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(value.work_order, key)) {
+        throw createAuditDecisionError(
+          ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
+          `work_order missing required key '${key}'`,
+          { path: woPath, missing_property: key }
+        );
+      }
     }
     const { work_order_id, directive, verification, worker_model_policy } = value.work_order;
 
@@ -1258,6 +1340,7 @@ module.exports = {
   MAX_ERROR_MESSAGE_BYTES,
   createAuditDecisionError,
   isPlainJsonObject,
+  inspectPlainJsonDataObject,
   parseStrictJson,
   buildAuditDecisionV1OutputSchema,
   parseAuditDecisionV1Text,
