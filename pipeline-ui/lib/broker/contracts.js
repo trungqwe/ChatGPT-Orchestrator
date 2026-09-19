@@ -121,6 +121,12 @@ function isAllowedLifecycleTransition(currentState, nextState) {
   return Boolean(allowed && allowed.has(nextState));
 }
 
+const _RECOGNIZED_LIFECYCLE_STATES_SET = new Set(Object.values(DISPATCH_STATES));
+
+function isRecognizedLifecycleState(state) {
+  return _RECOGNIZED_LIFECYCLE_STATES_SET.has(state);
+}
+
 /**
  * Genuinely Frozen Array Exports (Sections 18-20)
  * Exported as frozen Arrays to guarantee external immutability.
@@ -129,6 +135,7 @@ const ACTIVE_STATES = Object.freeze([..._ACTIVE_STATES_SET]);
 const TERMINAL_STATES = Object.freeze([..._TERMINAL_STATES_SET]);
 const WAITABLE_STATES = Object.freeze([..._WAITABLE_STATES_SET]);
 const RECOGNIZED_WAIT_STATES = Object.freeze([..._RECOGNIZED_WAIT_STATES_SET]);
+const RECOGNIZED_LIFECYCLE_STATES = Object.freeze([..._RECOGNIZED_LIFECYCLE_STATES_SET]);
 const MUTABLE_TRANSITION_FIELDS = Object.freeze([..._MUTABLE_TRANSITION_FIELDS_SET]);
 const RESERVED_RECORD_FIELDS = Object.freeze([..._RESERVED_RECORD_FIELDS_SET]);
 
@@ -191,12 +198,14 @@ module.exports = {
   TERMINAL_STATES,
   WAITABLE_STATES,
   RECOGNIZED_WAIT_STATES,
+  RECOGNIZED_LIFECYCLE_STATES,
   MUTABLE_TRANSITION_FIELDS,
   RESERVED_RECORD_FIELDS,
   isActiveState,
   isTerminalState,
   isWaitableState,
   isRecognizedWaitState,
+  isRecognizedLifecycleState,
   isMutableTransitionField,
   isReservedRecordField,
   isAllowedLifecycleTransition,
