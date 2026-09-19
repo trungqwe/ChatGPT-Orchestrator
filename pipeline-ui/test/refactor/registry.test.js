@@ -66,7 +66,7 @@ function makeValidProject(id, rootPath, overrides = {}) {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING REGISTRY TEST SUITE (RG-001 .. RG-039)');
+  console.log('RUNNING REGISTRY TEST SUITE (RG-001 .. RG-049)');
   console.log('======================================================================\n');
 
   // RG-001: Empty / nonexistent registry file
@@ -1427,8 +1427,370 @@ async function runAllTests() {
     }
   }
 
+  // RG-040: bindAuditorThread binds unbound project atomically
+  {
+    console.log('[RG-040] bindAuditorThread binds unbound project atomically and updates disk...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-bind');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-bind', projDir));
+
+      const bindRes = await registry.bindAuditorThread({
+        project_id: 'proj-bind',
+        thread_id: 'thread-audit-12345',
+        expected_project_root: projDir,
+        expected_model_policy: 'auditor_standard'
+      });
+
+      assert.strictEqual(bindRes.ok, true);
+      assert.strictEqual(bindRes.status, 'BOUND');
+      assert.strictEqual(bindRes.project.auditor.thread_id, 'thread-audit-12345');
+      assert.strictEqual(bindRes.project.auditor.enabled, true);
+
+      // Verify reloaded from disk
+      const reloaded = createProjectRegistry({ registryFilePath: regFile });
+      const proj = await reloaded.getProject('proj-bind');
+      assert.strictEqual(proj.auditor.thread_id, 'thread-audit-12345');
+      assert.strictEqual(proj.auditor.enabled, true);
+
+      console.log('✓ RG-040 PASSED: bindAuditorThread bound unbound project atomically.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-041: Idempotent replay returns ALREADY_BOUND_SAME_THREAD
+  {
+    console.log('[RG-041] bindAuditorThread with same thread returns ALREADY_BOUND_SAME_THREAD without rewrite...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-replay');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-replay', projDir));
+
+      await registry.bindAuditorThread({
+        project_id: 'proj-replay',
+        thread_id: 'thread-replay-1'
+      });
+
+      const replayRes = await registry.bindAuditorThread({
+        project_id: 'proj-replay',
+        thread_id: 'thread-replay-1'
+      });
+
+      assert.strictEqual(replayRes.ok, true);
+      assert.strictEqual(replayRes.status, 'ALREADY_BOUND_SAME_THREAD');
+      assert.strictEqual(replayRes.project.auditor.thread_id, 'thread-replay-1');
+      assert.strictEqual(replayRes.project.auditor.enabled, true);
+
+      console.log('✓ RG-041 PASSED: Idempotent bind returns ALREADY_BOUND_SAME_THREAD.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-042: Different thread conflict fails closed with AUDITOR_BINDING_CONFLICT
+  {
+    console.log('[RG-042] bindAuditorThread with different thread fails closed with AUDITOR_BINDING_CONFLICT...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-conflict');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-conflict', projDir));
+
+      await registry.bindAuditorThread({
+        project_id: 'proj-conflict',
+        thread_id: 'thread-first'
+      });
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-conflict',
+          thread_id: 'thread-second'
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_CONFLICT);
+
+      // Verify thread_first remains untouched
+      const proj = await registry.getProject('proj-conflict');
+      assert.strictEqual(proj.auditor.thread_id, 'thread-first');
+
+      console.log('✓ RG-042 PASSED: Conflicting thread bind rejected with AUDITOR_BINDING_CONFLICT.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-043: Disabled bound project preserves disabled state and fails closed
+  {
+    console.log('[RG-043] bindAuditorThread on disabled bound project throws AUDITOR_BOUND_DISABLED...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-disabled');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-disabled', projDir, {
+        auditor: {
+          engine: 'codex_app_server',
+          thread_id: 'thread-disabled-99',
+          cwd: projDir,
+          enabled: false,
+          model_policy: 'auditor_standard'
+        }
+      }));
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-disabled',
+          thread_id: 'thread-disabled-99'
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BOUND_DISABLED);
+
+      const proj = await registry.getProject('proj-disabled');
+      assert.strictEqual(proj.auditor.enabled, false);
+
+      console.log('✓ RG-043 PASSED: Disabled bound project preserved and throws AUDITOR_BOUND_DISABLED.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-044: Root mismatch precondition check fails closed
+  {
+    console.log('[RG-044] bindAuditorThread root mismatch fails closed with AUDITOR_BINDING_PRECONDITION_FAILED...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-root-pre');
+      const otherDir = path.join(sandbox.dir, 'other-dir');
+      fs.mkdirSync(projDir, { recursive: true });
+      fs.mkdirSync(otherDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-root-pre', projDir));
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-root-pre',
+          thread_id: 'thread-pre-1',
+          expected_project_root: otherDir
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED);
+
+      console.log('✓ RG-044 PASSED: Root mismatch rejected with AUDITOR_BINDING_PRECONDITION_FAILED.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-045: Model policy mismatch fails closed
+  {
+    console.log('[RG-045] bindAuditorThread policy mismatch fails closed with AUDITOR_BINDING_PRECONDITION_FAILED...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-pol-pre');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-pol-pre', projDir));
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-pol-pre',
+          thread_id: 'thread-pol-1',
+          expected_model_policy: 'auditor_deep'
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED);
+
+      console.log('✓ RG-045 PASSED: Model policy mismatch rejected with AUDITOR_BINDING_PRECONDITION_FAILED.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-046: Invalid thread ID variations fail closed
+  {
+    console.log('[RG-046] bindAuditorThread invalid thread ID variations fail closed with REGISTRY_SCHEMA_INVALID...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-invalid-thread');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-invalid-thread', projDir));
+
+      const invalidThreads = [
+        '',
+        '   ',
+        'thread\x00null',
+        'thread\nnewline',
+        'a'.repeat(513)
+      ];
+
+      for (const badThread of invalidThreads) {
+        let caught = null;
+        try {
+          await registry.bindAuditorThread({
+            project_id: 'proj-invalid-thread',
+            thread_id: badThread
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.ok(caught, `Expected failure for thread: ${badThread.slice(0, 10)}`);
+        assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID);
+      }
+
+      console.log('✓ RG-046 PASSED: Invalid thread IDs rejected with REGISTRY_SCHEMA_INVALID.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-047: Nonexistent project fails closed with PROJECT_NOT_FOUND
+  {
+    console.log('[RG-047] bindAuditorThread on unknown project fails closed with PROJECT_NOT_FOUND...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'nonexistent-proj',
+          thread_id: 'thread-123'
+        });
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.PROJECT_NOT_FOUND);
+
+      console.log('✓ RG-047 PASSED: Nonexistent project rejected with PROJECT_NOT_FOUND.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-048: Persistence failure during bindAuditorThread preserves unbound state
+  {
+    console.log('[RG-048] Persistence failure during bindAuditorThread preserves previous unbound state...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-persist-fail');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      let failRename = false;
+      const faultFs = {
+        ...fs,
+        renameSync: (oldP, newP) => {
+          if (failRename) {
+            throw new Error('EACCES: permission denied, rename');
+          }
+          return fs.renameSync(oldP, newP);
+        }
+      };
+
+      const registry = createProjectRegistry({ registryFilePath: regFile, fs: faultFs });
+      await registry.putProject(makeValidProject('proj-persist-fail', projDir));
+
+      failRename = true;
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-persist-fail',
+          thread_id: 'thread-fail-persist'
+        });
+      } catch (err) {
+        caught = err;
+      }
+      failRename = false;
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.REGISTRY_PERSIST_FAILED);
+
+      // In-memory state remains unbound
+      const proj = await registry.getProject('proj-persist-fail');
+      assert.strictEqual(proj.auditor.thread_id, null);
+      assert.strictEqual(proj.auditor.enabled, false);
+
+      console.log('✓ RG-048 PASSED: Persistence failure leaves project unbound.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-049: Concurrent bind calls serialize cleanly without race
+  {
+    console.log('[RG-049] Concurrent bindAuditorThread calls serialize cleanly without race...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-conc');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-conc', projDir));
+
+      // Call bind concurrently with same thread
+      const p1 = registry.bindAuditorThread({ project_id: 'proj-conc', thread_id: 'thread-conc-1' });
+      const p2 = registry.bindAuditorThread({ project_id: 'proj-conc', thread_id: 'thread-conc-1' });
+
+      const [res1, res2] = await Promise.all([p1, p2]);
+      assert.strictEqual(res1.ok, true);
+      assert.strictEqual(res2.ok, true);
+      assert.ok(
+        (res1.status === 'BOUND' && res2.status === 'ALREADY_BOUND_SAME_THREAD') ||
+        (res2.status === 'BOUND' && res1.status === 'ALREADY_BOUND_SAME_THREAD')
+      );
+
+      console.log('✓ RG-049 PASSED: Concurrent bind calls serialized cleanly.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
   console.log('======================================================================');
-  console.log('ALL REGISTRY TESTS PASSED (RG-001 .. RG-039: 39/39 PASS)');
+  console.log('ALL REGISTRY TESTS PASSED (RG-001 .. RG-049: 49/49 PASS)');
   console.log('======================================================================\n');
 }
 

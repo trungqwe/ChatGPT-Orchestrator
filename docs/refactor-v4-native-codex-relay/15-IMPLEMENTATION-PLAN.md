@@ -8,7 +8,8 @@
 | V4-03A | Transport core implemented | APPROVED / CLOSED (84 CAS tests pass; fake fixture + deterministic protocol) |
 | V4-03B | Real App Server acceptance | REAL_RUNTIME_ACCEPTED (Real binary initialize, model/list, thread/start, same-process thread/read, clean close; zero-turn resume reclassified per WO-V4-03BR) |
 | V4-04 | AuditDecisionV1 | COMPLETE / READY FOR REVIEW (78 AD tests pass, strict schema & local validation, duplicate-key rejection, turn authority, 11 deterministic suites pass) |
-| V4-05 | Thread persistence/recovery | first materialized real thread, cross-process exact resume, no pre-materialization Registry binding, restart recovery crash tests (NOT STARTED) |
+| V4-05A | Durability / Recovery Core | COMPLETE / READY FOR REVIEW (38 ARS + 10 RG + 45 ATL tests pass; SQLite fail-closed store, atomic bindAuditorThread, lazy rollout fixture, cross-process resume gate, 13 deterministic suites pass) |
+| V4-05B | Real First Audit Acceptance | Real native Codex first audit turn, real rollout materialization, real cross-process resume acceptance (NOT STARTED) |
 | V4-06 | Model resolver | catalog/fallback tests |
 | V4-07 | Audit/recover CLI | integration tests |
 | V4-08 | Generic worker boundary | Antigravity regression |

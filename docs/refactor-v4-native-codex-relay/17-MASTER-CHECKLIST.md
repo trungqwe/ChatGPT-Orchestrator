@@ -11,7 +11,8 @@
 - [x] App Server stdio transport core & semantic adapter implemented (WP-V4-03A).
 - [x] Real Native Codex accepted (WP-V4-03B: real initialize, model/list, thread/start, same-process thread/read, clean close; WP-V4-03 COMPLETE).
 - [x] AuditDecision complete (WP-V4-04: AuditDecisionV1 pure semantic contract, duplicate key rejection, exact context binding, turn items authority, 78 AD tests).
-- [ ] Thread persistence & durable cross-process recovery complete (WP-V4-05; no pre-materialization Registry binding).
+- [x] Thread persistence & durable cross-process recovery core complete (WP-V4-05A: SQLite fail-closed recovery store, atomic bindAuditorThread, lazy rollout fixture, cross-process resume gate, zero provisional Registry authority, 38 ARS + 10 RG + 45 ATL tests pass).
+- [ ] Real first audit acceptance complete (WP-V4-05B).
 - [ ] Model resolver complete (WP-V4-06).
 - [ ] One-shot và shadow proven.
 - [ ] Legacy production path removed.

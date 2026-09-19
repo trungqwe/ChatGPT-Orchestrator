@@ -5,14 +5,59 @@
  * Uses actual stdio JSONL protocol conforming to current stable Codex App Server schema.
  */
 
+const fs = require('fs');
 const readline = require('readline');
 
 const args = process.argv.slice(2);
 let scenario = 'default';
+let durabilityStateFile = null;
+let decisionFile = null;
+let decisionProjectId = null;
+let decisionSubjectId = null;
+let decisionWorkspaceState = null;
+let decisionType = null;
 
 for (const arg of args) {
   if (arg.startsWith('--scenario=')) {
     scenario = arg.slice('--scenario='.length);
+  } else if (arg.startsWith('--durability-state-file=')) {
+    durabilityStateFile = arg.slice('--durability-state-file='.length);
+  } else if (arg.startsWith('--decision-file=')) {
+    decisionFile = arg.slice('--decision-file='.length);
+  } else if (arg.startsWith('--decision-project-id=')) {
+    decisionProjectId = arg.slice('--decision-project-id='.length);
+  } else if (arg.startsWith('--decision-subject-id=')) {
+    decisionSubjectId = arg.slice('--decision-subject-id='.length);
+  } else if (arg.startsWith('--decision-workspace-state=')) {
+    decisionWorkspaceState = arg.slice('--decision-workspace-state='.length);
+  } else if (arg.startsWith('--decision-type=')) {
+    decisionType = arg.slice('--decision-type='.length);
+  }
+}
+
+function loadMaterializedThreads() {
+  if (!durabilityStateFile) return new Set();
+  try {
+    if (!fs.existsSync(durabilityStateFile)) return new Set();
+    const content = fs.readFileSync(durabilityStateFile, 'utf8');
+    const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    return new Set(lines);
+  } catch (err) {
+    logDiag(`Failed to read durability state file: ${err.message}`);
+    return new Set();
+  }
+}
+
+function markThreadMaterialized(threadId) {
+  if (!durabilityStateFile || !threadId) return;
+  try {
+    const set = loadMaterializedThreads();
+    if (!set.has(threadId)) {
+      fs.appendFileSync(durabilityStateFile, `${threadId}\n`, 'utf8');
+      logDiag(`Marked thread '${threadId}' materialized in durability state file`);
+    }
+  } catch (err) {
+    logDiag(`Failed to append to durability state file: ${err.message}`);
   }
 }
 
@@ -275,6 +320,21 @@ rl.on('line', (line) => {
         return;
       }
 
+      if (durabilityStateFile) {
+        const materialized = loadMaterializedThreads();
+        if (!materialized.has(params.threadId)) {
+          logDiag(`thread/resume rejected: thread '${params.threadId}' not yet materialized`);
+          writeLine({
+            id,
+            error: {
+              code: -32600,
+              message: `Thread ${params.threadId} not found or not yet materialized (zero-turn thread has no rollout)`
+            }
+          });
+          return;
+        }
+      }
+
       if (scenario === 'resume_thread_mismatch' || params.threadId === 'thr_resume_mismatch') {
         writeLine({
           id,
@@ -330,6 +390,11 @@ rl.on('line', (line) => {
     }
 
     case 'turn/start': {
+      // Provider materialization on first accepted turn/start (lazy rollout emulation)
+      if (durabilityStateFile && params.threadId) {
+        markThreadMaterialized(params.threadId);
+      }
+
       let turnId = 'turn_fake_001';
       let targetTurnId = 'turn_fake_001';
       let turnStatus = 'completed';
@@ -399,30 +464,36 @@ rl.on('line', (line) => {
         if (scenario === 'audit_decision') {
           completedParams.threadId = params.threadId || 'thr_fake_001';
           completedParams.turn.itemsView = 'full';
-          const decisionPayload = {
-            schema_version: 1,
-            decision: 'DISPATCH_WORKER',
-            project_id: 'test-project-01',
-            audit_subject_id: 'subj-001',
-            auditor_thread_id: params.threadId || 'thr_fake_001',
-            workspace_state_observed: 'ws-state-001',
-            summary: 'Fake decision summary for integration testing',
-            independent_verification: [
-              {
-                kind: 'SOURCE_INSPECTION',
-                result: 'PASS',
-                evidence: 'Inspected fake source'
-              }
-            ],
-            work_order: {
-              work_order_id: 'wo-fake-01',
-              directive: 'Execute worker implementation',
-              verification: ['Run tests'],
-              worker_model_policy: 'worker_standard'
-            },
-            requested_evidence: [],
-            blocker: null
-          };
+          let decisionPayload;
+          if (decisionFile && fs.existsSync(decisionFile)) {
+            decisionPayload = JSON.parse(fs.readFileSync(decisionFile, 'utf8'));
+          } else {
+            const decType = decisionType || 'DISPATCH_WORKER';
+            decisionPayload = {
+              schema_version: 1,
+              decision: decType,
+              project_id: decisionProjectId || 'test-project-01',
+              audit_subject_id: decisionSubjectId || 'subj-001',
+              auditor_thread_id: params.threadId || 'thr_fake_001',
+              workspace_state_observed: decisionWorkspaceState || 'ws-state-001',
+              summary: 'Fake decision summary for integration testing',
+              independent_verification: [
+                {
+                  kind: 'SOURCE_INSPECTION',
+                  result: 'PASS',
+                  evidence: 'Inspected fake source'
+                }
+              ],
+              work_order: decType === 'DISPATCH_WORKER' ? {
+                work_order_id: 'wo-fake-01',
+                directive: 'Execute worker implementation',
+                verification: ['Run tests'],
+                worker_model_policy: 'worker_standard'
+              } : null,
+              requested_evidence: [],
+              blocker: null
+            };
+          }
           completedParams.turn.items = [
             {
               type: 'agentMessage',

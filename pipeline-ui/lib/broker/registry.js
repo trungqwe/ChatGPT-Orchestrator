@@ -23,6 +23,9 @@ const REGISTRY_ERROR_CODES = Object.freeze({
   REGISTRY_MIGRATION_VERIFY_FAILED: 'REGISTRY_MIGRATION_VERIFY_FAILED',
   REGISTRY_MIGRATION_ROLLBACK_FAILED: 'REGISTRY_MIGRATION_ROLLBACK_FAILED',
   AUDITOR_CWD_MISMATCH: 'AUDITOR_CWD_MISMATCH',
+  AUDITOR_BINDING_CONFLICT: 'AUDITOR_BINDING_CONFLICT',
+  AUDITOR_BINDING_PRECONDITION_FAILED: 'AUDITOR_BINDING_PRECONDITION_FAILED',
+  AUDITOR_BOUND_DISABLED: 'AUDITOR_BOUND_DISABLED',
   INVALID_REQUEST: 'INVALID_REQUEST'
 });
 
@@ -896,6 +899,149 @@ function createProjectRegistry(options = {}) {
   }
 
   /**
+   * bindAuditorThread(input) (WO-V4-05A)
+   * Dedicated atomic API to bind an auditor thread to a project.
+   * Runs sequentially inside serializeMutation.
+   *
+   * Input:
+   *   - project_id: string (required)
+   *   - thread_id: string (required)
+   *   - expected_project_root: string (optional)
+   *   - expected_model_policy: string (optional)
+   */
+  async function bindAuditorThread(input) {
+    return serializeMutation(async () => {
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.INVALID_REQUEST,
+          'bindAuditorThread requires an input object'
+        );
+      }
+
+      const { project_id, thread_id, expected_project_root, expected_model_policy } = input;
+
+      if (typeof project_id !== 'string' || !project_id.trim() || !PROJECT_ID_REGEX.test(project_id.trim())) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.PROJECT_NOT_FOUND,
+          `Invalid or missing project_id: '${project_id}'`
+        );
+      }
+
+      const id = project_id.trim();
+      const existingProject = inMemoryData.projects[id];
+      if (!existingProject) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.PROJECT_NOT_FOUND,
+          `Project '${id}' not found in registry`
+        );
+      }
+
+      // Thread ID bounds and character validation
+      if (
+        typeof thread_id !== 'string' ||
+        !thread_id.trim() ||
+        Buffer.byteLength(thread_id, 'utf8') > 512 ||
+        /[\x00-\x1f\x7f]/.test(thread_id)
+      ) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
+          'thread_id must be a non-empty string <= 512 bytes without control characters'
+        );
+      }
+
+      // Optional expected_project_root verification
+      if (expected_project_root !== undefined && expected_project_root !== null) {
+        if (typeof expected_project_root !== 'string' || !expected_project_root.trim()) {
+          throw new RegistryError(
+            REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+            'expected_project_root must be a non-empty string if provided'
+          );
+        }
+        const expectedIdentity = computeRootIdentityKey(expected_project_root);
+        const existingIdentity = computeRootIdentityKey(existingProject.project_root);
+        if (expectedIdentity !== existingIdentity) {
+          throw new RegistryError(
+            REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+            `expected_project_root '${expected_project_root}' does not match registered root '${existingProject.project_root}'`
+          );
+        }
+      }
+
+      // Optional expected_model_policy verification
+      if (expected_model_policy !== undefined && expected_model_policy !== null) {
+        if (existingProject.auditor.model_policy !== expected_model_policy) {
+          throw new RegistryError(
+            REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+            `expected_model_policy '${expected_model_policy}' does not match registered policy '${existingProject.auditor.model_policy}'`
+          );
+        }
+      }
+
+      const currentAuditor = existingProject.auditor;
+
+      // Idempotency / conflict check
+      if (currentAuditor.thread_id === thread_id) {
+        if (currentAuditor.enabled === true) {
+          // Already bound to same thread and enabled: idempotent success without rewriting
+          return {
+            ok: true,
+            status: 'ALREADY_BOUND_SAME_THREAD',
+            project: structuredClone(existingProject)
+          };
+        } else {
+          // Bound to same thread but disabled: preserve disabled state, fail-closed
+          throw new RegistryError(
+            REGISTRY_ERROR_CODES.AUDITOR_BOUND_DISABLED,
+            `Auditor thread '${thread_id}' is already bound to project '${id}' but is disabled`
+          );
+        }
+      }
+
+      // If already bound to a DIFFERENT thread
+      if (currentAuditor.thread_id !== null) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_CONFLICT,
+          `Auditor is already bound to thread '${currentAuditor.thread_id}'; conflict with '${thread_id}'`
+        );
+      }
+
+      // Unbound state: thread_id is null.
+      // Construct updated project candidate
+      const updatedProject = {
+        ...existingProject,
+        auditor: {
+          ...currentAuditor,
+          thread_id: thread_id,
+          enabled: true
+        }
+      };
+
+      // Validate candidate record structurally
+      const validated = validateProjectRecord(updatedProject);
+
+      const nextProjects = {
+        ...inMemoryData.projects,
+        [id]: validated
+      };
+
+      const nextRegistry = {
+        schema_version: 2,
+        projects: nextProjects
+      };
+
+      // Atomic persistence
+      persistToDisk(nextRegistry);
+      inMemoryData = nextRegistry;
+
+      return {
+        ok: true,
+        status: 'BOUND',
+        project: structuredClone(validated)
+      };
+    });
+  }
+
+  /**
    * removeProject(projectId)
    * Removes project mapping by explicit ID.
    * Throws PROJECT_NOT_FOUND if unknown.
@@ -1054,6 +1200,7 @@ function createProjectRegistry(options = {}) {
     getProject,
     listProjects,
     putProject,
+    bindAuditorThread,
     removeProject,
     validate,
     previewLegacyImport

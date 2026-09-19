@@ -93,3 +93,47 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 66. **AD-AUTH-14** (Nested Symbol Rejection): Ký hiệu symbol trên `work_order` hoặc item `independent_verification` bị từ chối với `AUDIT_DECISION_SCHEMA_INVALID` (AD-107, AD-108).
 67. **AD-AUTH-15** (Custom Prototype ExpectedContext): ExpectedContext có custom prototype bị từ chối với `AUDIT_DECISION_CONTEXT_MISMATCH` (AD-109).
 68. **AD-AUTH-16** (Accessor on ExpectedContext): Thuộc tính định danh trong ExpectedContext được khai báo dạng getter bị từ chối với `AUDIT_DECISION_CONTEXT_MISMATCH` mà không kích hoạt getter (AD-110).
+
+## Auditor Recovery Store Negative Matrix (WP-V4-05A: ARS-001..ARS-038)
+
+69. **ARS-ISOL-01** (Single Active Bootstrap Per Project): Cố tình tạo bootstrap thứ hai cho cùng `project_id` bị từ chối với `AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT` (ARS-003).
+70. **ARS-ISOL-02** (Duplicate Operation ID Across Projects): Trùng `operation_id` giữa hai dự án bị SQLite unique constraint từ chối với `AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT` (ARS-005).
+71. **ARS-BOUND-01** (Thread / Operation ID Bounds): Thread ID hoặc Operation ID rỗng, chứa ký tự điều khiển, chứa whitespace đầu/cuối, hoặc vượt quá 512 bytes bị từ chối với `AUDITOR_RECOVERY_INVALID_REQUEST` (ARS-006, ARS-007).
+72. **ARS-TRANS-01** (Illegal State Transitions): Nhảy cóc trạng thái (ví dụ `PROVISIONAL_THREAD` $\to$ `DECISION_VALIDATED` hoặc `DURABLE_BOUND`) bị từ chối với `AUDITOR_RECOVERY_TRANSITION_INVALID` (ARS-010).
+73. **ARS-TRANS-02** (Operation ID Mismatch in Transition): Chuyển trạng thái với `operation_id` khác với bản ghi active bootstrap bị từ chối với `AUDITOR_RECOVERY_OPERATION_MISMATCH` (ARS-011).
+74. **ARS-TRANS-03** (Transition Unknown Project): Chuyển trạng thái trên dự án không có bootstrap nào bị từ chối với `AUDITOR_RECOVERY_NOT_FOUND` (ARS-012).
+75. **ARS-AUTH-01** (Context Mismatched Decision Storage): Lưu `decision_json` có ngữ cảnh lệch với `project_id`, `audit_subject_id`, `auditor_thread_id`, hoặc `workspace_state_observed` bị từ chối tại cửa ngõ transition với `AUDITOR_RECOVERY_INVALID_REQUEST` (ARS-014).
+76. **ARS-AUTH-02** (SHA-256 Mismatched Decision Storage): Hash SHA-256 cung cấp không khớp với hash tính toán trên chuỗi byte `decision_json` bị từ chối với `AUDITOR_RECOVERY_INVALID_REQUEST` (ARS-015).
+77. **ARS-REOPEN-01** (Corrupt Persisted Decision Hash): Reopen DB mà hash trong bản ghi khác với hash thực của chuỗi byte JSON lập tức fail-closed với `AUDITOR_RECOVERY_CORRUPT` (ARS-021).
+78. **ARS-REOPEN-02** (Corrupt Persisted Decision JSON): Reopen DB mà `decision_json` bị hỏng cấu trúc JSON hoặc vi phạm schema lập tức fail-closed với `AUDITOR_RECOVERY_CORRUPT` (ARS-022).
+79. **ARS-REOPEN-03** (Unrecognized / Illegal Persisted State): Reopen DB mà cột `state` chứa giá trị lạ không nằm trong enum hợp lệ lập tức fail-closed với `AUDITOR_RECOVERY_CORRUPT` (ARS-023).
+80. **ARS-REOPEN-04** (History Disagreement With Active Bootstrap): Reopen DB mà trạng thái của active bootstrap không khớp với bản ghi history mới nhất fail-closed với `AUDITOR_RECOVERY_CORRUPT` (ARS-024).
+81. **ARS-SCHEMA-01** (Unsupported User Version): `PRAGMA user_version` khác 1 bị từ chối với `AUDITOR_RECOVERY_SCHEMA_MISMATCH` (ARS-025).
+82. **ARS-SCHEMA-02** (Zero User Version on Existing Tables): DB có bảng nhưng version = 0 bị từ chối với `AUDITOR_RECOVERY_CORRUPT` (ARS-026).
+83. **ARS-SCHEMA-03** (Missing Table or Column): Thiếu bảng hoặc cột bắt buộc bị từ chối với `AUDITOR_RECOVERY_SCHEMA_MISMATCH` (ARS-027).
+84. **ARS-BOUNDS-01** (Decision Payload Size Limit): Chuỗi JSON quyết định vượt quá 128 KiB (131,072 bytes) bị từ chối với `AUDITOR_RECOVERY_INVALID_REQUEST` (ARS-035).
+85. **ARS-UNCERTAIN-01** (Trap State Immutability): Không cho phép bất kỳ phép chuyển trạng thái nào thoát ra khỏi `AUDIT_UNCERTAIN` (ARS-034).
+
+## Auditor Thread Lifecycle Negative Matrix (WP-V4-05A: ATL-001..ATL-045)
+
+86. **ATL-PRE-01** (Missing Project in Registry): Bootstrap dự án chưa đăng ký trong Registry v2 ném lỗi `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (ATL-002).
+87. **ATL-PRE-02** (Already Bound and Enabled Project): Bootstrap dự án đã có `thread_id != null` và `enabled: true` ném lỗi `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (ATL-003).
+88. **ATL-PRE-03** (Bound But Disabled Project): Dự án có `thread_id != null` nhưng `enabled: false` ném lỗi `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (ATL-004).
+89. **ATL-PRE-04** (Active Bootstrap In Flight): Gọi bootstrap khi dự án đang có active bootstrap khác ném lỗi `AUDITOR_LIFECYCLE_BOOTSTRAP_IN_PROGRESS` (ATL-005, ATL-028).
+90. **ATL-START-01** (Thread Start Failure): Client 1 `startThread()` thất bại ném lỗi mà không tạo bất kỳ bản ghi bootstrap nào trong recovery DB (ATL-007).
+91. **ATL-TURN-01** (Turn Start Failure Uncertainty): `startTurn()` thất bại hoặc văng lỗi đưa trạng thái vòng đời vào `AUDIT_UNCERTAIN`, bảo đảm không tự resend (ATL-008).
+92. **ATL-VALID-01** (Decision Validation Failure Uncertainty): Turn trả về quyết định sai ngữ cảnh hoặc sai schema đưa trạng thái vòng đời vào `AUDIT_UNCERTAIN` (ATL-009).
+93. **ATL-RESUME-01** (Second Process Resume Failure Gate): Client 2 `resumeThread()` thất bại (do unmaterialized hoặc provider crash) dừng ngay vòng đời, tuyệt đối không gọi `registry.bindAuditorThread` (ATL-010).
+94. **ATL-RESUME-02** (Cross-Process Thread ID Mismatch): Client 2 trả về `threadId` khác với client 1 dừng ngay vòng đời trước khi bind Registry (ATL-011).
+95. **ATL-BIND-01** (Registry Binding Conflict): Registry ném `AUDITOR_BINDING_CONFLICT` dừng ngay vòng đời và báo lỗi (ATL-012).
+96. **ATL-ISOL-01** (Provisional Registry Isolation): Qua các bước 1..4 (provisional, starting, in-flight, validated), Registry v2 luôn được chứng minh giữ nguyên `thread_id: null` và `enabled: false` (ATL-014).
+97. **ATL-REC-01** (Provisional Recovery Cleans Store): Phục hồi từ `PROVISIONAL_THREAD` xóa sạch active record và giữ Registry unbound (ATL-016).
+98. **ATL-REC-02** (In-Flight Recovery Preserves Uncertainty): Phục hồi từ `FIRST_TURN_STARTING` hoặc `FIRST_TURN_IN_FLIGHT` chuyển/giữ nguyên `AUDIT_UNCERTAIN` và cấm tuyệt đối auto-resend (ATL-017, ATL-018, ATL-019).
+
+## Atomic Registry Binding Negative Matrix (WP-V4-05A: RG-040..RG-049)
+
+99. **RG-BIND-01** (Unknown Project Binding): `bindAuditorThread` trên projectId không tồn tại ném `AUDITOR_BINDING_PRECONDITION_FAILED` (RG-041).
+100. **RG-BIND-02** (Invalid Thread ID Formats): Thread ID rỗng, chứa newline, spaces, hoặc vượt quá 512 bytes ném `AUDITOR_BINDING_PRECONDITION_FAILED` (RG-042, RG-043, RG-044).
+101. **RG-BIND-03** (Conflicting Thread ID Rejection): Dự án đã bind thread `th-existing` cố bind thread `th-different` ném lỗi `AUDITOR_BINDING_CONFLICT` mà không ghi đè Registry (RG-045).
+102. **RG-BIND-04** (Disabled-Bound State Preservation): Gọi `bindAuditorThread` với cùng thread ID trên project đang `enabled: false` giữ nguyên `enabled: false` (RG-047).
+103. **RG-BIND-05** (Atomic Rename Resilience & Write-Lock): `bindAuditorThread` chạy trong hàng đợi `serializeMutation()`, đảm bảo an toàn đồng thời tuyệt đối giữa các tiến trình/luồng (RG-049).
