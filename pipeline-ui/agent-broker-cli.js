@@ -6,6 +6,7 @@ const os = require('os');
 
 const { LIMITS } = require('./lib/broker/contracts');
 const { createBrokerRuntime } = require('./lib/broker/runtime');
+const { sameFileIdentity } = require('./lib/broker/workspace-state');
 
 const DEFAULT_REQUESTS_DIR = path.join(os.homedir(), '.orchestrator', 'requests');
 const MAX_REQUEST_FILE_BYTES = LIMITS.MAX_DIRECTIVE_BYTES + 256 * 1024; // 2 MiB + 256 KiB
@@ -338,8 +339,9 @@ function readAndValidateRequestFile(requestFilePath, options = {}) {
     }
   }
 
-  // 5. Safe open and identity verification (Section 28, 61)
-  const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  // 5. Safe open and identity verification (Section 28, 61 / CLIAUTH-04, CLIAUTH-05, CLIAUTH-06)
+  const constants = (fsModule && fsModule.constants) || fs.constants || {};
+  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW || 0);
   let fd;
   try {
     fd = fsModule.openSync(canonicalFilePath, openFlags);
@@ -354,53 +356,96 @@ function readAndValidateRequestFile(requestFilePath, options = {}) {
 
   let fileBytes;
   try {
-    const fstat = fsModule.fstatSync(fd);
-    let statPost;
+    let fdStat;
     try {
-      statPost = fsModule.lstatSync(canonicalFilePath);
-    } catch {
-      statPost = null;
-    }
-
-    // Verify opened fd matches pre-stat and post-stat identity
-    let identityMatch = true;
-    if (!fstat.isFile() || (statPost && statPost.isSymbolicLink())) {
-      identityMatch = false;
-    }
-
-    if (fstat.ino && statPre.ino && statPost && statPost.ino) {
-      if (fstat.dev !== statPre.dev || fstat.ino !== statPre.ino) identityMatch = false;
-      if (fstat.dev !== statPost.dev || fstat.ino !== statPost.ino) identityMatch = false;
-    }
-
-    if (statPre.identityTag || fstat.identityTag || (statPost && statPost.identityTag)) {
-      if (fstat.identityTag !== statPre.identityTag || fstat.identityTag !== statPost.identityTag) {
-        identityMatch = false;
-      }
-    }
-
-    if (!identityMatch) {
+      fdStat = fsModule.fstatSync(fd);
+    } catch (err) {
       return {
         ok: false,
         code: 'INVALID_REQUEST',
-        error: 'Request file identity swap race detected',
+        error: `Cannot fstat opened request file: ${err.message}`,
         deleteFile: false
       };
     }
 
-    // 6. Request file size bound (Section 30, 58)
-    if (fstat.size > MAX_REQUEST_FILE_BYTES) {
+    let postStat;
+    try {
+      postStat = fsModule.lstatSync(canonicalFilePath);
+    } catch (err) {
+      // CLIAUTH-04: If post-open lstat fails, FAIL CLOSED before reading
       return {
         ok: false,
-        code: 'PAYLOAD_TOO_LARGE',
-        error: `Request file size (${fstat.size} bytes) exceeds maximum limit (${MAX_REQUEST_FILE_BYTES} bytes)`,
-        deleteFile: true,
-        filePathToDelete: canonicalFilePath
+        code: 'INVALID_REQUEST',
+        error: `Cannot post-stat request file pathname: ${err.message}`,
+        deleteFile: false
       };
     }
 
-    fileBytes = Buffer.alloc(fstat.size);
-    fsModule.readSync(fd, fileBytes, 0, fstat.size, 0);
+    // Section 18: Require preStat.isFile(), fdStat.isFile(), postStat.isFile() all true
+    if (
+      !statPre || typeof statPre.isFile !== 'function' || !statPre.isFile() ||
+      !fdStat || typeof fdStat.isFile !== 'function' || !fdStat.isFile() ||
+      !postStat || typeof postStat.isFile !== 'function' || !postStat.isFile()
+    ) {
+      return {
+        ok: false,
+        code: 'INVALID_REQUEST',
+        error: 'Request file must be a regular file across pre, fd, and post stat checks',
+        deleteFile: false
+      };
+    }
+
+    // CLIAUTH-05: Exact identity proof cannot be optional or skipped
+    if (!sameFileIdentity(statPre, fdStat) || !sameFileIdentity(fdStat, postStat)) {
+      return {
+        ok: false,
+        code: 'INVALID_REQUEST',
+        error: 'Request file descriptor identity does not match pathname identity (pre/fd/post identity mismatch)',
+        deleteFile: false
+      };
+    }
+
+    // Section 24: File size bound before allocation
+    if (typeof fdStat.size !== 'number' || !Number.isSafeInteger(fdStat.size) || fdStat.size < 0) {
+      return {
+        ok: false,
+        code: 'INVALID_REQUEST',
+        error: 'Invalid request file size',
+        deleteFile: false
+      };
+    }
+
+    if (fdStat.size > MAX_REQUEST_FILE_BYTES) {
+      return {
+        ok: false,
+        code: 'PAYLOAD_TOO_LARGE',
+        error: `Request file size (${fdStat.size} bytes) exceeds maximum limit (${MAX_REQUEST_FILE_BYTES} bytes)`,
+        deleteFile: false
+      };
+    }
+
+    // CLIAUTH-06: Complete fd read loop
+    fileBytes = Buffer.alloc(fdStat.size);
+    let totalBytesRead = 0;
+    while (totalBytesRead < fdStat.size) {
+      const bytesToRead = fdStat.size - totalBytesRead;
+      const bytesRead = fsModule.readSync(
+        fd,
+        fileBytes,
+        totalBytesRead,
+        bytesToRead,
+        null
+      );
+      if (typeof bytesRead !== 'number' || bytesRead <= 0) {
+        return {
+          ok: false,
+          code: 'INVALID_REQUEST',
+          error: `Premature EOF: expected ${fdStat.size} bytes but only read ${totalBytesRead} bytes`,
+          deleteFile: false
+        };
+      }
+      totalBytesRead += bytesRead;
+    }
   } finally {
     try {
       fsModule.closeSync(fd);

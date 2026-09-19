@@ -19,8 +19,10 @@ const { createBroker } = require('./broker');
  * Supports dependency injection for testing while enforcing durable defaults in production.
  */
 function createBrokerRuntime(options = {}) {
+  const registryFilePath = options.registryPath || options.registryFilePath;
   const registryPort = options.registryPort || createProjectRegistry({
-    registryPath: options.registryPath
+    registryFilePath,
+    fs: options.registryFs || options.fs
   });
 
   const workspacePort = options.workspacePort || createWorkspaceStatePort(

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Agent Broker Semantic CLI Test Suite (CLI-001 .. CLI-040)
+ * Agent Broker Semantic CLI Test Suite (CLI-001 .. CLI-050)
  *
  * Validates the thin semantic command-line surface:
  *   snapshot, worker-status, worker-dispatch, worker-wait
@@ -73,7 +73,7 @@ async function createTestEnv(name) {
   const requestsDir = path.join(envDir, 'requests');
   fs.mkdirSync(requestsDir, { recursive: true });
 
-  const registryPort = createProjectRegistry({ registryPath });
+  const registryPort = createProjectRegistry({ registryFilePath: registryPath });
   await registryPort.putProject({
     project_id: 'test-project',
     project_name: 'Test Project',
@@ -96,6 +96,18 @@ async function createTestEnv(name) {
       require_workspace_state: true
     }
   });
+
+  // CLIAUTH-02 / Section 9: Prove temp registry physically exists on disk and contains fixture
+  assert.strictEqual(
+    fs.existsSync(registryPath),
+    true,
+    `Fixture registry must physically exist on disk at ${registryPath}`
+  );
+  const persistedDoc = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+  assert.ok(
+    persistedDoc.projects && persistedDoc.projects['test-project'],
+    `Fixture registry must contain project 'test-project'`
+  );
 
   return {
     envDir,
@@ -186,7 +198,7 @@ async function executeCli(argv, options = {}) {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING AGENT BROKER SEMANTIC CLI TEST SUITE (CLI-001 .. CLI-040)');
+  console.log('RUNNING AGENT BROKER SEMANTIC CLI TEST SUITE (CLI-001 .. CLI-050)');
   console.log('======================================================================\n');
 
   // ------------------------------------------------------------------
@@ -626,18 +638,21 @@ async function runAllTests() {
       fstatSync(fd) {
         fstatCall++;
         const s = realFs.fstatSync(fd);
-        // Inject mismatched identity tag
+        // Inject mismatched identity (file B opened)
         return {
           ...s,
-          identityTag: 'file-B-identity',
+          dev: 1,
+          ino: 22222,
           isFile: () => true
         };
       },
       lstatSync(p) {
         const s = realFs.lstatSync(p);
+        // Inject mismatched identity (file A pathname)
         return {
           ...s,
-          identityTag: 'file-A-identity',
+          dev: 1,
+          ino: 11111,
           isFile: () => true,
           isSymbolicLink: () => false
         };
@@ -1651,8 +1666,479 @@ async function runAllTests() {
     console.log('✓ CLI-040 PASSED: static source verification confirms no arbitrary execution surface');
   }
 
+  // ------------------------------------------------------------------
+  // CLI-041: CUSTOM REGISTRY PATH (CLIAUTH-01 / CLIAUTH-03)
+  // ------------------------------------------------------------------
+  {
+    const envDir = getTempSubdir('cli-041');
+    const repoDir = path.join(envDir, 'repo');
+    createGitRepo(repoDir);
+
+    const customRegistryPath = path.join(envDir, 'custom-projects.json');
+    const dbPath = path.join(envDir, 'lifecycle.sqlite3');
+
+    const uniqueProjectId = `cli-runtime-isolation-${Date.now()}`;
+    const customReg = createProjectRegistry({ registryFilePath: customRegistryPath });
+    await customReg.putProject({
+      project_id: uniqueProjectId,
+      project_name: 'Custom Isolation Project',
+      project_root: repoDir,
+      worker: { engine: 'antigravity', session_id: 'sess-041', enabled: true },
+      auditor: { engine: 'codex', task_id: 'task-041', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      policy: { max_active_dispatches: 1, require_workspace_state: true }
+    });
+
+    const mockWorker = createMockWorkerPort();
+    const runtime = createBrokerRuntime({
+      registryPath: customRegistryPath,
+      dbPath,
+      workerPort: mockWorker
+    });
+
+    const projects = await runtime.registryPort.listProjects();
+    assert.strictEqual(projects.some(p => p && p.project_id === uniqueProjectId), true);
+
+    const res = await executeCli(['worker-status', '--project-id', uniqueProjectId], { runtime });
+    assert.strictEqual(res.exitCode, 0);
+    assert.strictEqual(res.response.ok, true);
+    assert.strictEqual(res.response.project_id, uniqueProjectId);
+    assert.strictEqual(res.response.worker_state, 'IDLE');
+
+    runtime.close();
+    console.log('✓ CLI-041 PASSED: custom registry path honored exactly by createBrokerRuntime');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-042: FIXTURE REGISTRY IS PHYSICALLY TEMP (CLIAUTH-02)
+  // ------------------------------------------------------------------
+  {
+    const envDir = getTempSubdir('cli-042');
+    const repoDir = path.join(envDir, 'repo');
+    createGitRepo(repoDir);
+
+    const tempRegPath = path.join(envDir, 'temp-projects.json');
+    const tempReg = createProjectRegistry({ registryFilePath: tempRegPath });
+
+    const uniqueId = `temp-fixture-proj-${Date.now()}`;
+    await tempReg.putProject({
+      project_id: uniqueId,
+      project_name: 'Temp Fixture',
+      project_root: repoDir,
+      worker: { engine: 'antigravity', session_id: 'sess-042', enabled: true },
+      auditor: { engine: 'codex', task_id: 'task-042', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      policy: { max_active_dispatches: 1, require_workspace_state: true }
+    });
+
+    assert.strictEqual(fs.existsSync(tempRegPath), true);
+    const parsed = JSON.parse(fs.readFileSync(tempRegPath, 'utf8'));
+    assert.ok(parsed.projects && parsed.projects[uniqueId]);
+
+    console.log('✓ CLI-042 PASSED: fixture registry physically exists on disk at temp path');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-043: ACTUAL PROCESS STATUS (CLIAUTH-03 / Section 14, 15)
+  // ------------------------------------------------------------------
+  {
+    const tempHome = getTempSubdir('cli-043-home');
+    const orchDir = path.join(tempHome, '.orchestrator');
+    fs.mkdirSync(orchDir, { recursive: true });
+
+    const repoDir = path.join(tempHome, 'repo');
+    createGitRepo(repoDir);
+
+    const homeRegPath = path.join(orchDir, 'projects.json');
+    const homeReg = createProjectRegistry({ registryFilePath: homeRegPath });
+    const uniqueId = `process-proj-${Date.now()}`;
+    await homeReg.putProject({
+      project_id: uniqueId,
+      project_name: 'Process Project',
+      project_root: repoDir,
+      worker: { engine: 'antigravity', session_id: 'sess-043', enabled: true },
+      auditor: { engine: 'codex', task_id: 'task-043', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      policy: { max_active_dispatches: 1, require_workspace_state: true }
+    });
+
+    const cliPath = path.resolve(__dirname, '../../agent-broker-cli.js');
+    const childRes = child_process.spawnSync(
+      process.execPath,
+      ['--no-warnings', cliPath, 'worker-status', '--project-id', uniqueId],
+      {
+        env: {
+          ...process.env,
+          HOME: tempHome,
+          USERPROFILE: tempHome
+        },
+        encoding: 'utf8'
+      }
+    );
+
+    const cleanStderr = childRes.stderr.replace(/\(node:\d+\) ExperimentalWarning:[^\n]+\n(\(Use `node --trace-warnings[^\n]+\n)?/g, '').trim();
+    assert.strictEqual(childRes.status, 0, `Process failed with stderr: ${childRes.stderr}`);
+    assert.strictEqual(cleanStderr, '');
+    const out = JSON.parse(childRes.stdout.trim());
+    assert.strictEqual(out.ok, true);
+    assert.strictEqual(out.operation, 'worker-status');
+    assert.strictEqual(out.project_id, uniqueId);
+    assert.strictEqual(out.worker_state, 'IDLE');
+
+    console.log('✓ CLI-043 PASSED: actual CLI child process worker-status returns IDLE (exit 0)');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-044: ACTUAL PROCESS UNCERTAIN WAIT (CLIAUTH-03 / Section 16)
+  // ------------------------------------------------------------------
+  {
+    const tempHome = getTempSubdir('cli-044-home');
+    const orchDir = path.join(tempHome, '.orchestrator');
+    fs.mkdirSync(orchDir, { recursive: true });
+
+    const repoDir = path.join(tempHome, 'repo');
+    createGitRepo(repoDir);
+
+    const homeRegPath = path.join(orchDir, 'projects.json');
+    const homeReg = createProjectRegistry({ registryFilePath: homeRegPath });
+    const uniqueId = `process-proj-${Date.now()}`;
+    await homeReg.putProject({
+      project_id: uniqueId,
+      project_name: 'Process Project',
+      project_root: repoDir,
+      worker: { engine: 'antigravity', session_id: 'sess-044', enabled: true },
+      auditor: { engine: 'codex', task_id: 'task-044', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      policy: { max_active_dispatches: 1, require_workspace_state: true }
+    });
+
+    const homeDbPath = path.join(orchDir, 'lifecycle.sqlite3');
+    const store = createSqliteLifecycleStore({ dbPath: homeDbPath });
+    store.beginDispatch(uniqueId, {
+      dispatch_id: 'D-CLI-044',
+      project_id: uniqueId,
+      work_order_id: 'WO-044',
+      expected_workspace_state_id: null,
+      request_fingerprint: 'fp-044',
+      directive: 'directive-044',
+      audit_metadata: null
+    });
+    store.transition('D-CLI-044', DISPATCH_STATES.DISPATCH_UNCERTAIN, {
+      error: 'transport timeout'
+    });
+    store.close();
+
+    const cliPath = path.resolve(__dirname, '../../agent-broker-cli.js');
+    const childRes = child_process.spawnSync(
+      process.execPath,
+      ['--no-warnings', cliPath, 'worker-wait', '--project-id', uniqueId, '--dispatch-id', 'D-CLI-044'],
+      {
+        env: {
+          ...process.env,
+          HOME: tempHome,
+          USERPROFILE: tempHome
+        },
+        encoding: 'utf8'
+      }
+    );
+
+    const cleanStderr = childRes.stderr.replace(/\(node:\d+\) ExperimentalWarning:[^\n]+\n(\(Use `node --trace-warnings[^\n]+\n)?/g, '').trim();
+    assert.strictEqual(childRes.status, 6, `Expected exit code 6, got ${childRes.status}. Stderr: ${childRes.stderr}`);
+    assert.strictEqual(cleanStderr, '');
+    const out = JSON.parse(childRes.stdout.trim());
+    assert.strictEqual(out.ok, false);
+    assert.strictEqual(out.code, 'DISPATCH_UNCERTAIN');
+
+    console.log('✓ CLI-044 PASSED: actual CLI child process wait against DISPATCH_UNCERTAIN exits 6');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-045: POST-LSTAT FAILURE (CLIAUTH-04 / Section 17, 32)
+  // ------------------------------------------------------------------
+  {
+    const env = await createTestEnv('cli-045');
+    const reqFile = path.join(env.requestsDir, 'req-045.json');
+    fs.writeFileSync(reqFile, JSON.stringify({
+      schema_version: 1,
+      operation: 'worker_dispatch',
+      project_id: 'test-project',
+      work_order_id: 'WO-045',
+      expected_workspace_state_id: 'sha256:dummy',
+      directive: 'post-lstat-fail'
+    }), 'utf8');
+
+    let readSyncCalls = 0;
+    let lstatCalls = 0;
+    const realFs = fs;
+    const mockFs = {
+      ...realFs,
+      lstatSync(p) {
+        lstatCalls++;
+        if (lstatCalls > 1) {
+          throw new Error('Injected post-lstat pathname disappearance (ENOENT)');
+        }
+        return realFs.lstatSync(p);
+      },
+      readSync(...args) {
+        readSyncCalls++;
+        return realFs.readSync(...args);
+      }
+    };
+
+    const mockWorker = createMockWorkerPort();
+    const res = await executeCli(['worker-dispatch', '--request-file', reqFile], {
+      registryPath: env.registryPath,
+      dbPath: env.dbPath,
+      workerPort: mockWorker,
+      requestsDir: env.requestsDir,
+      fs: mockFs
+    });
+
+    assert.strictEqual(res.exitCode, 2);
+    assert.strictEqual(res.response.ok, false);
+    assert.strictEqual(res.response.code, 'INVALID_REQUEST');
+    assert.strictEqual(readSyncCalls, 0, 'readSync MUST NOT be called when post-lstat fails');
+    assert.strictEqual(mockWorker.calls.dispatch.length, 0, 'Broker MUST NOT be called');
+
+    console.log('✓ CLI-045 PASSED: post-lstat failure fails closed before reading bytes (exit 2)');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-046: POST PATH NOT REGULAR (CLIAUTH-04 / Section 18, 33)
+  // ------------------------------------------------------------------
+  {
+    const env = await createTestEnv('cli-046');
+    const reqFile = path.join(env.requestsDir, 'req-046.json');
+    fs.writeFileSync(reqFile, JSON.stringify({
+      schema_version: 1,
+      operation: 'worker_dispatch',
+      project_id: 'test-project',
+      work_order_id: 'WO-046',
+      expected_workspace_state_id: 'sha256:dummy',
+      directive: 'post-nonregular'
+    }), 'utf8');
+
+    let readSyncCalls = 0;
+    let lstatCalls = 0;
+    const realFs = fs;
+    const mockFs = {
+      ...realFs,
+      lstatSync(p) {
+        lstatCalls++;
+        const s = realFs.lstatSync(p);
+        if (lstatCalls > 1) {
+          return {
+            ...s,
+            isFile: () => false,
+            isDirectory: () => true
+          };
+        }
+        return s;
+      },
+      readSync(...args) {
+        readSyncCalls++;
+        return realFs.readSync(...args);
+      }
+    };
+
+    const mockWorker = createMockWorkerPort();
+    const res = await executeCli(['worker-dispatch', '--request-file', reqFile], {
+      registryPath: env.registryPath,
+      dbPath: env.dbPath,
+      workerPort: mockWorker,
+      requestsDir: env.requestsDir,
+      fs: mockFs
+    });
+
+    assert.strictEqual(res.exitCode, 2);
+    assert.strictEqual(res.response.ok, false);
+    assert.strictEqual(res.response.code, 'INVALID_REQUEST');
+    assert.strictEqual(readSyncCalls, 0, 'readSync MUST NOT be called if post path is not regular');
+    assert.strictEqual(mockWorker.calls.dispatch.length, 0);
+
+    console.log('✓ CLI-046 PASSED: post path not regular fails closed before reading (exit 2)');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-047: IDENTITY UNAVAILABLE (CLIAUTH-05 / Section 19, 20, 34)
+  // ------------------------------------------------------------------
+  {
+    const env = await createTestEnv('cli-047');
+    const reqFile = path.join(env.requestsDir, 'req-047.json');
+    fs.writeFileSync(reqFile, JSON.stringify({
+      schema_version: 1,
+      operation: 'worker_dispatch',
+      project_id: 'test-project',
+      work_order_id: 'WO-047',
+      expected_workspace_state_id: 'sha256:dummy',
+      directive: 'identity-missing'
+    }), 'utf8');
+
+    let readSyncCalls = 0;
+    const realFs = fs;
+    const mockFs = {
+      ...realFs,
+      fstatSync(fd) {
+        const s = realFs.fstatSync(fd);
+        return {
+          ...s,
+          dev: s.dev,
+          ino: null,
+          isFile: () => true
+        };
+      },
+      readSync(...args) {
+        readSyncCalls++;
+        return realFs.readSync(...args);
+      }
+    };
+
+    const mockWorker = createMockWorkerPort();
+    const res = await executeCli(['worker-dispatch', '--request-file', reqFile], {
+      registryPath: env.registryPath,
+      dbPath: env.dbPath,
+      workerPort: mockWorker,
+      requestsDir: env.requestsDir,
+      fs: mockFs
+    });
+
+    assert.strictEqual(res.exitCode, 2);
+    assert.strictEqual(res.response.ok, false);
+    assert.strictEqual(res.response.code, 'INVALID_REQUEST');
+    assert.strictEqual(readSyncCalls, 0, 'readSync MUST NOT be called when identity is unavailable');
+    assert.strictEqual(mockWorker.calls.dispatch.length, 0);
+
+    console.log('✓ CLI-047 PASSED: unavailable descriptor identity fails closed without downgrade');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-048: SHORT READS COMPLETE CORRECTLY (CLIAUTH-06 / Section 22, 35)
+  // ------------------------------------------------------------------
+  {
+    const env = await createTestEnv('cli-048');
+    const snapRuntime = createBrokerRuntime({
+      registryPort: env.registryPort,
+      dbPath: env.dbPath,
+      workerPort: createMockWorkerPort()
+    });
+    const snap = await snapRuntime.broker.getWorkspaceState('test-project');
+    snapRuntime.close();
+
+    const reqFile = path.join(env.requestsDir, 'req-048.json');
+    fs.writeFileSync(reqFile, JSON.stringify({
+      schema_version: 1,
+      operation: 'worker_dispatch',
+      project_id: 'test-project',
+      work_order_id: 'WO-048',
+      expected_workspace_state_id: snap.workspace_state_id,
+      directive: 'short-read-directive'
+    }), 'utf8');
+
+    let readCount = 0;
+    const realFs = fs;
+    const mockFs = {
+      ...realFs,
+      readSync(fd, buffer, offset, length, position) {
+        readCount++;
+        const maxChunk = Math.min(16, length);
+        return realFs.readSync(fd, buffer, offset, maxChunk, position);
+      }
+    };
+
+    const mockWorker = createMockWorkerPort();
+    const res = await executeCli(['worker-dispatch', '--request-file', reqFile], {
+      registryPath: env.registryPath,
+      dbPath: env.dbPath,
+      workerPort: mockWorker,
+      requestsDir: env.requestsDir,
+      fs: mockFs
+    });
+
+    assert.strictEqual(res.exitCode, 0);
+    assert.strictEqual(res.response.ok, true);
+    assert.strictEqual(res.response.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    assert.ok(readCount > 1, `Expected multiple short read calls, got ${readCount}`);
+    assert.strictEqual(mockWorker.calls.dispatch.length, 1);
+    assert.strictEqual(mockWorker.calls.dispatch[0].directive, 'short-read-directive');
+
+    console.log(`✓ CLI-048 PASSED: short read chunks assembled completely (${readCount} reads, exit 0)`);
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-049: PREMATURE EOF (CLIAUTH-06 / Section 23, 36)
+  // ------------------------------------------------------------------
+  {
+    const env = await createTestEnv('cli-049');
+    const reqFile = path.join(env.requestsDir, 'req-049.json');
+    fs.writeFileSync(reqFile, JSON.stringify({
+      schema_version: 1,
+      operation: 'worker_dispatch',
+      project_id: 'test-project',
+      work_order_id: 'WO-049',
+      expected_workspace_state_id: 'sha256:dummy',
+      directive: 'eof-test'
+    }), 'utf8');
+
+    const realFs = fs;
+    const mockFs = {
+      ...realFs,
+      fstatSync(fd) {
+        const s = realFs.fstatSync(fd);
+        return {
+          ...s,
+          size: s.size + 1000
+        };
+      },
+      readSync(fd, buffer, offset, length, position) {
+        return realFs.readSync(fd, buffer, offset, length, position);
+      }
+    };
+
+    const mockWorker = createMockWorkerPort();
+    const res = await executeCli(['worker-dispatch', '--request-file', reqFile], {
+      registryPath: env.registryPath,
+      dbPath: env.dbPath,
+      workerPort: mockWorker,
+      requestsDir: env.requestsDir,
+      fs: mockFs
+    });
+
+    assert.strictEqual(res.exitCode, 2);
+    assert.strictEqual(res.response.ok, false);
+    assert.strictEqual(res.response.code, 'INVALID_REQUEST');
+    assert.strictEqual(mockWorker.calls.dispatch.length, 0);
+
+    console.log('✓ CLI-049 PASSED: premature EOF fails closed without parsing partial buffer (exit 2)');
+  }
+
+  // ------------------------------------------------------------------
+  // CLI-050: DEFAULT REGISTRY UNCHANGED (CLIAUTH-02 / Section 37, 43)
+  // ------------------------------------------------------------------
+  {
+    const crypto = require('crypto');
+    const defaultRegistry = path.join(os.homedir(), '.orchestrator', 'projects.json');
+    let hashBefore = null;
+    if (fs.existsSync(defaultRegistry)) {
+      hashBefore = crypto.createHash('sha256').update(fs.readFileSync(defaultRegistry)).digest('hex');
+    }
+
+    const env = await createTestEnv('cli-050');
+    const mockWorker = createMockWorkerPort();
+    const res = await executeCli(['worker-status', '--project-id', 'test-project'], {
+      registryPath: env.registryPath,
+      dbPath: env.dbPath,
+      workerPort: mockWorker
+    });
+    assert.strictEqual(res.exitCode, 0);
+
+    let hashAfter = null;
+    if (fs.existsSync(defaultRegistry)) {
+      hashAfter = crypto.createHash('sha256').update(fs.readFileSync(defaultRegistry)).digest('hex');
+    }
+
+    assert.strictEqual(hashBefore, hashAfter, 'Default registry must remain completely untouched by CLI suite');
+
+    console.log('✓ CLI-050 PASSED: default user registry unchanged by isolated CLI operations');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AGENT BROKER CLI TESTS PASSED (CLI-001 .. CLI-040: 40/40 PASS)');
+  console.log('ALL AGENT BROKER CLI TESTS PASSED (CLI-001 .. CLI-050: 50/50 PASS)');
   console.log('======================================================================');
 }
 
