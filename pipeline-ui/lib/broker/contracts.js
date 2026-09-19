@@ -89,6 +89,39 @@ function isReservedRecordField(field) {
 }
 
 /**
+ * Shared Immutable Lifecycle Transition Authority (WO-V3-006P / Section 6)
+ */
+const _ALLOWED_TRANSITIONS_MAP = Object.freeze({
+  [DISPATCH_STATES.DISPATCHING]: new Set([
+    DISPATCH_STATES.DISPATCH_ACCEPTED,
+    DISPATCH_STATES.DISPATCH_FAILED,
+    DISPATCH_STATES.DISPATCH_UNCERTAIN
+  ]),
+  [DISPATCH_STATES.DISPATCH_ACCEPTED]: new Set([
+    DISPATCH_STATES.RUNNING,
+    DISPATCH_STATES.READY_FOR_REVIEW,
+    DISPATCH_STATES.DISPATCH_FAILED,
+    DISPATCH_STATES.PROVENANCE_AMBIGUOUS
+  ]),
+  [DISPATCH_STATES.RUNNING]: new Set([
+    DISPATCH_STATES.RUNNING, // Heartbeat / progress update
+    DISPATCH_STATES.READY_FOR_REVIEW,
+    DISPATCH_STATES.DISPATCH_FAILED,
+    DISPATCH_STATES.PROVENANCE_AMBIGUOUS
+  ]),
+  // Terminal and uncertain states cannot transition to normal execution without reconciliation
+  [DISPATCH_STATES.READY_FOR_REVIEW]: new Set([]),
+  [DISPATCH_STATES.DISPATCH_FAILED]: new Set([]),
+  [DISPATCH_STATES.PROVENANCE_AMBIGUOUS]: new Set([]),
+  [DISPATCH_STATES.DISPATCH_UNCERTAIN]: new Set([])
+});
+
+function isAllowedLifecycleTransition(currentState, nextState) {
+  const allowed = _ALLOWED_TRANSITIONS_MAP[currentState];
+  return Boolean(allowed && allowed.has(nextState));
+}
+
+/**
  * Genuinely Frozen Array Exports (Sections 18-20)
  * Exported as frozen Arrays to guarantee external immutability.
  */
@@ -166,6 +199,7 @@ module.exports = {
   isRecognizedWaitState,
   isMutableTransitionField,
   isReservedRecordField,
+  isAllowedLifecycleTransition,
   ERROR_CODES,
   LIMITS,
   computeRequestFingerprint

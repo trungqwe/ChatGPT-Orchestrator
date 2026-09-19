@@ -5,6 +5,7 @@ const {
   MUTABLE_TRANSITION_FIELDS,
   isActiveState,
   isMutableTransitionField,
+  isAllowedLifecycleTransition,
   ERROR_CODES
 } = require('./contracts');
 
@@ -16,35 +17,6 @@ function safeClone(val) {
   if (val === null || val === undefined || typeof val !== 'object') return val;
   return structuredClone(val);
 }
-
-/**
- * Valid Transition Map (Section 46):
- * Enforces strict forward state-machine progression and prevents illegal resurrection.
- */
-const ALLOWED_TRANSITIONS = Object.freeze({
-  [DISPATCH_STATES.DISPATCHING]: new Set([
-    DISPATCH_STATES.DISPATCH_ACCEPTED,
-    DISPATCH_STATES.DISPATCH_FAILED,
-    DISPATCH_STATES.DISPATCH_UNCERTAIN
-  ]),
-  [DISPATCH_STATES.DISPATCH_ACCEPTED]: new Set([
-    DISPATCH_STATES.RUNNING,
-    DISPATCH_STATES.READY_FOR_REVIEW,
-    DISPATCH_STATES.DISPATCH_FAILED,
-    DISPATCH_STATES.PROVENANCE_AMBIGUOUS
-  ]),
-  [DISPATCH_STATES.RUNNING]: new Set([
-    DISPATCH_STATES.RUNNING, // Heartbeat / progress update
-    DISPATCH_STATES.READY_FOR_REVIEW,
-    DISPATCH_STATES.DISPATCH_FAILED,
-    DISPATCH_STATES.PROVENANCE_AMBIGUOUS
-  ]),
-  // Terminal and uncertain states cannot transition to normal execution without reconciliation
-  [DISPATCH_STATES.READY_FOR_REVIEW]: new Set([]),
-  [DISPATCH_STATES.DISPATCH_FAILED]: new Set([]),
-  [DISPATCH_STATES.PROVENANCE_AMBIGUOUS]: new Set([]),
-  [DISPATCH_STATES.DISPATCH_UNCERTAIN]: new Set([])
-});
 
 /**
  * Volatile / Memory-backed Lifecycle Store (Sections 16-18)
@@ -206,8 +178,7 @@ function createMemoryLifecycleStore(options = {}) {
       }
     }
 
-    const allowed = ALLOWED_TRANSITIONS[record.state];
-    if (!allowed || !allowed.has(nextState)) {
+    if (!isAllowedLifecycleTransition(record.state, nextState)) {
       return {
         ok: false,
         code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
