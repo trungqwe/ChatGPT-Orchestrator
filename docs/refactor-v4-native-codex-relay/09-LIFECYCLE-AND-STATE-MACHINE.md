@@ -19,9 +19,11 @@ Registry: UNBOUND (auditor.thread_id: null, enabled: false)
         ↓
 PROVISIONAL_UNMATERIALIZED (In-memory live session; thread/read verify exact ID)
         ↓
-   Lượt audit thực tế đầu tiên có cấu trúc (theo schema AuditDecisionV1 ở WP-V4-04)
+   Lượt audit thực tế đầu tiên có cấu trúc (theo schema AuditDecisionV1)
         ↓
-   turn/completed (Codex tự động vật chất hóa rollout file trên đĩa)
+   Codex may materialize durable history once the first meaningful user turn begins;
+   WP05 proves durability explicitly through recovery/resume and does not rely on
+   the exact filesystem-materialization event.
         ↓
    Gate kiểm định khôi phục/bền vững (restart App Server & thread/resume ở WP-V4-05)
         ↓

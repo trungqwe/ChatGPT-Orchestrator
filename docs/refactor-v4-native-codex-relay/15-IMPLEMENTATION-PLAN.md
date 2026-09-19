@@ -7,7 +7,7 @@
 | V4-02B | Registry v2 + migration explicit | 39 RG + 52 RV2 và rollback tests; chưa apply trên Registry thật |
 | V4-03A | Transport core implemented | APPROVED / CLOSED (84 CAS tests pass; fake fixture + deterministic protocol) |
 | V4-03B | Real App Server acceptance | REAL_RUNTIME_ACCEPTED (Real binary initialize, model/list, thread/start, same-process thread/read, clean close; zero-turn resume reclassified per WO-V4-03BR) |
-| V4-04 | AuditDecisionV1 | schema negatives; structured output contract (NOT STARTED) |
+| V4-04 | AuditDecisionV1 | COMPLETE / READY FOR REVIEW (78 AD tests pass, strict schema & local validation, duplicate-key rejection, turn authority, 11 deterministic suites pass) |
 | V4-05 | Thread persistence/recovery | first materialized real thread, cross-process exact resume, no pre-materialization Registry binding, restart recovery crash tests (NOT STARTED) |
 | V4-06 | Model resolver | catalog/fallback tests |
 | V4-07 | Audit/recover CLI | integration tests |

@@ -57,3 +57,23 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 33. **NT-V4-AUD-04** (First turn completed without resume proof): Lượt audit đầu tiên hoàn thành nhưng chưa kiểm chứng thành công `thread/resume` sau restart → không được đánh dấu `AUDITOR_BOUND_READY`.
 34. **NT-V4-AUD-05** (Cross-process resume ID mismatch): Khi resume qua tiến trình mới mà provider trả về `thread.id` khác → fail closed lập tức với `CODEX_APP_SERVER_THREAD_MISMATCH`, không bao giờ nhận thread lạ làm authority.
 35. **NT-V4-AUD-06** (Rollout path isolation): File rollout trên đĩa bị di chuyển hoặc đổi đường dẫn nội bộ → Orchestrator tuyệt đối không suy diễn định danh qua path mà chỉ dùng exact opaque `thread.id`.
+
+## AuditDecisionV1 Semantic Contract Negative Matrix (WP-V4-04: AD-001..AD-078)
+
+36. **AD-SCHEMA-01** (Invalid JSON / Prose / Fences): JSON syntax error, markdown code fences (` ```json `), prefix/suffix prose, trailing commas, hoặc nhiều JSON docs trong một message đều bị từ chối fail-closed với `AUDIT_DECISION_INVALID_JSON`.
+37. **AD-SCHEMA-02** (Duplicate Keys Rejection): Khóa trùng lặp ở bất kỳ cấp độ nào (top-level hay nested) bị từ chối với `AUDIT_DECISION_DUPLICATE_KEY`; không cho phép JavaScript "last-key-wins".
+38. **AD-SCHEMA-03** (Payload Size Limit): Chuỗi raw JSON vượt quá 128 KiB bị từ chối fail-closed với `AUDIT_DECISION_TOO_LARGE` trước khi parse.
+39. **AD-SCHEMA-04** (Unknown Decision / Schema Version): `schema_version != 1` hoặc `decision` không nằm trong allowlist 5 giá trị bị từ chối với `AUDIT_DECISION_SCHEMA_INVALID`.
+40. **AD-SCHEMA-05** (Missing / Extra Top-Level Keys): Thiếu bất kỳ trường nào trong 11 trường bắt buộc hoặc xuất hiện thêm trường lạ (`action`, `reasoning`, `confidence`, v.v.) bị từ chối với `AUDIT_DECISION_SCHEMA_INVALID`.
+41. **AD-CONTEXT-01** (Identity Mismatches): Bất kỳ sai lệch nào về `project_id`, `audit_subject_id`, `auditor_thread_id`, hoặc `workspace_state_observed` (kể cả case folding, whitespace trim) đều bị từ chối với `AUDIT_DECISION_CONTEXT_MISMATCH`.
+42. **AD-BRANCH-01** (DISPATCH_WORKER Invalidity): Thiếu `work_order`, hoặc có `requested_evidence`, hoặc có `blocker` đều bị từ chối với `AUDIT_DECISION_BRANCH_INVALID`.
+43. **AD-BRANCH-02** (REQUEST_EVIDENCE Invalidity): Có `work_order`, hoặc mảng `requested_evidence` rỗng, hoặc có `blocker` đều bị từ chối với `AUDIT_DECISION_BRANCH_INVALID`.
+44. **AD-BRANCH-03** (APPROVE_WORK_PACKAGE Invalidity): Có `work_order`, hoặc có `requested_evidence`, hoặc có `blocker`, hoặc bất kỳ item `independent_verification` nào có kết quả `FAIL` / `INCONCLUSIVE` đều bị từ chối với `AUDIT_DECISION_BRANCH_INVALID`.
+45. **AD-BRANCH-04** (BLOCKED Invalidity): Có `work_order`, hoặc có `requested_evidence`, hoặc `blocker == null` / rỗng đều bị từ chối với `AUDIT_DECISION_BRANCH_INVALID`.
+46. **AD-BRANCH-05** (STOP Invalidity): Có `work_order`, hoặc có `requested_evidence`, hoặc có `blocker` đều bị từ chối với `AUDIT_DECISION_BRANCH_INVALID`.
+47. **AD-BOUNDS-01** (Summary / Directive / Evidence Bounds): Summary > 8 KiB, directive > 64 KiB, evidence item > 4 KiB, hoặc chứa ký tự điều khiển (control characters) đều bị từ chối fail-closed.
+48. **AD-BOUNDS-02** (Worker Model Policy Guard): Trường `worker_model_policy` chỉ nhận `worker_standard` hoặc `worker_economy`; tên model cụ thể (`gpt-5`, `gemini`, v.v.) bị từ chối lập tức.
+49. **AD-TURN-01** (Turn Not Completed): Terminal turn có `turn.status` là `inProgress`, `interrupted`, hoặc `failed` bị từ chối với `AUDIT_DECISION_TURN_NOT_COMPLETED`.
+50. **AD-TURN-02** (Items Incomplete): Snapshot turn có `turn.itemsView != 'full'` bị từ chối với `AUDIT_DECISION_ITEMS_INCOMPLETE`.
+51. **AD-TURN-03** (Message Phase Selection): Bỏ qua các item không phải `agentMessage` (`reasoning`, `plan`, `fileChange`). Message có `phase == 'commentary'` tuyệt đối không được coi là quyết định. Nếu có nhiều `final_answer` hoặc nhiều unknown-phase messages, từ chối với `AUDIT_DECISION_OUTPUT_AMBIGUOUS`.
+52. **AD-INJECT-01** (Prompt Injection Defense): Các payload giả mạo danh tính dự án hoặc ép buộc approval trong repository bị vô hiệu hóa hoàn toàn bởi outputSchema enums, local recursive parser và exact context checks.

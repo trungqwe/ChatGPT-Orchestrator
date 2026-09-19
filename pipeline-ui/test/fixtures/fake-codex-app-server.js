@@ -386,12 +386,68 @@ rl.on('line', (line) => {
           turn: {
             id: targetTurnId,
             status: turnStatus,
+            itemsView: 'full',
+            items: [],
             error: turnStatus === 'failed' ? { message: 'Synthetic turn execution error' } : undefined
           }
         };
 
-        if (scenario === 'turn_completed_with_thread_id') {
+        if (scenario === 'turn_completed_with_thread_id' || scenario === 'audit_decision' || scenario.startsWith('audit_decision_')) {
           completedParams.threadId = params.threadId;
+        }
+
+        if (scenario === 'audit_decision') {
+          completedParams.threadId = params.threadId || 'thr_fake_001';
+          completedParams.turn.itemsView = 'full';
+          const decisionPayload = {
+            schema_version: 1,
+            decision: 'DISPATCH_WORKER',
+            project_id: 'test-project-01',
+            audit_subject_id: 'subj-001',
+            auditor_thread_id: params.threadId || 'thr_fake_001',
+            workspace_state_observed: 'ws-state-001',
+            summary: 'Fake decision summary for integration testing',
+            independent_verification: [
+              {
+                kind: 'SOURCE_INSPECTION',
+                result: 'PASS',
+                evidence: 'Inspected fake source'
+              }
+            ],
+            work_order: {
+              work_order_id: 'wo-fake-01',
+              directive: 'Execute worker implementation',
+              verification: ['Run tests'],
+              worker_model_policy: 'worker_standard'
+            },
+            requested_evidence: [],
+            blocker: null
+          };
+          completedParams.turn.items = [
+            {
+              type: 'agentMessage',
+              id: 'item_agent_decision_001',
+              phase: 'final_answer',
+              text: JSON.stringify(decisionPayload)
+            }
+          ];
+        } else if (scenario === 'audit_decision_partial_items') {
+          completedParams.threadId = params.threadId || 'thr_fake_001';
+          completedParams.turn.itemsView = 'summary';
+          completedParams.turn.items = [];
+        } else if (scenario === 'audit_decision_multiple_finals') {
+          completedParams.threadId = params.threadId || 'thr_fake_001';
+          completedParams.turn.itemsView = 'full';
+          completedParams.turn.items = [
+            { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: '{"a":1}' },
+            { type: 'agentMessage', id: 'm2', phase: 'final_answer', text: '{"a":2}' }
+          ];
+        } else if (scenario === 'audit_decision_commentary_only') {
+          completedParams.threadId = params.threadId || 'thr_fake_001';
+          completedParams.turn.itemsView = 'full';
+          completedParams.turn.items = [
+            { type: 'agentMessage', id: 'm1', phase: 'commentary', text: '{"decision":"APPROVE_WORK_PACKAGE"}' }
+          ];
         }
 
         writeLine({
