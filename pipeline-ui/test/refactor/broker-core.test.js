@@ -1643,8 +1643,51 @@ async function runAllTests() {
     console.log('✓ BC-051 PASSED: provenance transition failure caught and returned LIFECYCLE_STORE_FAILURE.');
   }
 
+  // -----------------------------------------------------------------------
+  // BC-052: expected_workspace_state_id forwarded to workerPort.wait unchanged (WAAUTH-04 / BC-052)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-052] Testing expected_workspace_state_id forwarded to workerPort.wait unchanged...');
+  {
+    const expectedWsId = 'sha256:custom-ws-wait-52';
+    let capturedWaitArgs = null;
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => {
+        capturedWaitArgs = args;
+        return {
+          ok: true,
+          state: DISPATCH_STATES.RUNNING,
+          dispatch_id: args.dispatch_id,
+          work_order_id: args.work_order_id
+        };
+      },
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, workspacePort } = createTestHarness({
+      workerPort: customWorkerPort,
+      workspacePort: {
+        getWorkspaceState: async () => ({ workspace_state_id: expectedWsId })
+      }
+    });
+
+    const req = baseValidRequest({ expected_workspace_state_id: expectedWsId });
+    const dispRes = await broker.dispatchWorker(req);
+    assert.strictEqual(dispRes.ok, true);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+    assert.strictEqual(waitRes.ok, true);
+    assert.ok(capturedWaitArgs !== null);
+    assert.strictEqual(capturedWaitArgs.expected_workspace_state_id, expectedWsId);
+    console.log('✓ BC-052 PASSED: workerPort.wait receives exact expected_workspace_state_id from dispatch lifecycle record.');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-051: 51/51 PASS)');
+  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-052: 52/52 PASS)');
   console.log('======================================================================');
 }
 

@@ -81,6 +81,30 @@ function createDispatchArgs(overrides = {}) {
 }
 
 function createMockCompletionSource(records = [], options = {}) {
+  const scanFn = async (arg1, arg2, arg3) => {
+    let visitor;
+    if (typeof arg2 === 'function') {
+      visitor = arg2;
+    } else if (typeof arg3 === 'function') {
+      visitor = arg3;
+    }
+    if (options.throwOnScan) {
+      throw new CompletionSourceError(
+        options.throwOnScan.code || COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_UNAVAILABLE,
+        options.throwOnScan.message || 'Scan unavailable'
+      );
+    }
+    const recs = typeof records === 'function' ? records() : records;
+    for (let i = 0; i < recs.length; i++) {
+      const res = await visitor(recs[i], i, {
+        sessionId: typeof arg1 === 'object' ? arg1.sessionId : arg1,
+        transcriptPath: options.getTranscriptPath ? options.getTranscriptPath() : (options.transcriptPath || '/fake/path/transcript.jsonl'),
+        agentSessionId: options.agentSessionId || 'agent-uuid-1'
+      });
+      if (res && res.stop) break;
+    }
+  };
+
   return {
     resolveSessionTranscript: (sessionId, project) => {
       if (options.throwOnResolve) {
@@ -91,33 +115,18 @@ function createMockCompletionSource(records = [], options = {}) {
       }
       return {
         sessionId,
-        transcriptPath: options.transcriptPath || '/fake/path/transcript.jsonl',
+        transcriptPath: options.getTranscriptPath ? options.getTranscriptPath() : (options.transcriptPath || '/fake/path/transcript.jsonl'),
         agentSessionId: options.agentSessionId || 'agent-uuid-1'
       };
     },
-    scanSession: async (sessionId, project, visitor) => {
-      if (options.throwOnScan) {
-        throw new CompletionSourceError(
-          options.throwOnScan.code || COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_UNAVAILABLE,
-          options.throwOnScan.message || 'Scan unavailable'
-        );
-      }
-      const recs = typeof records === 'function' ? records() : records;
-      for (let i = 0; i < recs.length; i++) {
-        const res = await visitor(recs[i], i, {
-          sessionId,
-          transcriptPath: options.getTranscriptPath ? options.getTranscriptPath() : (options.transcriptPath || '/fake/path/transcript.jsonl'),
-          agentSessionId: options.agentSessionId || 'agent-uuid-1'
-        });
-        if (res && res.stop) break;
-      }
-    }
+    scanResolvedSession: scanFn,
+    scanSession: scanFn
   };
 }
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING WORKER ADAPTER TEST SUITE (WA-001 .. WA-042)');
+  console.log('RUNNING WORKER ADAPTER TEST SUITE (WA-001 .. WA-055)');
   console.log('======================================================================');
 
   // -----------------------------------------------------------------------
@@ -1799,8 +1808,564 @@ async function runAllTests() {
     console.log('✓ WA-042 PASSED: streaming scanner stops cleanly with bounded memory.');
   }
 
+  // -----------------------------------------------------------------------
+  // WA-043: Transcript outside brain root fails closed (WAAUTH-01 / Section 28)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-043] Testing transcript outside brain root fails closed (WAAUTH-01)...');
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-test-043-brain-'));
+    const externalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-test-043-ext-'));
+    const externalFile = path.join(externalDir, 'transcript.jsonl');
+    fs.writeFileSync(externalFile, '{"source":"MODEL"}\n');
+
+    const aoDbPath = path.join(tmpDir, 'ao.db');
+    const db = new DatabaseSync(aoDbPath);
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        harness TEXT,
+        agent_session_id TEXT,
+        native_transcript_path TEXT
+      );
+      INSERT INTO sessions (id, project_id, harness, agent_session_id, native_transcript_path)
+      VALUES ('ao-sess-ext', 'ai-multi-task', 'agy', 'agent-uuid-1', '${externalFile.replace(/\\/g, '\\\\')}');
+    `);
+    db.close();
+
+    const cs = createAntigravityCompletionSource({
+      brainDir: tmpDir,
+      aoDbPath
+    });
+
+    assert.throws(() => {
+      cs.resolveSessionTranscript('ao-sess-ext', createBaseProject());
+    }, (err) => {
+      assert.strictEqual(err.code, COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_UNAVAILABLE);
+      assert.ok(err.message.includes('resolves outside canonical brainDir'));
+      return true;
+    });
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(externalDir, { recursive: true, force: true });
+    console.log('✓ WA-043 PASSED: transcript outside brain root fails closed with 0 transcript reads.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-044: Agent session path traversal fails closed (WAAUTH-01 / Section 29)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-044] Testing agent session path traversal fails closed (WAAUTH-01)...');
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-test-044-'));
+    const aoDbPath = path.join(tmpDir, 'ao.db');
+    const db = new DatabaseSync(aoDbPath);
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        harness TEXT,
+        agent_session_id TEXT,
+        native_transcript_path TEXT
+      );
+      INSERT INTO sessions (id, project_id, harness, agent_session_id, native_transcript_path)
+      VALUES ('ao-sess-trav', 'ai-multi-task', 'agy', '../../outside', NULL);
+    `);
+    db.close();
+
+    const cs = createAntigravityCompletionSource({
+      brainDir: tmpDir,
+      aoDbPath
+    });
+
+    assert.throws(() => {
+      cs.resolveSessionTranscript('ao-sess-trav', createBaseProject());
+    }, (err) => {
+      assert.strictEqual(err.code, COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_UNAVAILABLE);
+      assert.ok(err.message.includes('path traversal') || err.message.includes('outside'));
+      return true;
+    });
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.log('✓ WA-044 PASSED: agent_session_id path traversal fails closed.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-045: Fuzzy AO project name rejected (WAAUTH-02 / Section 30)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-045] Testing fuzzy AO project name rejected (WAAUTH-02)...');
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-test-045-'));
+    const aoDbPath = path.join(tmpDir, 'ao.db');
+    const db = new DatabaseSync(aoDbPath);
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        harness TEXT,
+        agent_session_id TEXT,
+        native_transcript_path TEXT
+      );
+      INSERT INTO sessions (id, project_id, harness, agent_session_id, native_transcript_path)
+      VALUES ('ao-sess-fuzzy', 'my-app-backup', 'agy', 'agent-uuid-1', NULL);
+    `);
+    db.close();
+
+    const cs = createAntigravityCompletionSource({
+      brainDir: tmpDir,
+      aoDbPath
+    });
+
+    assert.throws(() => {
+      cs.resolveSessionTranscript('ao-sess-fuzzy', createBaseProject({ project_id: 'app', project_name: 'App' }));
+    }, (err) => {
+      assert.strictEqual(err.code, COMPLETION_SOURCE_ERROR_CODES.WORKER_SESSION_CONFLICT);
+      assert.ok(err.message.includes('conflicting with registry project'));
+      return true;
+    });
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.log('✓ WA-045 PASSED: fuzzy project name similarity rejected as conflict.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-046: Boundary requires BOTH source=USER_EXPLICIT and type=USER_INPUT (WAAUTH-03 / Section 31)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-046] Testing boundary requires BOTH source=USER_EXPLICIT and type=USER_INPUT (WAAUTH-03)...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const events = [
+      {
+        source: 'USER_EXPLICIT',
+        type: 'NOTE', // Wrong type
+        content: env
+      },
+      {
+        source: 'SYSTEM', // Wrong source
+        type: 'USER_INPUT',
+        content: env
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED); // Neither event established boundary!
+    console.log('✓ WA-046 PASSED: boundary requires BOTH source=USER_EXPLICIT and type=USER_INPUT.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-047: Leading prefix does not establish boundary (WAAUTH-03 / Section 32)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-047] Testing leading prefix does not establish boundary (WAAUTH-03)...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const events = [
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: ' \n' + env // Leading space and newline before marker
+      },
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: 'NOTE:\n' + env // Leading prose header before marker
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    console.log('✓ WA-047 PASSED: leading prefix before dispatch marker does not establish boundary.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-048: Expected workspace mismatch fails PROVENANCE_AMBIGUOUS (WAAUTH-04 / Section 33)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-048] Testing expected workspace mismatch fails PROVENANCE_AMBIGUOUS (WAAUTH-04)...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws-actual-in-transcript',
+      directive: 'Work.'
+    });
+    const events = [
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: env
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws-different-expected',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    assert.ok(res.error.includes('expected_workspace_state_id'));
+    console.log('✓ WA-048 PASSED: contradictory expected_workspace_state_id on matching dispatch identity fails PROVENANCE_AMBIGUOUS.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-049: Missing DONE status does not complete (WAAUTH-05 / Section 34)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-049] Testing missing DONE status does not complete (WAAUTH-05)...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const events = [
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: env
+      },
+      {
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        // status is missing (undefined)
+        content: '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}'
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.RUNNING); // Missing status is NOT authoritative finality
+    console.log('✓ WA-049 PASSED: model record with missing status=DONE does not complete wait.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-050: Markdown fenced completion does not complete (WAAUTH-06 / Section 35)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-050] Testing markdown fenced completion does not complete (WAAUTH-06)...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const events = [
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: env
+      },
+      {
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'Here is the requested format:\n```text\n[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}\n```'
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.RUNNING);
+    console.log('✓ WA-050 PASSED: completion marker inside markdown code fence is not authoritative.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-051: Mapping change with empty transcripts fails closed (WAAUTH-07 / Section 36)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-051] Testing mapping change with empty transcripts fails closed (WAAUTH-07)...');
+  {
+    const clock = createMockClock();
+    let pollCount = 0;
+    const mockCs = {
+      resolveSessionTranscript: (sessionId, project) => {
+        pollCount++;
+        return {
+          sessionId,
+          transcriptPath: pollCount === 1 ? '/fake/brain/session_A/transcript.jsonl' : '/fake/brain/session_B/transcript.jsonl',
+          agentSessionId: pollCount === 1 ? 'session_A' : 'session_B'
+        };
+      },
+      scanResolvedSession: async (resolution, visitor) => {
+        // Empty transcript: 0 records
+        return null;
+      },
+      scanSession: async (sessionId, project, visitor) => {
+        return null;
+      }
+    };
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: mockCs
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 2
+    });
+
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    assert.ok(res.error.includes('Transcript mapping changed'));
+    console.log('✓ WA-051 PASSED: mapping change detected per poll even with zero transcript records.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-052: Snapshot readable EOF prevents chasing concurrent appends (WAAUTH-08 / Section 37)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-052] Testing snapshot readable EOF prevents chasing concurrent appends (WAAUTH-08)...');
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-test-052-'));
+    const transcriptFile = path.join(tmpDir, 'transcript.jsonl');
+
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    fs.writeFileSync(transcriptFile, JSON.stringify({
+      source: 'USER_EXPLICIT',
+      type: 'USER_INPUT',
+      content: env
+    }) + '\n');
+
+    const baseFs = fs;
+    const wrappedFs = {
+      ...baseFs,
+      fstatSync: (fd) => {
+        const res = baseFs.fstatSync(fd);
+        // Append bytes to the file right after fstatSync
+        baseFs.appendFileSync(transcriptFile, JSON.stringify({
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}'
+        }) + '\n');
+        return res; // Returns the size BEFORE the append!
+      }
+    };
+
+    const snapCs = createAntigravityCompletionSource({
+      brainDir: tmpDir,
+      aoDbPath: '/fake/ao.db',
+      fs: wrappedFs
+    });
+
+    let recordsSeen = 0;
+    await snapCs.scanResolvedSession({ transcriptPath: transcriptFile }, async () => {
+      recordsSeen++;
+    });
+
+    assert.strictEqual(recordsSeen, 1); // Only saw the boundary record, did NOT read the appended completion record!
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.log('✓ WA-052 PASSED: snapshot readable EOF bounds scan to size at start, ignoring concurrent append.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-053: Oversized single record fails source integrity (WAAUTH-09 / Section 38)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-053] Testing oversized single record fails source integrity (WAAUTH-09)...');
+  {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-test-053-'));
+    const transcriptFile = path.join(tmpDir, 'transcript.jsonl');
+
+    // Create record with 2048 bytes of content
+    const hugeLine = JSON.stringify({
+      source: 'MODEL',
+      type: 'VIEW_FILE',
+      status: 'DONE',
+      content: 'x'.repeat(2048)
+    }) + '\n';
+    fs.writeFileSync(transcriptFile, hugeLine);
+
+    const cs = createAntigravityCompletionSource({
+      brainDir: tmpDir,
+      aoDbPath: '/fake/ao.db',
+      maxRecordSizeBytes: 512 // configured bound lower than line length
+    });
+
+    await assert.rejects(async () => {
+      await cs.scanResolvedSession({ transcriptPath: transcriptFile }, async () => {});
+    }, (err) => {
+      assert.strictEqual(err.code, COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_INTEGRITY_FAILURE);
+      assert.ok(err.message.includes('exceeds maximum allowable size'));
+      return true;
+    });
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.log('✓ WA-053 PASSED: oversized single record triggers COMPLETION_SOURCE_INTEGRITY_FAILURE.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-054: Control identifier JSON escaping (WAAUTH-10 / Section 39)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-054] Testing control identifier JSON escaping (WAAUTH-10)...');
+  {
+    const complexWorkOrderId = 'WO-"complex"-id-\\with\\special\nchars';
+    const complexProjectId = 'proj-"complex"-id';
+    const envelope = formatDispatchEnvelope({
+      project_id: complexProjectId,
+      work_order_id: complexWorkOrderId,
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws-test',
+      directive: 'Testing JSON escaping.'
+    });
+
+    // Find the required completion line
+    const lines = envelope.split('\n');
+    const compLine = lines.find(l => l.startsWith('[ORCHESTRATOR_COMPLETION_V1] '));
+    assert.ok(compLine !== undefined, 'Must contain standalone completion template line');
+
+    const jsonStr = compLine.slice('[ORCHESTRATOR_COMPLETION_V1] '.length).trim();
+    const parsed = JSON.parse(jsonStr);
+
+    assert.strictEqual(parsed.work_order_id, complexWorkOrderId);
+    assert.strictEqual(parsed.project_id, complexProjectId);
+    assert.strictEqual(parsed.state, 'READY_FOR_REVIEW');
+    console.log('✓ WA-054 PASSED: control identifiers properly escaped via JSON.stringify without interpolation corruption.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WA-055: Duplicate exact current boundaries fail closed (Section 40)
+  // -----------------------------------------------------------------------
+  console.log('\n[WA-055] Testing duplicate exact current boundaries fail closed (Section 40)...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+
+    const events = [
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: env
+      },
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: env // Duplicate exact boundary record
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    assert.ok(res.error.includes('Duplicate current dispatch boundary'));
+    console.log('✓ WA-055 PASSED: duplicate exact current dispatch boundaries fail closed with PROVENANCE_AMBIGUOUS.');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL WORKER ADAPTER TESTS PASSED (WA-001 .. WA-042: 42/42 PASS)');
+  console.log('ALL WORKER ADAPTER TESTS PASSED (WA-001 .. WA-055: 55/55 PASS)');
   console.log('======================================================================');
 }
 

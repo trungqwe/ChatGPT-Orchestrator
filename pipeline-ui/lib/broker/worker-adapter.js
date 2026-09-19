@@ -5,16 +5,42 @@ const { DISPATCH_STATES, ERROR_CODES, LIMITS } = require('./contracts');
 const { createAntigravityCompletionSource, COMPLETION_SOURCE_ERROR_CODES } = require('./antigravity-completion-source');
 
 /**
- * Deterministic Dispatch Envelope Formatter (WO-V3-005 Section 24, A-09)
+ * Deterministic Dispatch Envelope Formatter (WO-V3-005 Section 24, A-09, WAAUTH-10)
  */
 function formatDispatchEnvelope({ project_id, work_order_id, dispatch_id, expected_workspace_state_id, directive }) {
+  if (typeof project_id !== 'string' || !project_id.trim()) {
+    throw new Error('project_id must be a non-empty string');
+  }
+  if (typeof work_order_id !== 'string' || !work_order_id.trim()) {
+    throw new Error('work_order_id must be a non-empty string');
+  }
+  if (typeof dispatch_id !== 'string' || !dispatch_id.trim()) {
+    throw new Error('dispatch_id must be a non-empty string');
+  }
+  if (typeof expected_workspace_state_id !== 'string' || !expected_workspace_state_id.trim()) {
+    throw new Error('expected_workspace_state_id must be a non-empty string');
+  }
+  if (typeof directive !== 'string' || !directive.trim()) {
+    throw new Error('directive must be a non-empty string');
+  }
+
   const metaObj = {
     type: 'worker_dispatch',
     schema_version: 1,
     project_id,
     work_order_id,
     dispatch_id,
-    expected_workspace_state_id: expected_workspace_state_id || ''
+    expected_workspace_state_id
+  };
+
+  // WAAUTH-10: JSON-safe control envelope serialization without string interpolation
+  const completionObj = {
+    type: 'worker_completion',
+    schema_version: 1,
+    project_id,
+    work_order_id,
+    dispatch_id,
+    state: 'READY_FOR_REVIEW'
   };
 
   return `[ORCHESTRATOR_DISPATCH_V1]\n` +
@@ -24,13 +50,13 @@ function formatDispatchEnvelope({ project_id, work_order_id, dispatch_id, expect
     `[DIRECTIVE_END]\n\n` +
     `[REQUIRED_COMPLETION]\n` +
     `When implementation work is finished, output exactly one standalone machine line:\n\n` +
-    `[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"${project_id}","work_order_id":"${work_order_id}","dispatch_id":"${dispatch_id}","state":"READY_FOR_REVIEW"}\n\n` +
+    `[ORCHESTRATOR_COMPLETION_V1] ${JSON.stringify(completionObj)}\n\n` +
     `READY_FOR_REVIEW means implementation is ready for independent Sol audit.\n` +
     `It does NOT mean the project/work package is approved.`;
 }
 
 /**
- * Create Antigravity Worker Port (WP-V3-05)
+ * Create Antigravity Worker Port (WP-V3-05 / WO-V3-005F)
  *
  * Implements concrete broker workerPort:
  * - dispatch(args): Delivers directives to Antigravity via AO CLI, binds identity envelope.
@@ -95,13 +121,22 @@ function createAntigravityWorkerPort(options = {}) {
     }
 
     // 3. Render deterministic dispatch envelope
-    const renderedEnvelope = formatDispatchEnvelope({
-      project_id,
-      work_order_id,
-      dispatch_id,
-      expected_workspace_state_id,
-      directive
-    });
+    let renderedEnvelope;
+    try {
+      renderedEnvelope = formatDispatchEnvelope({
+        project_id,
+        work_order_id,
+        dispatch_id,
+        expected_workspace_state_id,
+        directive
+      });
+    } catch (envErr) {
+      return {
+        ok: false,
+        definitive: true,
+        error: `Envelope formatting error: ${envErr.message}`
+      };
+    }
 
     // 4. Execute AO send via spawnSync (Section 19)
     let childRes;
@@ -166,7 +201,7 @@ function createAntigravityWorkerPort(options = {}) {
       };
     }
 
-    const { project, project_id, dispatch_id, work_order_id } = args;
+    const { project, project_id, dispatch_id, work_order_id, expected_workspace_state_id } = args;
 
     if (!project || !project.worker || typeof project.worker.session_id !== 'string' || !project.worker.session_id.trim()) {
       return {
@@ -188,34 +223,52 @@ function createAntigravityWorkerPort(options = {}) {
     const startTime = clock.monotonic();
     const deadline = startTime + (timeoutSecs * 1000);
 
-    let activeTranscriptPath = null;
+    let initialTranscriptPath = null;
     let latestNonterminalState = DISPATCH_STATES.DISPATCH_ACCEPTED;
 
     while (true) {
+      // WAAUTH-07: Resolve exact session mapping at the start of EVERY polling iteration
+      let resolution;
+      try {
+        resolution = completionSource.resolveSessionTranscript(sessionId, project);
+      } catch (resErr) {
+        return {
+          ok: false,
+          code: ERROR_CODES.WORKER_WAIT_UNAVAILABLE,
+          dispatch_id,
+          error: `Session resolution failed: ${resErr.message}`
+        };
+      }
+
+      // Check mapping stability across polls even if transcript has zero complete records
+      if (initialTranscriptPath === null) {
+        initialTranscriptPath = resolution.transcriptPath;
+      } else if (initialTranscriptPath !== resolution.transcriptPath) {
+        return {
+          ok: false,
+          code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
+          dispatch_id,
+          error: 'Transcript mapping changed during active wait'
+        };
+      }
+
       let boundaryIndex = -1;
       const candidateCompletions = [];
       let ambiguityError = null;
-      let mappingChangeDetected = false;
 
       try {
-        await completionSource.scanSession(sessionId, project, async (record, index, resolution) => {
-          // A-18: Check transcript mapping stability during active wait
-          if (resolution && resolution.transcriptPath) {
-            if (activeTranscriptPath === null) {
-              activeTranscriptPath = resolution.transcriptPath;
-            } else if (activeTranscriptPath !== resolution.transcriptPath) {
-              mappingChangeDetected = true;
-              return { stop: true };
-            }
-          }
+        const visitor = async (record, index) => {
+          // 1. Boundary Detection (A-09, WAAUTH-03, WAAUTH-04, Section 10, 13, 26)
+          if (typeof record.content === 'string') {
+            // WAAUTH-03: Authoritative boundary requires BOTH source=USER_EXPLICIT and type=USER_INPUT
+            const isUserInput = record.source === 'USER_EXPLICIT' && record.type === 'USER_INPUT';
 
-          // 1. Boundary Detection (A-09)
-          if (boundaryIndex === -1) {
-            if ((record.source === 'USER_EXPLICIT' || record.type === 'USER_INPUT') && typeof record.content === 'string') {
-              const contentLines = record.content.trimStart().split('\n').map(l => l.trim());
-              if (contentLines[0] === '[ORCHESTRATOR_DISPATCH_V1]' && contentLines[1]) {
+            if (isUserInput) {
+              // Section 10: Require physical line 0 to be exactly [ORCHESTRATOR_DISPATCH_V1] (no trimStart)
+              const rawLines = record.content.split(/\r?\n/);
+              if (rawLines[0] === '[ORCHESTRATOR_DISPATCH_V1]' && rawLines[1]) {
                 try {
-                  const dObj = JSON.parse(contentLines[1]);
+                  const dObj = JSON.parse(rawLines[1]);
                   if (
                     dObj &&
                     dObj.type === 'worker_dispatch' &&
@@ -224,28 +277,36 @@ function createAntigravityWorkerPort(options = {}) {
                     dObj.work_order_id === work_order_id &&
                     dObj.dispatch_id === dispatch_id
                   ) {
+                    // WAAUTH-04 / Section 13: Validate expected_workspace_state_id
+                    if (expected_workspace_state_id !== undefined && dObj.expected_workspace_state_id !== expected_workspace_state_id) {
+                      ambiguityError = `Contradictory expected_workspace_state_id on matching dispatch identity: expected '${expected_workspace_state_id}', got '${dObj.expected_workspace_state_id}'`;
+                      return { stop: true };
+                    }
+
+                    // Section 26: Duplicate exact dispatch boundary detection
+                    if (boundaryIndex !== -1) {
+                      ambiguityError = 'Duplicate current dispatch boundary records observed';
+                      return { stop: true };
+                    }
+
                     boundaryIndex = index;
+                    return;
                   }
                 } catch (_) {
                   // Not valid JSON header, cannot be boundary
                 }
               }
             }
-            return;
           }
 
-          // 2. Completion Detection (A-10, A-11, A-21, A-22, A-23)
-          if (index > boundaryIndex) {
-            // Must be worker/model final planner response record (A-11, WA-020)
-            const isModelOutput = record.type === 'PLANNER_RESPONSE' && record.source === 'MODEL';
+          // 2. Completion Detection (A-10, A-11, A-21, A-22, A-23, WAAUTH-05, WAAUTH-06)
+          if (boundaryIndex !== -1 && index > boundaryIndex) {
+            // WAAUTH-05: Require ALL THREE: source=MODEL, type=PLANNER_RESPONSE, status=DONE
+            const isFinalModelOutput = record.source === 'MODEL' &&
+              record.type === 'PLANNER_RESPONSE' &&
+              record.status === 'DONE';
 
-            if (!isModelOutput) {
-              return;
-            }
-
-            // Must be concluded/final record (A-11 / WA-038)
-            // If status is present and not 'DONE', it is an intermediate/streaming record
-            if (record.status !== undefined && record.status !== 'DONE') {
+            if (!isFinalModelOutput) {
               return;
             }
 
@@ -254,20 +315,51 @@ function createAntigravityWorkerPort(options = {}) {
               return;
             }
 
-            // A-10: Completion must be an exact standalone line
-            const lines = text.split('\n');
-            for (const rawLine of lines) {
-              const trimmed = rawLine.trim();
+            // WAAUTH-06: Parse lines tracking markdown code fence state
+            const lines = text.split(/\r?\n/);
+            let inFence = false;
+            let fenceChar = '';
+            let fenceLength = 0;
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+
+              // Track fenced-code state (``` or ~~~ with at least 3 chars)
+              const fenceMatch = line.match(/^(\s*)(`{3,}|~{3,})/);
+              if (fenceMatch) {
+                const char = fenceMatch[2][0];
+                const len = fenceMatch[2].length;
+                if (!inFence) {
+                  inFence = true;
+                  fenceChar = char;
+                  fenceLength = len;
+                  continue;
+                } else if (char === fenceChar && len >= fenceLength) {
+                  inFence = false;
+                  continue;
+                }
+              }
+
+              if (inFence) {
+                // Fenced code is example/documentation, not machine signal
+                continue;
+              }
+
+              // Reject markdown blockquote lines
+              if (trimmed.startsWith('>')) {
+                continue;
+              }
+
               if (!trimmed.includes('[ORCHESTRATOR_COMPLETION_V1]')) {
                 continue;
               }
 
-              // Reject prefix prose, quoted lines, markdown fences
-              if (!rawLine.startsWith('[ORCHESTRATOR_COMPLETION_V1] ') && rawLine !== '[ORCHESTRATOR_COMPLETION_V1]') {
+              // Must be an exact standalone line: begins with marker, no prose prefix
+              if (!line.startsWith('[ORCHESTRATOR_COMPLETION_V1] ') && line !== '[ORCHESTRATOR_COMPLETION_V1]') {
                 continue;
               }
 
-              const remainder = rawLine.slice('[ORCHESTRATOR_COMPLETION_V1]'.length).trim();
+              const remainder = line.slice('[ORCHESTRATOR_COMPLETION_V1]'.length).trim();
               if (!remainder) {
                 continue;
               }
@@ -319,7 +411,13 @@ function createAntigravityWorkerPort(options = {}) {
               candidateCompletions.push({ index, envelope: cObj });
             }
           }
-        });
+        };
+
+        if (typeof completionSource.scanResolvedSession === 'function') {
+          await completionSource.scanResolvedSession(resolution, visitor, { deadline, clock });
+        } else {
+          await completionSource.scanSession(sessionId, project, visitor, { deadline, clock });
+        }
       } catch (err) {
         if (err.code === COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_INTEGRITY_FAILURE) {
           return {
@@ -334,15 +432,6 @@ function createAntigravityWorkerPort(options = {}) {
           code: ERROR_CODES.WORKER_WAIT_UNAVAILABLE,
           dispatch_id,
           error: `Completion source unavailable: ${err.message}`
-        };
-      }
-
-      if (mappingChangeDetected) {
-        return {
-          ok: false,
-          code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
-          dispatch_id,
-          error: 'Transcript mapping changed during active wait'
         };
       }
 
@@ -380,8 +469,6 @@ function createAntigravityWorkerPort(options = {}) {
       // No terminal completion yet
       if (boundaryIndex !== -1) {
         latestNonterminalState = DISPATCH_STATES.RUNNING;
-      } else {
-        latestNonterminalState = DISPATCH_STATES.DISPATCH_ACCEPTED;
       }
 
       const now = clock.monotonic();

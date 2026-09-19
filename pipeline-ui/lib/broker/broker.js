@@ -522,6 +522,7 @@ function createBroker(dependencies = {}) {
         project_id: request.project_id,
         dispatch_id: request.dispatch_id,
         work_order_id: dispatch.work_order_id,
+        expected_workspace_state_id: dispatch.expected_workspace_state_id,
         timeout_secs: timeoutSecs
       });
     } catch (err) {
