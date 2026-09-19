@@ -71,7 +71,7 @@ function commitFile(repoDir, relPath, content, msg = 'initial commit') {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING WORKSPACE-STATE TEST SUITE (WS-001 .. WS-039)');
+  console.log('RUNNING WORKSPACE-STATE TEST SUITE (WS-001 .. WS-045)');
   console.log('======================================================================\n');
 
   const wsPort = createWorkspaceStatePort();
@@ -1311,9 +1311,9 @@ async function runAllTests() {
     }
   }
 
-  // WS-037: Regular file becomes symlink before read (A-04, A-13)
+  // WS-037: Regular file becomes symlink before open (A-04, A-13, strengthened per Section 39)
   {
-    console.log('[WS-037] Untracked regular file swapped for symlink before open fails closed (0 target reads)...');
+    console.log('[WS-037] Untracked regular file swapped for symlink before open fails closed on open/no-follow (0 target reads)...');
     const sandbox = createTestSandbox();
     try {
       const repoDir = path.join(sandbox.dir, 'repo');
@@ -1328,7 +1328,6 @@ async function runAllTests() {
         ...fs,
         lstatSync: (p) => {
           // Pre-lstat reports regular file
-          // Post-open lstat reports symlink!
           const real = fs.lstatSync(p);
           return real;
         },
@@ -1357,7 +1356,7 @@ async function runAllTests() {
       assert.strictEqual(caught.code, WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE);
       assert.strictEqual(externalTargetReadAttempted, false);
 
-      console.log('✓ WS-037 PASSED: Regular file symlink swap detected and failed closed with 0 external reads.\n');
+      console.log('✓ WS-037 PASSED: Regular file symlink swap detected at open and failed closed with 0 external reads.\n');
     } finally {
       sandbox.cleanup();
     }
@@ -1419,8 +1418,405 @@ async function runAllTests() {
     }
   }
 
+  // WS-040: Opened regular-file descriptor identity mismatch (WSAUTH-01 / Section 32)
+  {
+    console.log('[WS-040] Opened regular-file descriptor identity mismatch fails closed (WSAUTH-01)...');
+    const sandbox = createTestSandbox();
+    try {
+      const repoDir = path.join(sandbox.dir, 'repo');
+      initGitRepo(repoDir);
+      commitFile(repoDir, 'README.md', 'Hello World\n');
+
+      const fileA = path.join(repoDir, 'fileA.txt');
+      const fileB = path.join(repoDir, 'fileB.txt');
+      fs.writeFileSync(fileA, 'Content A\n');
+      fs.writeFileSync(fileB, 'Content B (SECRET)\n');
+
+      let readFromBAttempted = false;
+
+      // Open real fd for file B
+      const realFdB = fs.openSync(fileB, fs.constants.O_RDONLY);
+
+      const injectedFs = {
+        ...fs,
+        lstatSync: (p) => {
+          // pre and post lstat report file A identity
+          if (p.includes('fileA')) {
+            return {
+              isFile: () => true,
+              isSymbolicLink: () => false,
+              isDirectory: () => false,
+              dev: 1,
+              ino: 100,
+              mode: 0o100644
+            };
+          }
+          return fs.lstatSync(p);
+        },
+        openSync: (p, flags) => {
+          // File A open returns descriptor that actually refers to file B!
+          if (p.includes('fileA')) {
+            return realFdB;
+          }
+          return fs.openSync(p, flags);
+        },
+        fstatSync: (fd) => {
+          if (fd === realFdB) {
+            // fdStat reports file B identity (dev 1, ino 200)
+            return {
+              isFile: () => true,
+              isSymbolicLink: () => false,
+              isDirectory: () => false,
+              dev: 1,
+              ino: 200,
+              mode: 0o100644
+            };
+          }
+          return fs.fstatSync(fd);
+        },
+        readSync: (fd, buf, offset, length, pos) => {
+          if (fd === realFdB) {
+            readFromBAttempted = true;
+          }
+          return fs.readSync(fd, buf, offset, length, pos);
+        },
+        closeSync: (fd) => {
+          if (fd === realFdB) {
+            return;
+          }
+          return fs.closeSync(fd);
+        }
+      };
+
+      const port = createWorkspaceStatePort({ fs: injectedFs });
+      let caught = null;
+      try {
+        await port.getWorkspaceState({ project_id: 'p1', project_root: repoDir });
+      } catch (err) {
+        caught = err;
+      }
+
+      fs.closeSync(realFdB);
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE);
+      assert.strictEqual(readFromBAttempted, false, 'Bytes from file B must never be read');
+
+      console.log('✓ WS-040 PASSED: File descriptor identity mismatch caught and failed closed without reading B.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-041: Hash-authoritative submodule Git command failures fail closed (WSAUTH-02 / Section 33)
+  {
+    console.log('[WS-041] Submodule Git command failures fail closed with GIT_COMMAND_FAILED (WSAUTH-02)...');
+    const sandbox = createTestSandbox();
+    try {
+      const superDir = path.join(sandbox.dir, 'super-repo');
+      const subDir = path.join(sandbox.dir, 'sub-repo');
+
+      initGitRepo(subDir);
+      commitFile(subDir, 'sub.txt', 'Sub v1\n');
+
+      initGitRepo(superDir);
+      commitFile(superDir, 'README.md', 'Super repo\n');
+
+      const subPathAbs = path.resolve(subDir).replace(/\\/g, '/');
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', subPathAbs, 'modules/sub1'], {
+        cwd: superDir,
+        shell: false
+      });
+      child_process.spawnSync('git', ['commit', '-m', 'add sub1'], { cwd: superDir, shell: false });
+
+      // Subcase A: submodule rev-parse HEAD fails
+      {
+        const customSpawnA = (bin, args, opts) => {
+          if (args.includes('rev-parse') && args.includes('HEAD')) {
+            return {
+              status: 128,
+              stdout: Buffer.alloc(0),
+              stderr: Buffer.from('fatal: injected failure for submodule rev-parse HEAD\n')
+            };
+          }
+          return child_process.spawnSync(bin, args, opts);
+        };
+        const portA = createWorkspaceStatePort({ spawnSync: customSpawnA });
+        let caughtA = null;
+        try {
+          await portA.getWorkspaceState({ project_id: 'p1', project_root: superDir });
+        } catch (err) {
+          caughtA = err;
+        }
+        assert.ok(caughtA);
+        assert.strictEqual(caughtA.code, WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED);
+      }
+
+      // Subcase B: submodule status --porcelain=v2 fails
+      {
+        const customSpawnB = (bin, args, opts) => {
+          if (args.includes('status') && args.includes('-C')) {
+            return {
+              status: 128,
+              stdout: Buffer.alloc(0),
+              stderr: Buffer.from('fatal: injected failure for submodule git -C status\n')
+            };
+          }
+          return child_process.spawnSync(bin, args, opts);
+        };
+        const portB = createWorkspaceStatePort({ spawnSync: customSpawnB });
+        let caughtB = null;
+        try {
+          await portB.getWorkspaceState({ project_id: 'p1', project_root: superDir });
+        } catch (err) {
+          caughtB = err;
+        }
+        assert.ok(caughtB);
+        assert.strictEqual(caughtB.code, WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED);
+      }
+
+      // Subcase C: git submodule status --recursive fails
+      {
+        const customSpawnC = (bin, args, opts) => {
+          if (args.includes('submodule') && args.includes('status')) {
+            return {
+              status: 128,
+              stdout: Buffer.alloc(0),
+              stderr: Buffer.from('fatal: injected failure for git submodule status --recursive\n')
+            };
+          }
+          return child_process.spawnSync(bin, args, opts);
+        };
+        const portC = createWorkspaceStatePort({ spawnSync: customSpawnC });
+        let caughtC = null;
+        try {
+          await portC.getWorkspaceState({ project_id: 'p1', project_root: superDir });
+        } catch (err) {
+          caughtC = err;
+        }
+        assert.ok(caughtC);
+        assert.strictEqual(caughtC.code, WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED);
+      }
+
+      console.log('✓ WS-041 PASSED: All submodule Git command failures failed closed with GIT_COMMAND_FAILED.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-042: Gitlink path byte integrity (WSAUTH-03 / Section 34)
+  {
+    console.log('[WS-042] Gitlink path parsed as raw bytes: untrimmed whitespace preserved, invalid UTF-8 rejected...');
+    const sandbox = createTestSandbox();
+    try {
+      const repoDir = path.join(sandbox.dir, 'repo');
+      initGitRepo(repoDir);
+      commitFile(repoDir, 'README.md', 'Hello\n');
+
+      // 1. Injected ls-files --stage -z with leading/trailing whitespace in path
+      const pathWithSpaces = '  modules/sub with spaces  ';
+      const record1 = Buffer.concat([
+        Buffer.from(`160000 0123456789abcdef0123456789abcdef01234567 0\t${pathWithSpaces}`),
+        Buffer.from([0])
+      ]);
+
+      const customSpawnSpaces = (bin, args, opts) => {
+        if (args.includes('ls-files') && args.includes('--stage')) {
+          return {
+            status: 0,
+            stdout: record1,
+            stderr: Buffer.alloc(0)
+          };
+        }
+        if (args.includes('submodule') && args.includes('status')) {
+          return {
+            status: 0,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.alloc(0)
+          };
+        }
+        return child_process.spawnSync(bin, args, opts);
+      };
+
+      const portSpaces = createWorkspaceStatePort({ spawnSync: customSpawnSpaces });
+      const state = await portSpaces.getWorkspaceState({ project_id: 'p1', project_root: repoDir });
+      assert.strictEqual(state.submodule_count, 1);
+
+      // 2. Injected ls-files --stage -z with invalid UTF-8 in gitlink path
+      const invalidPathBytes = Buffer.from([0x6d, 0x6f, 0x64, 0xc3, 0x28, 0x00]); // invalid UTF-8
+      const recordInvalid = Buffer.concat([
+        Buffer.from('160000 0123456789abcdef0123456789abcdef01234567 0\t'),
+        invalidPathBytes
+      ]);
+
+      const customSpawnInvalid = (bin, args, opts) => {
+        if (args.includes('ls-files') && args.includes('--stage')) {
+          return {
+            status: 0,
+            stdout: recordInvalid,
+            stderr: Buffer.alloc(0)
+          };
+        }
+        return child_process.spawnSync(bin, args, opts);
+      };
+
+      const portInvalid = createWorkspaceStatePort({ spawnSync: customSpawnInvalid });
+      let caught = null;
+      try {
+        await portInvalid.getWorkspaceState({ project_id: 'p1', project_root: repoDir });
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.code, WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH);
+
+      console.log('✓ WS-042 PASSED: Gitlink path whitespace preserved exactly; invalid UTF-8 failed closed.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-043: Submodule symlink escape to external repository fails closed (WSAUTH-04 / Section 35)
+  {
+    console.log('[WS-043] Submodule resolving to external directory via symlink fails closed with 0 git -C calls...');
+    const sandbox = createTestSandbox();
+    try {
+      const superDir = path.join(sandbox.dir, 'super-repo');
+      const extDir = path.join(sandbox.dir, 'external-repo');
+
+      initGitRepo(extDir);
+      commitFile(extDir, 'ext.txt', 'external\n');
+
+      initGitRepo(superDir);
+      commitFile(superDir, 'README.md', 'super\n');
+
+      const stageRecord = Buffer.concat([
+        Buffer.from('160000 0123456789abcdef0123456789abcdef01234567 0\tmodules/sub1'),
+        Buffer.from([0])
+      ]);
+
+      let externalGitExecAttempted = false;
+
+      const customSpawn = (bin, args, opts) => {
+        if (args.includes('ls-files') && args.includes('--stage')) {
+          return { status: 0, stdout: stageRecord, stderr: Buffer.alloc(0) };
+        }
+        if (args.includes('-C')) {
+          const cIdx = args.indexOf('-C');
+          const targetDir = args[cIdx + 1];
+          if (targetDir && targetDir.includes('external-repo')) {
+            externalGitExecAttempted = true;
+          }
+        }
+        return child_process.spawnSync(bin, args, opts);
+      };
+
+      // Injected fs that reports modules/sub1 resolving to external-repo
+      const injectedFs = {
+        ...fs,
+        lstatSync: (p) => {
+          if (p.includes('modules' + path.sep + 'sub1') || p.includes('modules/sub1')) {
+            return {
+              isSymbolicLink: () => true,
+              isFile: () => false,
+              isDirectory: () => false,
+              mode: 0o120777
+            };
+          }
+          return fs.lstatSync(p);
+        },
+        realpathSync: (p) => {
+          if (p.includes('modules' + path.sep + 'sub1') || p.includes('modules/sub1')) {
+            return extDir; // Escapes project root!
+          }
+          return fs.realpathSync(p);
+        }
+      };
+
+      const port = createWorkspaceStatePort({ spawnSync: customSpawn, fs: injectedFs });
+      let caught = null;
+      try {
+        await port.getWorkspaceState({ project_id: 'p1', project_root: superDir });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH);
+      assert.strictEqual(externalGitExecAttempted, false, 'External repository must never be executed against via git -C');
+
+      console.log('✓ WS-043 PASSED: Submodule symlink escape failed closed with 0 external git -C calls.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-044: POSIX backslash filename integrity (WSAUTH-05 / Section 36)
+  {
+    console.log('[WS-044] Git-relative path with backslash preserves backslash without rewriting to "/" (WSAUTH-05)...');
+    const repoRoot = path.resolve('C:\\Fake\\Repo');
+    const pathWithBackslash = Buffer.from('foo\\bar.txt');
+
+    const validated = validateUntrackedPathSafety(pathWithBackslash, repoRoot);
+    assert.ok(validated);
+    assert.strictEqual(validated.gitRelativePath, 'foo\\bar.txt');
+    assert.notStrictEqual(validated.gitRelativePath, 'foo/bar.txt');
+
+    // Also test nested with backslash: "dir/sub\\file.txt"
+    const nestedWithBackslash = Buffer.from('dir/sub\\file.txt');
+    const validatedNested = validateUntrackedPathSafety(nestedWithBackslash, repoRoot);
+    assert.strictEqual(validatedNested.gitRelativePath, 'dir/sub\\file.txt');
+
+    console.log('✓ WS-044 PASSED: Git relative path backslashes preserved as filename data.\n');
+  }
+
+  // WS-045: Project-root symlink alias fails closed (WSAUTH-06 / Section 37)
+  {
+    console.log('[WS-045] Project-root symlink alias fails closed with PROJECT_ROOT_UNAVAILABLE (WSAUTH-06)...');
+    const sandbox = createTestSandbox();
+    try {
+      const repoDir = path.join(sandbox.dir, 'real-repo');
+      initGitRepo(repoDir);
+      commitFile(repoDir, 'README.md', 'Hello World\n');
+
+      const aliasDir = path.join(sandbox.dir, 'alias-repo');
+
+      const injectedFs = {
+        ...fs,
+        statSync: (p) => {
+          if (p === aliasDir) {
+            return { isDirectory: () => true };
+          }
+          return fs.statSync(p);
+        },
+        realpathSync: (p) => {
+          if (p === aliasDir) {
+            return fs.realpathSync(repoDir); // Resolves to real-repo!
+          }
+          return fs.realpathSync(p);
+        }
+      };
+
+      const port = createWorkspaceStatePort({ fs: injectedFs });
+      let caught = null;
+      try {
+        await port.getWorkspaceState({ project_id: 'p1', project_root: aliasDir });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, WORKSPACE_STATE_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE);
+      assert.ok(caught.message.includes('alias or symlink'));
+
+      console.log('✓ WS-045 PASSED: Project root symlink alias rejected with PROJECT_ROOT_UNAVAILABLE.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
   console.log('======================================================================');
-  console.log('ALL WORKSPACE-STATE TESTS PASSED (WS-001 .. WS-039: 39/39 PASS)');
+  console.log('ALL WORKSPACE-STATE TESTS PASSED (WS-001 .. WS-045: 45/45 PASS)');
   console.log('======================================================================\n');
 }
 

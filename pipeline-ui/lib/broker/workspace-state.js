@@ -37,7 +37,7 @@ class WorkspaceStateError extends Error {
  * Constants and Bounds
  */
 const STATE_VERSION = 'workspace-state-v1';
-const GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024; // 64 MiB (A-09)
+const GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024; // 64 MiB (A-09 / WSAUTH-07)
 const MAX_STDERR_DIAGNOSTIC_BYTES = 8 * 1024; // 8 KiB (Section 48)
 
 /**
@@ -61,6 +61,26 @@ function canonicalJsonStringify(val) {
  */
 function sha256Hex(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Prove descriptor and pathname share exact semantic file identity (WSAUTH-01 / A-04).
+ * Compares device, inode number, and regular file type.
+ */
+function sameFileIdentity(s1, s2) {
+  if (!s1 || !s2) {
+    return false;
+  }
+  if (typeof s1.isFile !== 'function' || !s1.isFile() || typeof s2.isFile !== 'function' || !s2.isFile()) {
+    return false;
+  }
+  if (s1.dev == null || s2.dev == null || s1.ino == null || s2.ino == null) {
+    return false;
+  }
+  if (s1.dev !== s2.dev || s1.ino !== s2.ino) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -169,33 +189,41 @@ function resolveGitBranch(gitBinary, projectRoot, customSpawn) {
 
   if (res.status === 0) {
     const branch = res.stdout.toString('utf8').trim();
-    if (branch) {
-      return branch;
+    if (!branch) {
+      throw new WorkspaceStateError(
+        WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+        'git symbolic-ref returned empty branch name'
+      );
     }
+    return branch;
   }
 
-  // Detached HEAD or error
-  const stderr = extractBoundedStderr(res.stderr).trim();
-  if (res.status === 1 && (!stderr || stderr.includes('not a symbolic ref') || stderr.includes('ref HEAD is not a symbolic ref'))) {
+  // Check if failure is expected detached HEAD (A-01)
+  const stderr = extractBoundedStderr(res.stderr);
+  if (
+    res.status === 1 &&
+    (!stderr ||
+      stderr.includes('not a symbolic ref') ||
+      stderr.includes('ref HEAD is not a symbolic ref'))
+  ) {
     return 'DETACHED';
   }
 
-  // Unexpected failure must not become DETACHED (A-01)
   throw new WorkspaceStateError(
     WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
-    `git symbolic-ref failed unexpectedly (status ${res.status}): ${stderr}`,
+    `git symbolic-ref failed unexpectedly: ${stderr}`,
     { status: res.status, stderr }
   );
 }
 
 /**
- * Resolve current commit HEAD (Section 20 / A-08).
+ * Resolve commit SHA of HEAD (Section 20 / A-08).
  */
 function resolveGitHead(gitBinary, projectRoot, customSpawn) {
   const res = runGitCommand(gitBinary, ['rev-parse', '--verify', 'HEAD'], projectRoot, customSpawn);
-  const stderr = extractBoundedStderr(res.stderr);
 
   if (res.status !== 0) {
+    const stderr = extractBoundedStderr(res.stderr);
     if (
       stderr.includes('Needed a single revision') ||
       stderr.includes("ambiguous argument 'HEAD'") ||
@@ -314,14 +342,15 @@ function resolveUnstagedDiffDigest(gitBinary, projectRoot, customSpawn) {
 }
 
 /**
- * Validate untracked path safety against project root (A-02 / A-03).
+ * Validate untracked path safety against project root (A-02 / A-03 / WSAUTH-05).
+ * Preserves raw Git relative path without replacing '\' with '/'.
  */
 function validateUntrackedPathSafety(entryBuf, projectRoot) {
   // Strict UTF-8 decoding (A-02)
-  let relPath;
+  let gitRelativePath;
   try {
     const decoder = new TextDecoder('utf-8', { fatal: true });
-    relPath = decoder.decode(entryBuf);
+    gitRelativePath = decoder.decode(entryBuf);
   } catch (err) {
     throw new WorkspaceStateError(
       WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
@@ -329,47 +358,48 @@ function validateUntrackedPathSafety(entryBuf, projectRoot) {
     );
   }
 
-  if (!relPath) {
+  if (!gitRelativePath) {
     return null;
   }
 
-  // Segment-based traversal check (A-03)
-  const normalizedRel = relPath.replace(/\\/g, '/');
-
   // Reject absolute paths
-  if (path.isAbsolute(relPath) || /^[a-zA-Z]:/.test(relPath) || normalizedRel.startsWith('/')) {
+  if (gitRelativePath.startsWith('/') || /^[a-zA-Z]:/.test(gitRelativePath)) {
     throw new WorkspaceStateError(
       WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-      `Untracked path must be relative to project root: '${relPath}'`
+      `Untracked path must be relative to project root: '${gitRelativePath}'`
     );
   }
 
-  const segments = normalizedRel.split('/');
+  // Segment-based traversal check (A-03 / WSAUTH-05): Git relative paths use '/' as directory separator
+  const segments = gitRelativePath.split('/');
   for (const seg of segments) {
     if (seg === '..') {
       throw new WorkspaceStateError(
         WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-        `Untracked path contains directory traversal segment '..': '${relPath}'`
+        `Untracked path contains directory traversal segment '..': '${gitRelativePath}'`
       );
     }
   }
 
-  const fullPath = path.resolve(projectRoot, relPath);
-  if (!fullPath.startsWith(projectRoot + path.sep) && fullPath !== projectRoot) {
+  // Resolve filesystem path by joining segments
+  const fullPath = path.resolve(projectRoot, ...segments);
+  const relCheck = path.relative(projectRoot, fullPath);
+  if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
     throw new WorkspaceStateError(
       WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-      `Untracked path resolves outside project root: '${relPath}'`
+      `Untracked path resolves outside project root: '${gitRelativePath}'`
     );
   }
 
   return {
-    relPath: normalizedRel,
+    gitRelativePath,
+    relPath: gitRelativePath,
     fullPath
   };
 }
 
 /**
- * Collect nonignored untracked manifest with symlink safety and race detection (Sections 25-36 / A-02 / A-03 / A-04 / A-05 / A-19).
+ * Collect nonignored untracked manifest with symlink safety and race detection (Sections 25-36 / A-02-A-05 / WSAUTH-01 / WSAUTH-05).
  */
 function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs) {
   const res = runGitCommand(
@@ -411,7 +441,7 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
     if (!validated) {
       continue;
     }
-    const { relPath, fullPath } = validated;
+    const { gitRelativePath, fullPath } = validated;
 
     // Pre-lstat
     let preStat;
@@ -420,7 +450,7 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
     } catch (err) {
       throw new WorkspaceStateError(
         WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
-        `Failed to lstat untracked entry '${relPath}': ${err.message}`
+        `Failed to lstat untracked entry '${gitRelativePath}': ${err.message}`
       );
     }
 
@@ -432,20 +462,20 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
       } catch (err) {
         throw new WorkspaceStateError(
           WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
-          `Failed to readlink untracked symlink '${relPath}': ${err.message}`
+          `Failed to readlink untracked symlink '${gitRelativePath}': ${err.message}`
         );
       }
       const targetSha256 = sha256Hex(targetBuf);
 
       manifestEntries.push({
-        path: relPath,
+        path: gitRelativePath,
         type: 'symlink',
         target_sha256: targetSha256,
         target_bytes: targetBuf.length,
         mode: preStat.mode
       });
     } else if (preStat.isFile()) {
-      // Regular file safe open & race verification sequence (A-04)
+      // Regular file safe open & race verification sequence (A-04 / WSAUTH-01)
       const openFlags = (fs.constants.O_NOFOLLOW ? fs.constants.O_NOFOLLOW : 0) | fs.constants.O_RDONLY;
       let fd;
       try {
@@ -453,7 +483,7 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
       } catch (err) {
         throw new WorkspaceStateError(
           WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
-          `Failed to open untracked file '${relPath}': ${err.message}`
+          `Failed to open untracked file '${gitRelativePath}': ${err.message}`
         );
       }
 
@@ -461,18 +491,18 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
         const fdStat = customFs.fstatSync(fd);
         const postStat = customFs.lstatSync(fullPath);
 
-        if (!fdStat.isFile() || !postStat.isFile()) {
+        if (!preStat.isFile() || !fdStat.isFile() || !postStat.isFile()) {
           throw new WorkspaceStateError(
             WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
-            `Untracked file '${relPath}' changed from regular file during open`
+            `Untracked file '${gitRelativePath}' changed from regular file during open`
           );
         }
 
-        // Check inode identity where available
-        if (preStat.ino && postStat.ino && (preStat.ino !== postStat.ino || preStat.dev !== postStat.dev)) {
+        // Prove pre == fd and fd == post identity (WSAUTH-01 / A-04)
+        if (!sameFileIdentity(preStat, fdStat) || !sameFileIdentity(fdStat, postStat)) {
           throw new WorkspaceStateError(
             WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
-            `Untracked file '${relPath}' inode changed during open`
+            `Untracked file '${gitRelativePath}' descriptor identity does not match pathname identity (pre/fd/post mismatch)`
           );
         }
 
@@ -489,7 +519,7 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
         }
 
         manifestEntries.push({
-          path: relPath,
+          path: gitRelativePath,
           type: 'file',
           size: totalBytes,
           mode: preStat.mode,
@@ -504,7 +534,7 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
       // Special unsupported type (FIFO, socket, device, directory) (Section 35)
       throw new WorkspaceStateError(
         WORKSPACE_STATE_ERROR_CODES.UNSUPPORTED_UNTRACKED_TYPE,
-        `Unsupported untracked file type for '${relPath}' (mode ${preStat.mode})`
+        `Unsupported untracked file type for '${gitRelativePath}' (mode ${preStat.mode})`
       );
     }
   }
@@ -522,14 +552,14 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
 }
 
 /**
- * Collect submodule state from index gitlinks and working trees (Sections 41-46 / A-06 / A-07 / A-19).
+ * Collect submodule state from index gitlinks and working trees (Sections 41-46 / A-06 / A-07 / WSAUTH-02-05).
  */
-function collectSubmoduleState(gitBinary, projectRoot, customSpawn, customFs) {
+function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, customFs) {
   // 1. Discover submodules via index gitlinks (mode 160000)
   const lsStageRes = runGitCommand(
     gitBinary,
     ['ls-files', '--stage', '-z'],
-    projectRoot,
+    canonicalProjectRoot,
     customSpawn
   );
 
@@ -549,70 +579,196 @@ function collectSubmoduleState(gitBinary, projectRoot, customSpawn, customFs) {
   for (let i = 0; i < buf.length; i++) {
     if (buf[i] === 0) {
       if (i > start) {
-        const line = buf.subarray(start, i).toString('utf8');
-        // Format: <mode> <sha> <stage>\t<path>
-        const tabIdx = line.indexOf('\t');
-        if (tabIdx !== -1) {
-          const meta = line.substring(0, tabIdx).trim().split(/\s+/);
-          const submodPath = line.substring(tabIdx + 1).trim();
-          const mode = meta[0];
-          const gitlinkSha = meta[1];
+        const recordBuf = buf.subarray(start, i);
+        // Find TAB byte separating metadata from path (WSAUTH-03)
+        const tabIdx = recordBuf.indexOf(0x09);
+        if (tabIdx === -1) {
+          throw new WorkspaceStateError(
+            WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+            'Malformed git ls-files --stage record: missing TAB separator'
+          );
+        }
 
-          if (mode === '160000') {
-            const normalizedSubPath = submodPath.replace(/\\/g, '/');
-            const submodFullPath = path.resolve(projectRoot, submodPath);
+        const metaBuf = recordBuf.subarray(0, tabIdx);
+        const pathBuf = recordBuf.subarray(tabIdx + 1);
 
-            // Verify path safety
-            if (!submodFullPath.startsWith(projectRoot + path.sep) && submodFullPath !== projectRoot) {
+        const metaStr = metaBuf.toString('ascii').trim();
+        const metaParts = metaStr.split(/\s+/);
+        if (metaParts.length !== 3) {
+          throw new WorkspaceStateError(
+            WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+            `Malformed git ls-files --stage metadata: '${metaStr}'`
+          );
+        }
+
+        const [mode, gitlinkSha, stage] = metaParts;
+        if (!/^[0-7]{6}$/.test(mode) || !/^[0-9a-fA-F]{40}$/.test(gitlinkSha) || !/^[0-3]$/.test(stage)) {
+          throw new WorkspaceStateError(
+            WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+            `Invalid git ls-files --stage record values: mode=${mode}, sha=${gitlinkSha}, stage=${stage}`
+          );
+        }
+
+        if (mode === '160000') {
+          // Strict UTF-8 decode of path bytes (A-02, WSAUTH-03)
+          let gitRelativePath;
+          try {
+            const decoder = new TextDecoder('utf-8', { fatal: true });
+            gitRelativePath = decoder.decode(pathBuf);
+          } catch (err) {
+            throw new WorkspaceStateError(
+              WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
+              `Submodule path contains invalid UTF-8 bytes: ${err.message}`
+            );
+          }
+
+          if (!gitRelativePath) {
+            throw new WorkspaceStateError(
+              WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
+              'Submodule path is empty'
+            );
+          }
+
+          // Reject absolute paths
+          if (gitRelativePath.startsWith('/') || /^[a-zA-Z]:/.test(gitRelativePath)) {
+            throw new WorkspaceStateError(
+              WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
+              `Submodule path must be relative to project root: '${gitRelativePath}'`
+            );
+          }
+
+          // Segment-based traversal check (WSAUTH-04 / WSAUTH-05)
+          const segments = gitRelativePath.split('/');
+          for (const seg of segments) {
+            if (seg === '..') {
               throw new WorkspaceStateError(
                 WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-                `Submodule path escapes project root: '${submodPath}'`
+                `Submodule path contains directory traversal segment '..': '${gitRelativePath}'`
+              );
+            }
+          }
+
+          // Build filesystem path without modifying gitRelativePath (WSAUTH-05)
+          const submodFullPath = path.resolve(canonicalProjectRoot, ...segments);
+
+          // Lexical containment verification
+          const relCheck = path.relative(canonicalProjectRoot, submodFullPath);
+          if (relCheck.startsWith('..') || path.isAbsolute(relCheck) || relCheck === '') {
+            throw new WorkspaceStateError(
+              WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
+              `Submodule path resolves outside project root: '${gitRelativePath}'`
+            );
+          }
+
+          // Submodule worktree symlink / canonical containment check (WSAUTH-04)
+          let submodStat = null;
+          try {
+            submodStat = customFs.lstatSync(submodFullPath);
+          } catch (err) {
+            if (err.code !== 'ENOENT') {
+              throw new WorkspaceStateError(
+                WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
+                `Failed to lstat submodule path '${gitRelativePath}': ${err.message}`
+              );
+            }
+          }
+
+          if (!submodStat) {
+            // Directory does not exist -> uninitialized (A-06, Section 26)
+            submodules.push({
+              path: gitRelativePath,
+              recorded_gitlink_sha: gitlinkSha,
+              observed_head: null,
+              initialized: false,
+              dirty_status_sha256: null
+            });
+            continue;
+          }
+
+          // If working tree path exists, check if it or any intermediate resolves outside root (WSAUTH-04)
+          let canonicalSubmod;
+          try {
+            const realpathFn = customFs.realpathSync.native || customFs.realpathSync;
+            canonicalSubmod = realpathFn(submodFullPath);
+          } catch (err) {
+            throw new WorkspaceStateError(
+              WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
+              `Failed to resolve canonical path for submodule '${gitRelativePath}': ${err.message}`
+            );
+          }
+
+          const relCanonical = path.relative(canonicalProjectRoot, canonicalSubmod);
+          if (relCanonical.startsWith('..') || path.isAbsolute(relCanonical) || relCanonical === '') {
+            throw new WorkspaceStateError(
+              WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
+              `Submodule path '${gitRelativePath}' resolves outside project root via symlink: '${canonicalSubmod}'`
+            );
+          }
+
+          // Check if .git exists inside the validated canonical submodule directory
+          const gitDir = path.join(canonicalSubmod, '.git');
+          let isInitialized = false;
+          try {
+            isInitialized = customFs.existsSync(gitDir);
+          } catch {}
+
+          if (isInitialized) {
+            // Observed HEAD (WSAUTH-02: fails closed if git command fails)
+            const headRes = runGitCommand(
+              gitBinary,
+              ['rev-parse', '--verify', 'HEAD'],
+              canonicalSubmod,
+              customSpawn
+            );
+            if (headRes.status !== 0) {
+              const stderr = extractBoundedStderr(headRes.stderr);
+              throw new WorkspaceStateError(
+                WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+                `git rev-parse --verify HEAD failed for submodule '${gitRelativePath}': ${stderr}`,
+                { status: headRes.status, stderr }
+              );
+            }
+            const observedHead = headRes.stdout.toString('utf8').trim();
+            if (!observedHead || observedHead.length !== 40) {
+              throw new WorkspaceStateError(
+                WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+                `Invalid HEAD commit SHA returned for submodule '${gitRelativePath}': '${observedHead}'`
               );
             }
 
-            // Check initialization
-            const gitDir = path.join(submodFullPath, '.git');
-            let isInitialized = false;
-            try {
-              isInitialized = customFs.existsSync(gitDir);
-            } catch {}
-
-            if (isInitialized) {
-              // Observed HEAD
-              const headRes = runGitCommand(
-                gitBinary,
-                ['rev-parse', '--verify', 'HEAD'],
-                submodFullPath,
-                customSpawn
+            // Dirty status (WSAUTH-02: fails closed if git command fails)
+            const dirtyRes = runGitCommand(
+              gitBinary,
+              ['-C', canonicalSubmod, 'status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none'],
+              canonicalProjectRoot,
+              customSpawn
+            );
+            if (dirtyRes.status !== 0) {
+              const stderr = extractBoundedStderr(dirtyRes.stderr);
+              throw new WorkspaceStateError(
+                WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+                `git status failed for submodule '${gitRelativePath}': ${stderr}`,
+                { status: dirtyRes.status, stderr }
               );
-              const observedHead = headRes.status === 0 ? headRes.stdout.toString('utf8').trim() : null;
-
-              // Dirty status (A-06 / A-07)
-              const dirtyRes = runGitCommand(
-                gitBinary,
-                ['-C', submodFullPath, 'status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none'],
-                projectRoot,
-                customSpawn
-              );
-              const dirtyStatusSha = dirtyRes.status === 0 ? sha256Hex(dirtyRes.stdout) : null;
-
-              submodules.push({
-                path: normalizedSubPath,
-                recorded_gitlink_sha: gitlinkSha,
-                observed_head: observedHead,
-                initialized: true,
-                dirty_status_sha256: dirtyStatusSha
-              });
-            } else {
-              // Uninitialized (A-06)
-              submodules.push({
-                path: normalizedSubPath,
-                recorded_gitlink_sha: gitlinkSha,
-                observed_head: null,
-                initialized: false,
-                dirty_status_sha256: null
-              });
             }
+            const dirtyStatusSha = sha256Hex(dirtyRes.stdout);
+
+            submodules.push({
+              path: gitRelativePath,
+              recorded_gitlink_sha: gitlinkSha,
+              observed_head: observedHead,
+              initialized: true,
+              dirty_status_sha256: dirtyStatusSha
+            });
+          } else {
+            // Uninitialized (A-06)
+            submodules.push({
+              path: gitRelativePath,
+              recorded_gitlink_sha: gitlinkSha,
+              observed_head: null,
+              initialized: false,
+              dirty_status_sha256: null
+            });
           }
         }
       }
@@ -620,17 +776,24 @@ function collectSubmoduleState(gitBinary, projectRoot, customSpawn, customFs) {
     }
   }
 
-  // 2. Supplementary raw git submodule status --recursive (A-06)
+  // 2. Supplementary raw git submodule status --recursive (A-06 / WSAUTH-02)
   const rawSubmodRes = runGitCommand(
     gitBinary,
     ['submodule', 'status', '--recursive'],
-    projectRoot,
+    canonicalProjectRoot,
     customSpawn
   );
+  if (rawSubmodRes.status !== 0) {
+    const stderr = extractBoundedStderr(rawSubmodRes.stderr);
+    throw new WorkspaceStateError(
+      WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
+      `git submodule status --recursive failed: ${stderr}`,
+      { status: rawSubmodRes.status, stderr }
+    );
+  }
+  const rawSubmoduleStatusSha = sha256Hex(rawSubmodRes.stdout);
 
-  const rawSubmoduleStatusSha = rawSubmodRes.status === 0 ? sha256Hex(rawSubmodRes.stdout) : null;
-
-  // Code-unit sorting (A-19)
+  // Deterministic code-unit sorting (A-19)
   submodules.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
   const compositeSubmoduleData = {
@@ -739,6 +902,18 @@ function createWorkspaceStatePort(options = {}) {
       );
     }
 
+    // Root Input Identity Binding (WSAUTH-06 / A-10)
+    // Compare input identity with canonical identity.
+    // If caller supplied a symlink or alias whose canonical identity differs from input identity: fail closed.
+    const inputIdentity = computeRootIdentityKey(projectRoot);
+    const canonicalIdentity = computeRootIdentityKey(canonicalRoot);
+    if (inputIdentity !== canonicalIdentity) {
+      throw new WorkspaceStateError(
+        WORKSPACE_STATE_ERROR_CODES.PROJECT_ROOT_UNAVAILABLE,
+        `Project root '${projectRoot}' is an alias or symlink resolving to '${canonicalRoot}'. Non-canonical root aliases are not permitted.`
+      );
+    }
+
     // 3. Verify Git toplevel matches project root (Section 15 / A-10)
     resolveGitToplevel(gitBinary, canonicalRoot, customSpawn, customFs);
 
@@ -819,6 +994,7 @@ module.exports = {
   MAX_STDERR_DIAGNOSTIC_BYTES,
   canonicalJsonStringify,
   sha256Hex,
+  sameFileIdentity,
   runGitCommand,
   validateUntrackedPathSafety,
   createWorkspaceStatePort
