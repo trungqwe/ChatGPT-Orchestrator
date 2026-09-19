@@ -68,12 +68,17 @@ Before launching the auditor, the target repository and project registry must be
 3. **Select the Expected Model**:
    In the model selector dropdown, manually select the exact model specified by `auditor.expected_model_label` (e.g., `ChatGPT Web — GPT-5.6 Sol High`).
 
-4. **Visually Confirm Model**:
-   Confirm that the active model label matches the registry. Record:
-   ```text
-   MODEL_VERIFICATION: HUMAN_CONFIRMED
-   ```
-   > **WARNING**: The system will never auto-switch models. If the model does not match, stop.
+4. **Execute Operator Model Confirmation Protocol**:
+   Before initiating audit readiness, the operator must:
+   - Visually inspect the active selected model in the Codex task UI.
+   - Compare it directly against `auditor.expected_model_label` in the registry.
+   - Explicitly confirm the match by providing external operator confirmation:
+     ```text
+     MODEL_VERIFICATION: HUMAN_CONFIRMED
+     MODEL_LABEL: <exact visible selected label>
+     ```
+   - Only after this confirmation is provided may readiness evaluation proceed.
+   > **WARNING**: The system will never auto-switch models. If the model does not match or is unconfirmed, stop. Never permit `AUDITOR READY` before human confirmation.
 
 ---
 
@@ -88,7 +93,8 @@ codex-chatgpt-web doctor --json
 Verify the JSON response:
 - `ok` must be `true`.
 - `mode` must be `"full"`.
-- Checks for `config`, `browser-host`, `codex`, `service`, `proxy`, and `tools`/`tunnel` must have no `error` status.
+- Checks for `config`, `browser-host`, `codex`, `service`, `proxy`, tunnel categories (`tunnel-binary`, `tunnel-key`, `tunnel-service`, `tunnel-runtime`), and `connector` must contain zero `error` status.
+- **Connector Warning Rule**: A `connector` warning from doctor is expected and does not constitute an automatic health failure (`connector warning from doctor != automatic health failure` when `doctor.ok == true`, `doctor.mode == "full"`, and zero error checks exist). Actual task tool execution proves end-to-end connector usability.
 
 > **CRITICAL REMINDER**:  
 > A successful doctor check is necessary but **not sufficient**. Doctor proves local background services, but cannot locally prove that the remote ChatGPT web session has attached its connector to the active task. Actual local tool execution inside the task is required.
@@ -101,32 +107,44 @@ Verify the JSON response:
    Copy the authoritative prompt from `docs/refactor-v3-thin-orchestrator/21-CODEX-AUDITOR-BOOTSTRAP.md` (Section 16).
 
 2. **Send Prompt into Dedicated Codex Task**:
-   Paste and send the prompt into the chosen Codex task.
+   Paste and send the prompt into the chosen Codex task (along with the operator's explicit model confirmation).
 
 3. **Observe Sol's Execution**:
-   Sol will execute the 11-step startup sequence:
-   - Restate role as architect/auditor.
-   - Read durable architecture documentation.
-   - Verify Git toplevel matches `project_root`.
-   - Inspect git status and diff.
-   - Run `codex-chatgpt-web doctor --json`.
-   - Capture `S_before` via `agent-broker-cli snapshot --project-id <PROJECT_ID>`.
-   - Check worker status via `agent-broker-cli worker-status --project-id <PROJECT_ID>`.
-   - Execute one read/search operation and one terminal command to prove Full Harness tool capability.
-   - Capture `S_after` via `agent-broker-cli snapshot --project-id <PROJECT_ID>` and verify `S_before == S_after`.
-   - Emit `AUDITOR READY` or `AUDITOR BLOCKED`.
+   Sol will execute the 14-step startup sequence strictly in order:
+   - 1. Restate role as architect/auditor.
+   - 2. Read durable architecture documentation.
+   - 3. Resolve project mapping from registry.
+   - 4. Verify Git toplevel matches `project_root`.
+   - 5. Capture `S_before` via `agent-broker-cli snapshot --project-id <PROJECT_ID>`.
+   - 6. Inspect git status and diff.
+   - 7. Run `codex-chatgpt-web doctor --json`.
+   - 8. Check broker worker-status (verifying `worker_state == "IDLE"`).
+   - 9. Perform actual local source-read proof.
+   - 10. Perform read-only terminal proof.
+   - 11. Capture `S_after` via `agent-broker-cli snapshot --project-id <PROJECT_ID>`.
+   - 12. Verify `S_before == S_after`.
+   - 13. Evaluate human model confirmation and all health authorities.
+   - 14. Emit `AUDITOR READY` or `AUDITOR BLOCKED`.
 
 ---
 
 ## 6. Phase-B Acceptance Verification
 
-During Phase-B readiness acceptance:
-1. Confirm that Sol outputs the complete `AUDITOR READY` structured block.
-2. Confirm `workspace identity: MATCH`.
-3. Confirm `source write performed: NO` and `worker dispatch performed: NO`.
-4. Confirm `S_before == S_after`.
-5. Visually confirm model identity (`HUMAN_CONFIRMED`).
-6. Verify no worker dispatch was executed.
+During Phase-B readiness acceptance, the operator and system must strictly follow this sequential order:
+1. **Select intended persistent task** (dedicated to this project).
+2. **Select expected model** in the Codex model dropdown.
+3. **Human-confirm selected model** (`MODEL_VERIFICATION: HUMAN_CONFIRMED`).
+4. **Paste and run bootstrap prompt** in the selected task.
+5. **Complete machine and task health checks** (doctor `ok: true`, `mode: "full"`, broker `worker_state == "IDLE"`, local source read PASS, terminal PASS).
+6. **Verify `S_before == S_after`** (zero workspace mutation during bootstrap).
+7. **Emit and verify `AUDITOR READY` block**:
+   - Confirm block contains `model verification: HUMAN_CONFIRMED`.
+   - Confirm block contains `worker state: IDLE` (or `worker_state: IDLE`).
+   - Confirm `workspace identity: MATCH`.
+   - Confirm `source write performed: NO` and `worker dispatch performed: NO`.
+   - Verify zero worker dispatch was executed.
+
+> **CRITICAL INVARIANT**: Never emit or verify `AUDITOR READY` before human model confirmation is complete. If model is unconfirmed, Sol emits `AUDITOR BLOCKED` with `reason_code: MODEL_NOT_CONFIRMED`.
 
 ---
 

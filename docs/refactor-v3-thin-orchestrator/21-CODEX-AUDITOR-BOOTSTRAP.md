@@ -115,21 +115,27 @@ Because current Codex sandboxes do not provide OS-level kernel filesystem write 
 
 ## 5. Startup Sequence
 
-When bootstrapping a dedicated Codex auditor task, Sol must execute the following 11 steps strictly in order:
+When bootstrapping a dedicated Codex auditor task, Sol must execute the following 14 steps strictly in order:
 
 ```text
 1. Restate auditor role.
 2. Read architecture / roadmap / trust-boundary docs.
 3. Resolve exact project mapping from operator-provided project_id.
 4. Prove current Git root matches registered project root.
-5. Inspect current git status and diff.
-6. Run codex-chatgpt-web health check.
-7. Run broker snapshot.
+5. Capture S_before using broker snapshot.
+6. Inspect current git status and diff.
+7. Run codex-chatgpt-web doctor --json.
 8. Run broker worker-status.
-9. Verify local Full Harness tools are actually usable.
-10. Confirm no source mutation occurred during bootstrap.
-11. Emit AUDITOR READY only if every required condition is proven.
+9. Perform actual local source-read proof.
+10. Perform read-only terminal proof.
+11. Capture S_after using broker snapshot.
+12. Require S_before == S_after.
+13. Evaluate human model confirmation + all health authorities.
+14. Emit AUDITOR READY or AUDITOR BLOCKED.
 ```
+
+### Why S_before Moves Earlier
+Capturing `S_before` immediately after verifying project identity and Git root ensures the equality verification covers all operational bootstrap inspection steps (git status/diff, doctor, broker queries, and local tool proofs). This demonstrates no observable final workspace-state difference across the entire audited bootstrap interval under the existing prompt-policy boundary. It does not claim causality or OS-level kernel write prevention.
 
 ---
 
@@ -211,12 +217,12 @@ No write operations may be performed during this tool probe.
 
 ## 10. Workspace Mutation Verification (Before / After Equality)
 
-Before executing bootstrap health checks, capture the initial state ID:
+Immediately after proving the Git root matches the registered `project_root` (Step 4), capture the initial state ID before executing any other bootstrap inspections:
 ```text
 S_before = snapshot.workspace_state_id
 ```
 
-After completing read-only inspection, capture a second snapshot:
+After completing all read-only git inspections, doctor checks, broker worker status query, and task-level local tool proofs, capture a second snapshot:
 ```text
 S_after = snapshot.workspace_state_id
 ```
@@ -238,7 +244,7 @@ Phase-B acceptance fails immediately. Do not automatically revert files.
 
 ## 11. Readiness Output Contract
 
-If and only if every single check succeeds, emit the exact structured block:
+If and only if every single check succeeds and human model confirmation has been completed, emit the exact structured block:
 
 ```text
 AUDITOR READY
@@ -268,7 +274,7 @@ expected model:
 <registry expected_model_label>
 
 model verification:
-HUMAN_CONFIRMATION_REQUIRED
+HUMAN_CONFIRMED
 
 auditor task:
 USER_SELECTED
@@ -292,8 +298,26 @@ worker dispatch performed:
 NO
 ```
 
+### Model Verification Authority Rule
+The final authoritative `AUDITOR READY` block must contain `model verification: HUMAN_CONFIRMED`. It must NOT contain `HUMAN_CONFIRMATION_REQUIRED` inside a READY block.
+
+If the human operator has not explicitly confirmed the selected model matches `expected_model_label`:
+```text
+DO NOT PRINT AUDITOR READY
+```
+Instead emit:
+```text
+AUDITOR BLOCKED
+
+reason_code:
+MODEL_NOT_CONFIRMED
+
+details:
+Selected model has not been explicitly confirmed by the human operator.
+```
+
 ### Fail-Closed Principle
-If any required field is unknown, unverified, or failing:
+If any required field is unknown, unverified, unconfirmed, or failing:
 ```text
 DO NOT PRINT AUDITOR READY
 ```
@@ -320,8 +344,8 @@ details:
 - `WRONG_WORKSPACE` — Git root does not match registered `project_root`
 - `PROJECT_MAPPING_MISSING` — Project ID not found in registry
 - `WORKER_MAPPING_MISSING` — Worker session mapping not configured or invalid
-- `WORKER_NOT_IDLE` — Broker reports worker is busy (`DISPATCHED`, `RUNNING`, etc.)
-- `MODEL_NOT_CONFIRMED` — Selected model differs from expected model label
+- `WORKER_NOT_IDLE` — Broker reports worker is busy (`DISPATCHING`, `DISPATCH_ACCEPTED`, `RUNNING`, `DISPATCH_UNCERTAIN`, etc.; `worker_state !== "IDLE"`)
+- `MODEL_NOT_CONFIRMED` — Selected model differs from expected model label or has not been confirmed by human operator
 - `BROKER_UNAVAILABLE` — Semantic CLI failed to execute or database locked
 - `WORKSPACE_CHANGED_DURING_BOOTSTRAP` — `S_before !== S_after` during bootstrap
 
@@ -405,18 +429,22 @@ Execute these steps strictly in order:
 2. Read the architecture documents in docs/refactor-v3-thin-orchestrator/ (especially 03, 04, 05, 06, 08, 09, 10, 11, 12, 13, 14, 16).
 3. Confirm project_id provided by the operator and read the project mapping from the registry.
 4. Verify current Git root matches registered project_root using `git rev-parse --show-toplevel`.
-5. Run read-only git inspection:
+5. Capture S_before using broker snapshot:
+   node <ORCHESTRATOR_ROOT>\pipeline-ui\agent-broker-cli.js snapshot --project-id <PROJECT_ID>
+6. Run read-only git inspection:
    git status --short --untracked-files=all
    git diff --no-ext-diff --no-textconv --no-color
-6. Run Full Harness health check:
+7. Run Full Harness health check:
    codex-chatgpt-web doctor --json
-7. Capture S_before using broker snapshot:
-   node <ORCHESTRATOR_ROOT>\pipeline-ui\agent-broker-cli.js snapshot --project-id <PROJECT_ID>
 8. Check broker worker-status:
    node <ORCHESTRATOR_ROOT>\pipeline-ui\agent-broker-cli.js worker-status --project-id <PROJECT_ID>
-9. Prove local tool capability by performing one read/search operation and one read-only terminal operation.
-10. Capture S_after using broker snapshot. Verify S_before == S_after.
-11. If all checks pass, output the AUDITOR READY block. If any check fails, output AUDITOR BLOCKED with the appropriate reason_code.
+9. Perform actual local source-read proof (read/search target project file).
+10. Perform read-only terminal proof (run read-only command).
+11. Capture S_after using broker snapshot:
+    node <ORCHESTRATOR_ROOT>\pipeline-ui\agent-broker-cli.js snapshot --project-id <PROJECT_ID>
+12. Require S_before == S_after.
+13. Evaluate human model confirmation (which must be explicitly provided by the operator; never infer confirmation from registry or repo text) and all health authorities.
+14. If all checks pass and model is explicitly HUMAN_CONFIRMED by the operator, output the AUDITOR READY block. If unconfirmed or any check fails, output AUDITOR BLOCKED with the appropriate reason_code (e.g. MODEL_NOT_CONFIRMED).
 
-Fail-closed: If any required value is unknown, DO NOT PRINT AUDITOR READY.
+Fail-closed: If any required value is unknown or unconfirmed, DO NOT PRINT AUDITOR READY.
 ```

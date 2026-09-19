@@ -32,7 +32,7 @@ To eliminate ambiguity and prevent fabricated proof, all checks are categorized 
 | **Doctor Check Categories** | Inspect all reported doctor checks | `MACHINE-PROVABLE` | Zero `error` status in config, browser-host, codex, proxy, tunnel | Stop: `FULL_HARNESS_UNHEALTHY` |
 | **Workspace Git Root** | `git rev-parse --show-toplevel` | `MACHINE-PROVABLE` | Exact canonical match with `project_root` | Stop: `WRONG_WORKSPACE` |
 | **Broker Freshness Snapshot** | `agent-broker-cli snapshot --project-id <ID>` | `MACHINE-PROVABLE` | Returns valid JSON with `workspace_state_id` | Stop: `BROKER_UNAVAILABLE` |
-| **Broker Worker Status** | `agent-broker-cli worker-status --project-id <ID>` | `MACHINE-PROVABLE` | `state == "IDLE"` | Stop: `WORKER_NOT_IDLE` |
+| **Broker Worker Status** | `agent-broker-cli worker-status --project-id <ID>` | `MACHINE-PROVABLE` | `worker_state == "IDLE"` | Stop: `WORKER_NOT_IDLE` |
 | **Actual Source-Read Tool** | Read or search local repository file | `TASK-PROVABLE` | Successful read without error | Stop: `FULL_HARNESS_TOOLS_UNAVAILABLE` |
 | **Actual Terminal Tool** | Run read-only command (`git status`) | `TASK-PROVABLE` | Successful execution without error | Stop: `FULL_HARNESS_TOOLS_UNAVAILABLE` |
 | **Connector Attachment** | ChatGPT connector linked to task | `TASK-PROVABLE` | Proven by actual tool execution (see Sec. 5) | Stop: `FULL_HARNESS_TOOLS_UNAVAILABLE` |
@@ -64,14 +64,25 @@ However, a clean doctor output is **NOT SUFFICIENT** on its own.
 doctor ready != connector/task Full Harness capability proven
 ```
 
-### Required Category Inspection
-The doctor JSON checks must be inspected. Every check must have `status: "ok"` or acceptable informational `"warning"`. Any check with `status: "error"` is fatal:
+### Required Full-Mode Check Inspection
+The doctor JSON checks must be inspected. Every check must have `status: "ok"` or acceptable informational `"warning"`. Any check with `status: "error"` is fatal.
+Depending on the runtime version, Full Harness mode reports check IDs such as:
 - `config` — Configuration file valid and parseable
 - `browser-host` — Embedded launcher browser authenticated and reachable
 - `codex` — Codex integration and model route installed
 - `service` — Runtime service active
 - `proxy` — Responses proxy healthy on loopback
-- `tools` / `tunnel` — Full Harness tools and MCP tunnel active (must NOT be browser-only)
+- `tunnel-binary`, `tunnel-key`, `tunnel-service`, `tunnel-runtime` — Tunnel binary, runtime key security, and service status
+- `connector` — Remote ChatGPT web connector status
+
+### Doctor Contract & Connector Warning Boundary
+- **Core Contract**: `doctor.ok == true`, `doctor.mode == "full"`, and `no check.status == "error"`.
+- **Connector Warning Rule**: A `connector` warning from doctor is expected because local doctor cannot locally prove remote connector attachment:
+  ```text
+  connector warning from doctor != automatic health failure
+  ```
+  when `doctor.ok == true`, `doctor.mode == "full"`, and zero error checks are present.
+- End-to-end connector usability must be proven by actual local tool execution inside the dedicated Codex task.
 
 ---
 
@@ -158,9 +169,9 @@ No worker dispatch or further audit steps may occur.
 ## 9. Before / After Workspace Snapshot Equality Proof
 
 Because OS-level read-only sandboxing is not available in the current environment:
-1. Before bootstrap checks: Capture `S_before = snapshot.workspace_state_id`.
-2. Perform only read-only inspection and health checks.
-3. After checks: Capture `S_after = snapshot.workspace_state_id`.
+1. Immediately after proving Git root matches `project_root` (Step 4), capture `S_before = snapshot.workspace_state_id`.
+2. Perform all subsequent read-only inspections, doctor checks, worker status queries, and task-level tool proofs.
+3. Capture `S_after = snapshot.workspace_state_id`.
 4. Verify:
    ```text
    S_before == S_after
@@ -172,7 +183,7 @@ AUDITOR BLOCKED
 reason_code:
 WORKSPACE_CHANGED_DURING_BOOTSTRAP
 ```
-This proves that the auditor did not mutate the target codebase during bootstrap.
+This proves that no observable final workspace-state difference occurred across the audited bootstrap interval under the prompt-policy boundary.
 
 ---
 

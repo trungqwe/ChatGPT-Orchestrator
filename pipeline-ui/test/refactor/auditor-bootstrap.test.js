@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Codex Auditor Bootstrap & Health Static Test Suite (AB-001 .. AB-024)
+ * Codex Auditor Bootstrap & Health Static Test Suite (AB-001 .. AB-028)
  *
  * Validates:
  * - Authoritative presence of bootstrap, health checklist, and operator runbook docs
@@ -18,7 +18,11 @@
  * - Fail-closed readiness and structured blocked reason codes
  * - Independent re-audit after READY_FOR_REVIEW and context compaction recovery
  * - Bounded worker wait (1..30s, prefer <=10s)
- * - Zero real AO/Codex process execution during test
+ * - Non-vacuous static proof: zero process execution, zero broker/registry mutation APIs
+ * - Authoritative AUDITOR READY block requires HUMAN_CONFIRMED (never PENDING)
+ * - Unconfirmed model blocks readiness fail-closed (MODEL_NOT_CONFIRMED)
+ * - Exact broker worker_state authority field
+ * - Static test has zero side-effect capability (only built-in assert, fs, path; read-only)
  */
 
 const assert = require('assert');
@@ -33,13 +37,8 @@ const bootstrapDocPath = path.join(docsDir, '21-CODEX-AUDITOR-BOOTSTRAP.md');
 const healthDocPath = path.join(docsDir, '22-CODEX-AUDITOR-HEALTH-CHECKLIST.md');
 const runbookDocPath = path.join(docsDir, '23-CODEX-AUDITOR-OPERATOR-RUNBOOK.md');
 
-// Counter for tracking process launches and mutations within this test
-let codexProcessLaunches = 0;
-let aoProcessLaunches = 0;
-let registryMutations = 0;
-
 function runAllTests() {
-  console.log('Running Codex Auditor Bootstrap static verification tests (AB-001 .. AB-024)...');
+  console.log('Running Codex Auditor Bootstrap static verification tests (AB-001 .. AB-028)...');
 
   // AB-001: Required docs exist
   {
@@ -162,12 +161,12 @@ function runAllTests() {
     console.log('PASS: AB-013 — Worker dispatch strictly prohibited in WP-V3-07 acceptance');
   }
 
-  // AB-014: Model human confirmation
+  // AB-014: Model human confirmation required in READY
   {
     assert.match(healthContent, /HUMAN-CONFIRMED/i, 'AB-014: Model check must be classified as HUMAN-CONFIRMED');
     assert.match(healthContent, /MODEL[_\s]VERIFICATION:[\s\r\n]+HUMAN_CONFIRMED/i, 'AB-014: Must define MODEL_VERIFICATION: HUMAN_CONFIRMED');
-    assert.match(bootstrapContent, /model verification:\s*HUMAN_CONFIRMATION_REQUIRED/i, 'AB-014: Readiness block must require human model confirmation');
-    console.log('PASS: AB-014 — Model verification explicitly requires human confirmation');
+    assert.match(bootstrapContent, /AUDITOR READY[\s\S]*?model verification:\s*HUMAN_CONFIRMED/i, 'AB-014: Authoritative READY block must contain model verification: HUMAN_CONFIRMED');
+    console.log('PASS: AB-014 — Model verification explicitly requires completed HUMAN_CONFIRMED in READY');
   }
 
   // AB-015: Task ID fallback
@@ -255,15 +254,70 @@ function runAllTests() {
     console.log('PASS: AB-023 — Doctor ready != connector proof negative assertion present');
   }
 
-  // AB-024: No real AO/Codex action in test
+  // Read self source code for non-vacuous static verification assertions
+  const selfSource = fs.readFileSync(__filename, 'utf8');
+
+  // AB-024: Non-vacuous static proof: zero process execution & zero broker/registry mutation APIs
   {
-    assert.strictEqual(codexProcessLaunches, 0, 'AB-024: Zero Codex process launches permitted');
-    assert.strictEqual(aoProcessLaunches, 0, 'AB-024: Zero AO process launches permitted');
-    assert.strictEqual(registryMutations, 0, 'AB-024: Zero registry mutations permitted');
-    console.log('PASS: AB-024 — Zero Codex/AO launches and zero registry writes in test');
+    // Assert this test file has NO imports of child_process, registry, worker-adapter, or runtime
+    assert.strictEqual(/require\s*\(\s*['"](?:node:)?child_process['"]\s*\)/.test(selfSource), false, 'AB-024: child_process import forbidden in static test');
+    assert.strictEqual(/require\s*\(\s*['"].*registry(?:\.js)?['"]\s*\)/.test(selfSource), false, 'AB-024: registry import forbidden in static test');
+    assert.strictEqual(/require\s*\(\s*['"].*worker-adapter(?:\.js)?['"]\s*\)/.test(selfSource), false, 'AB-024: worker-adapter import forbidden in static test');
+    assert.strictEqual(/require\s*\(\s*['"].*runtime(?:\.js)?['"]\s*\)/.test(selfSource), false, 'AB-024: runtime import forbidden in static test');
+
+    // Assert this test file contains no call invocations to process spawning or registry writing
+    assert.strictEqual(/\b(?:spawn|spawnSync|exec|execSync)\s*\(/.test(selfSource), false, 'AB-024: Process spawn/exec call forbidden in static test');
+    assert.strictEqual(/\b(?:putProject|deleteProject)\s*\(/.test(selfSource), false, 'AB-024: Registry mutation calls forbidden in static test');
+    console.log('PASS: AB-024 — Non-vacuous static proof: zero process execution & zero broker/registry mutation APIs');
   }
 
-  console.log('\nAll 24 Codex Auditor Bootstrap tests (AB-001 .. AB-024) PASSED!');
+  // AB-025: Authoritative AUDITOR READY template contains HUMAN_CONFIRMED and not HUMAN_CONFIRMED_REQUIRED
+  {
+    const readyMatch = bootstrapContent.match(/```text\s*\r?\nAUDITOR READY[\s\S]*?```/);
+    assert.strictEqual(Boolean(readyMatch), true, 'AB-025: AUDITOR READY code block must be present in bootstrap doc');
+    const readyBlock = readyMatch[0];
+    assert.match(readyBlock, /model verification:\s*HUMAN_CONFIRMED/, 'AB-025: AUDITOR READY block must contain model verification: HUMAN_CONFIRMED');
+    assert.strictEqual(readyBlock.includes('HUMAN_CONFIRMATION_REQUIRED'), false, 'AB-025: AUDITOR READY block must NOT contain HUMAN_CONFIRMATION_REQUIRED');
+    console.log('PASS: AB-025 — AUDITOR READY block requires completed HUMAN_CONFIRMED authority');
+  }
+
+  // AB-026: Unconfirmed model blocks readiness fail-closed
+  {
+    assert.match(bootstrapContent, /MODEL_NOT_CONFIRMED/, 'AB-026: Bootstrap must define MODEL_NOT_CONFIRMED reason code');
+    assert.match(healthContent, /MODEL_NOT_CONFIRMED/, 'AB-026: Health checklist must define MODEL_NOT_CONFIRMED reason code');
+    assert.match(runbookContent, /MODEL_NOT_CONFIRMED/, 'AB-026: Runbook must define MODEL_NOT_CONFIRMED reason code');
+    assert.match(bootstrapContent, /If the human operator has not explicitly confirmed[\s\S]*?DO NOT PRINT AUDITOR READY/i, 'AB-026: Unconfirmed model must explicitly prevent AUDITOR READY');
+    console.log('PASS: AB-026 — Unconfirmed model blocks readiness fail-closed (MODEL_NOT_CONFIRMED)');
+  }
+
+  // AB-027: Exact worker_state authority field contract
+  {
+    assert.match(healthContent, /worker_state == "IDLE"/, 'AB-027: Health checklist must require worker_state == "IDLE"');
+    assert.match(runbookContent, /worker_state == "IDLE"/, 'AB-027: Runbook must require worker_state == "IDLE"');
+    // Ensure docs do not describe CLI response authority as state == IDLE
+    assert.strictEqual(/\bstate\s*==\s*"IDLE"/.test(healthContent), false, 'AB-027: Health doc must not use state == "IDLE"');
+    assert.strictEqual(/\bstate\s*==\s*"IDLE"/.test(runbookContent), false, 'AB-027: Runbook must not use state == "IDLE"');
+    console.log('PASS: AB-027 — Exact broker worker_state authority field enforced');
+  }
+
+  // AB-028: Static test has zero side-effect capability
+  {
+    // Verify that all require calls in this test file strictly load built-in assert, fs, path
+    const requireMatches = [...selfSource.matchAll(/require\s*\(\s*['"]([^'"]+)['"]\s*\)/g)].map(m => m[1]);
+    const allowedModules = new Set(['assert', 'fs', 'path', 'node:assert', 'node:fs', 'node:path']);
+    for (const mod of requireMatches) {
+      assert.strictEqual(allowedModules.has(mod), true, `AB-028: Unexpected module import in static test: ${mod}`);
+    }
+
+    // Verify test performs zero write or mutation operations on the filesystem
+    const forbiddenFsWrites = ['writeFileSync', 'appendFileSync', 'rmSync', 'unlinkSync', 'mkdirSync', 'writeFile', 'unlink'];
+    for (const writeOp of forbiddenFsWrites) {
+      assert.strictEqual(selfSource.includes(`fs.${writeOp}`), false, `AB-028: Filesystem write operation fs.${writeOp} forbidden in static test`);
+    }
+    console.log('PASS: AB-028 — Static test has zero side-effect capability (built-in read-only only)');
+  }
+
+  console.log('\nAll 28 Codex Auditor Bootstrap tests (AB-001 .. AB-028) PASSED!');
 }
 
 runAllTests();
