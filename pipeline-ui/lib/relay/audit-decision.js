@@ -1,8 +1,8 @@
 'use strict';
 
 /**
- * AuditDecisionV1 — Structured Semantic Authority Contract (WP-V4-04)
- * Strict schema, parser, and semantic validator for Native Codex auditor turn output.
+ * AuditDecisionV1 — Structured Semantic Authority Contract (WP-V4-04 / WO-V4-04F)
+ * Strict schema, prototype-free parser, and semantic validator for Native Codex auditor turn output.
  */
 
 const AUDIT_DECISIONS = Object.freeze({
@@ -61,18 +61,106 @@ const ERROR_CODES = Object.freeze({
   AUDIT_DECISION_OUTPUT_AMBIGUOUS: 'AUDIT_DECISION_OUTPUT_AMBIGUOUS'
 });
 
+const MAX_ERROR_MESSAGE_BYTES = 1024;
+const MAX_DETAIL_STRING_BYTES = 128;
+const FORBIDDEN_MULTILINE_CONTROL_CHARS = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+const FORBIDDEN_SINGLE_LINE_CONTROL_CHARS = /[\x00-\x1F\x7F]/;
+
+/**
+ * Truncate a string to a safe UTF-8 byte boundary without splitting multi-byte characters.
+ * @param {string} str
+ * @param {number} maxBytes
+ * @returns {string}
+ */
+function truncateUtf8(str, maxBytes) {
+  if (typeof str !== 'string') return '';
+  const buf = Buffer.from(str, 'utf8');
+  if (buf.byteLength <= maxBytes) return str;
+  let sliceLen = maxBytes;
+  while (sliceLen > 0 && (buf[sliceLen] & 0xC0) === 0x80) {
+    sliceLen--;
+  }
+  return buf.toString('utf8', 0, sliceLen);
+}
+
+/**
+ * Sanitize error details to ensure no nested provider objects, no unbounded strings,
+ * and no prototype pollution in details.
+ * @param {Object} details
+ * @returns {Object}
+ */
+function sanitizeDetails(details) {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) {
+    return {};
+  }
+  const clean = {};
+  for (const [k, v] of Object.entries(details)) {
+    if (k === '__proto__') continue;
+    if (typeof v === 'string') {
+      clean[k] = Buffer.byteLength(v, 'utf8') > MAX_DETAIL_STRING_BYTES
+        ? truncateUtf8(v, MAX_DETAIL_STRING_BYTES)
+        : v;
+    } else if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
+      clean[k] = v;
+    }
+  }
+  return clean;
+}
+
+/**
+ * Create a bounded AuditDecision error satisfying AD-AUTH-02.
+ * @param {string} code
+ * @param {string} message
+ * @param {Object} [details={}]
+ * @returns {Error}
+ */
 function createAuditDecisionError(code, message, details = {}) {
-  const err = new Error(message);
+  let boundedMessage = message;
+  if (Buffer.byteLength(boundedMessage, 'utf8') > MAX_ERROR_MESSAGE_BYTES) {
+    boundedMessage = truncateUtf8(boundedMessage, MAX_ERROR_MESSAGE_BYTES);
+  }
+  const err = new Error(boundedMessage);
   err.code = code;
-  err.details = details;
+  err.details = sanitizeDetails(details);
   return err;
 }
 
-function deepClone(obj) {
-  if (obj === null || typeof obj !== 'object') return obj;
-  return JSON.parse(JSON.stringify(obj));
+/**
+ * Check if a value is a plain JSON object (either Object.prototype or null prototype).
+ * Rejects class instances, custom prototype objects, arrays, Date, Map, Set, null, primitives.
+ * @param {any} val
+ * @returns {boolean}
+ */
+function isPlainJsonObject(val) {
+  if (val === null || typeof val !== 'object' || Array.isArray(val)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
 }
 
+/**
+ * Recursively clone an object into a clean, prototype-free representation.
+ * @param {any} obj
+ * @returns {any}
+ */
+function deepClone(obj) {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) {
+    return obj.map(deepClone);
+  }
+  const copy = Object.create(null);
+  for (const key of Object.keys(obj)) {
+    copy[key] = deepClone(obj[key]);
+  }
+  return copy;
+}
+
+/**
+ * Recursively freeze an object.
+ * @param {any} obj
+ * @returns {any}
+ */
 function deepFreeze(obj) {
   if (obj === null || typeof obj !== 'object') return obj;
   const propNames = Object.getOwnPropertyNames(obj);
@@ -86,8 +174,8 @@ function deepFreeze(obj) {
 }
 
 /**
- * Strict recursive-descent JSON parser with duplicate key detection.
- * Enforces raw size bound, RFC 8259 compliance, and single JSON document boundary.
+ * Strict recursive-descent JSON parser with duplicate key detection and prototype-free object representation.
+ * Enforces raw size bound, RFC 8259 compliance, bounded diagnostics, and single JSON document boundary.
  * @param {string} rawText
  * @param {number} [maxBytes=131072]
  * @returns {any}
@@ -101,7 +189,7 @@ function parseStrictJson(rawText, maxBytes = AUDIT_DECISION_LIMITS.MAX_RAW_JSON_
   if (byteLength > maxBytes) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_TOO_LARGE,
-      `JSON input exceeds maximum size limit of ${maxBytes} bytes (received ${byteLength} bytes)`,
+      `JSON input exceeds maximum size limit of ${maxBytes} bytes`,
       { byteLength, maxBytes }
     );
   }
@@ -165,14 +253,14 @@ function parseStrictJson(rawText, maxBytes = AUDIT_DECISION_LIMITS.MAX_RAW_JSON_
             }
             const hex = rawText.slice(index, index + 4);
             if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
-              error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, `Invalid unicode escape: \\u${hex}`);
+              error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, 'Invalid unicode escape');
             }
             str += String.fromCharCode(parseInt(hex, 16));
             index += 4;
             break;
           }
           default:
-            error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, `Invalid escape character: \\${String.fromCharCode(esc)}`);
+            error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, 'Invalid escape character');
         }
         start = index;
       } else {
@@ -232,13 +320,14 @@ function parseStrictJson(rawText, maxBytes = AUDIT_DECISION_LIMITS.MAX_RAW_JSON_
 
     const numStr = rawText.slice(start, index);
     const val = Number(numStr);
-    if (isNaN(val)) error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, `Invalid number: ${numStr}`);
+    if (isNaN(val)) error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, 'Invalid number format');
     return val;
   }
 
   function parseObject() {
     index++; // skip '{'
-    const obj = {};
+    // AD-AUTH-01: Represent all JSON objects with null prototype so no property behaves as prototype setter
+    const obj = Object.create(null);
     const seenKeys = new Set();
     skipWhitespace();
 
@@ -254,19 +343,27 @@ function parseStrictJson(rawText, maxBytes = AUDIT_DECISION_LIMITS.MAX_RAW_JSON_
       }
       const key = parseString();
       if (seenKeys.has(key)) {
-        error(ERROR_CODES.AUDIT_DECISION_DUPLICATE_KEY, `Duplicate key '${key}' in JSON object`);
+        // AD-AUTH-02: Bounded diagnostic, do not echo raw key
+        error(ERROR_CODES.AUDIT_DECISION_DUPLICATE_KEY, 'Duplicate JSON object key');
       }
       seenKeys.add(key);
 
       skipWhitespace();
       if (index >= len || rawText.charCodeAt(index) !== 0x3A) { // ':'
-        error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, `Expected ':' after key '${key}'`);
+        error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, "Expected ':' after object key");
       }
       index++; // skip ':'
 
       skipWhitespace();
       const val = parseValue();
-      obj[key] = val;
+
+      // AD-AUTH-01: Explicit own property definition ensures __proto__, constructor, etc. are normal own properties
+      Object.defineProperty(obj, key, {
+        value: val,
+        enumerable: true,
+        writable: true,
+        configurable: true
+      });
 
       skipWhitespace();
       if (index < len && rawText.charCodeAt(index) === 0x2C) { // ','
@@ -349,7 +446,7 @@ function parseStrictJson(rawText, maxBytes = AUDIT_DECISION_LIMITS.MAX_RAW_JSON_
       error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, 'Unexpected token');
     }
 
-    error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, `Unexpected token '${rawText[index]}'`);
+    error(ERROR_CODES.AUDIT_DECISION_INVALID_JSON, 'Unexpected token');
   }
 
   skipWhitespace();
@@ -530,36 +627,33 @@ const REQUIRED_TOP_LEVEL_KEYS_SET = new Set(REQUIRED_TOP_LEVEL_KEYS);
 function validateAuditDecisionV1(value, expectedContext) {
   assertExpectedContext(expectedContext);
 
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+  // AD-AUTH-01: Must be a plain JSON object (Object.prototype or null prototype)
+  if (!isPlainJsonObject(value)) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      'AuditDecisionV1 must be a non-null object'
+      'AuditDecisionV1 must be a plain JSON object',
+      { path: '$' }
     );
   }
 
-  // Exact top-level keys check
+  // Exact top-level keys check (no extra keys, all required keys present)
   const actualKeys = Object.keys(value);
-  if (actualKeys.length !== REQUIRED_TOP_LEVEL_KEYS.length) {
+  const extraKeys = actualKeys.filter(k => !REQUIRED_TOP_LEVEL_KEYS_SET.has(k));
+  if (extraKeys.length > 0) {
+    // AD-AUTH-02: Bounded diagnostic, do not echo arbitrary extra key
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      `AuditDecisionV1 must contain exactly ${REQUIRED_TOP_LEVEL_KEYS.length} top-level keys; received ${actualKeys.length}`
+      'AuditDecisionV1 contains forbidden extra top-level property',
+      { path: '$', extra_property_count: extraKeys.length }
     );
-  }
-
-  for (const key of actualKeys) {
-    if (!REQUIRED_TOP_LEVEL_KEYS_SET.has(key)) {
-      throw createAuditDecisionError(
-        ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `AuditDecisionV1 contains forbidden extra top-level key '${key}'`
-      );
-    }
   }
 
   for (const key of REQUIRED_TOP_LEVEL_KEYS) {
-    if (!(key in value)) {
+    if (!Object.prototype.hasOwnProperty.call(value, key) && !(key in value)) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `AuditDecisionV1 missing required top-level key '${key}'`
+        `AuditDecisionV1 missing required top-level key '${key}'`,
+        { path: '$', missing_property: key }
       );
     }
   }
@@ -568,7 +662,8 @@ function validateAuditDecisionV1(value, expectedContext) {
   if (value.schema_version !== 1) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      `schema_version must be integer 1; received ${JSON.stringify(value.schema_version)}`
+      'AuditDecisionV1 schema_version must be integer 1',
+      { path: 'schema_version' }
     );
   }
 
@@ -576,37 +671,39 @@ function validateAuditDecisionV1(value, expectedContext) {
   if (!Object.values(AUDIT_DECISIONS).includes(value.decision)) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      `decision '${value.decision}' is not a recognized AuditDecisionV1 value`
+      'AuditDecisionV1 decision value is not allowed',
+      { path: 'decision' }
     );
   }
 
   // 3. Exact Context Identity Matching (byte-for-byte string equality)
+  // AD-AUTH-02: Field-only bounded diagnostics; no raw expected/actual value leakage
   if (value.project_id !== expectedContext.project_id) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
-      `project_id mismatch: expected '${expectedContext.project_id}', received '${value.project_id}'`,
-      { field: 'project_id', expected: expectedContext.project_id, actual: value.project_id }
+      'AuditDecisionV1 context mismatch at project_id',
+      { field: 'project_id' }
     );
   }
   if (value.audit_subject_id !== expectedContext.audit_subject_id) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
-      `audit_subject_id mismatch: expected '${expectedContext.audit_subject_id}', received '${value.audit_subject_id}'`,
-      { field: 'audit_subject_id', expected: expectedContext.audit_subject_id, actual: value.audit_subject_id }
+      'AuditDecisionV1 context mismatch at audit_subject_id',
+      { field: 'audit_subject_id' }
     );
   }
   if (value.auditor_thread_id !== expectedContext.auditor_thread_id) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
-      `auditor_thread_id mismatch: expected '${expectedContext.auditor_thread_id}', received '${value.auditor_thread_id}'`,
-      { field: 'auditor_thread_id', expected: expectedContext.auditor_thread_id, actual: value.auditor_thread_id }
+      'AuditDecisionV1 context mismatch at auditor_thread_id',
+      { field: 'auditor_thread_id' }
     );
   }
   if (value.workspace_state_observed !== expectedContext.workspace_state_observed) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
-      `workspace_state_observed mismatch: expected '${expectedContext.workspace_state_observed}', received '${value.workspace_state_observed}'`,
-      { field: 'workspace_state_observed', expected: expectedContext.workspace_state_observed, actual: value.workspace_state_observed }
+      'AuditDecisionV1 context mismatch at workspace_state_observed',
+      { field: 'workspace_state_observed' }
     );
   }
 
@@ -614,19 +711,22 @@ function validateAuditDecisionV1(value, expectedContext) {
   if (typeof value.summary !== 'string' || value.summary.trim().length === 0) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      'summary must be a non-empty string'
+      'AuditDecisionV1 summary must be a non-empty string',
+      { path: 'summary' }
     );
   }
   if (Buffer.byteLength(value.summary, 'utf8') > AUDIT_DECISION_LIMITS.MAX_SUMMARY_BYTES) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      `summary exceeds maximum byte length of ${AUDIT_DECISION_LIMITS.MAX_SUMMARY_BYTES} bytes`
+      `AuditDecisionV1 summary exceeds maximum byte length of ${AUDIT_DECISION_LIMITS.MAX_SUMMARY_BYTES} bytes`,
+      { path: 'summary' }
     );
   }
-  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(value.summary)) {
+  if (FORBIDDEN_MULTILINE_CONTROL_CHARS.test(value.summary)) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      'summary contains forbidden control characters'
+      'AuditDecisionV1 summary contains forbidden control characters',
+      { path: 'summary' }
     );
   }
 
@@ -634,65 +734,84 @@ function validateAuditDecisionV1(value, expectedContext) {
   if (!Array.isArray(value.independent_verification)) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      'independent_verification must be an array'
+      'independent_verification must be an array',
+      { path: 'independent_verification' }
     );
   }
   const ivCount = value.independent_verification.length;
   if (ivCount < AUDIT_DECISION_LIMITS.MIN_VERIFICATION_ITEMS || ivCount > AUDIT_DECISION_LIMITS.MAX_VERIFICATION_ITEMS) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      `independent_verification must contain between ${AUDIT_DECISION_LIMITS.MIN_VERIFICATION_ITEMS} and ${AUDIT_DECISION_LIMITS.MAX_VERIFICATION_ITEMS} items; received ${ivCount}`
+      `independent_verification must contain between ${AUDIT_DECISION_LIMITS.MIN_VERIFICATION_ITEMS} and ${AUDIT_DECISION_LIMITS.MAX_VERIFICATION_ITEMS} items; received ${ivCount}`,
+      { path: 'independent_verification' }
     );
   }
 
-  const REQUIRED_IV_KEYS = new Set(['kind', 'result', 'evidence']);
+  const REQUIRED_IV_KEYS = ['kind', 'result', 'evidence'];
+  const REQUIRED_IV_KEYS_SET = new Set(REQUIRED_IV_KEYS);
   for (let i = 0; i < ivCount; i++) {
     const iv = value.independent_verification[i];
-    if (!iv || typeof iv !== 'object' || Array.isArray(iv)) {
+    // AD-AUTH-01: verification items must be plain JSON objects
+    if (!isPlainJsonObject(iv)) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `independent_verification[${i}] must be an object`
+        `independent_verification[${i}] must be a plain JSON object`,
+        { index: i, path: `independent_verification[${i}]` }
       );
     }
     const ivKeys = Object.keys(iv);
-    if (ivKeys.length !== 3 || !ivKeys.every(k => REQUIRED_IV_KEYS.has(k))) {
+    if (ivKeys.length !== 3 || !ivKeys.every(k => REQUIRED_IV_KEYS_SET.has(k))) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `independent_verification[${i}] must contain exactly [kind, result, evidence]`
+        `independent_verification[${i}] contains invalid or forbidden keys`,
+        { index: i, path: `independent_verification[${i}]` }
       );
     }
     if (!Object.values(INDEPENDENT_VERIFICATION_KINDS).includes(iv.kind)) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `independent_verification[${i}].kind '${iv.kind}' is invalid`
+        'independent_verification kind is invalid',
+        { index: i, path: `independent_verification[${i}].kind` }
       );
     }
     if (!Object.values(VERIFICATION_RESULTS).includes(iv.result)) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `independent_verification[${i}].result '${iv.result}' is invalid; must be PASS, FAIL, or INCONCLUSIVE`
+        'independent_verification result is invalid; must be PASS, FAIL, or INCONCLUSIVE',
+        { index: i, path: `independent_verification[${i}].result` }
       );
     }
     if (typeof iv.evidence !== 'string' || iv.evidence.trim().length === 0) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `independent_verification[${i}].evidence must be a non-empty string`
+        `independent_verification[${i}].evidence must be a non-empty string`,
+        { index: i, path: `independent_verification[${i}].evidence` }
       );
     }
     if (Buffer.byteLength(iv.evidence, 'utf8') > AUDIT_DECISION_LIMITS.MAX_EVIDENCE_ITEM_BYTES) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `independent_verification[${i}].evidence exceeds maximum size of ${AUDIT_DECISION_LIMITS.MAX_EVIDENCE_ITEM_BYTES} bytes`
+        `independent_verification[${i}].evidence exceeds maximum size limit`,
+        { index: i, path: `independent_verification[${i}].evidence` }
+      );
+    }
+    if (FORBIDDEN_MULTILINE_CONTROL_CHARS.test(iv.evidence)) {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
+        `independent_verification[${i}].evidence contains forbidden control characters`,
+        { index: i, path: `independent_verification[${i}].evidence` }
       );
     }
   }
 
   // 6. work_order
   if (value.work_order !== null) {
-    if (typeof value.work_order !== 'object' || Array.isArray(value.work_order)) {
+    // AD-AUTH-01: work_order must be a plain JSON object
+    if (!isPlainJsonObject(value.work_order)) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        'work_order must be an object or null'
+        'work_order must be a plain JSON object or null',
+        { path: 'work_order' }
       );
     }
     const REQUIRED_WO_KEYS = new Set(['work_order_id', 'directive', 'verification', 'worker_model_policy']);
@@ -700,52 +819,61 @@ function validateAuditDecisionV1(value, expectedContext) {
     if (woKeys.length !== 4 || !woKeys.every(k => REQUIRED_WO_KEYS.has(k))) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        'work_order must contain exactly [work_order_id, directive, verification, worker_model_policy]'
+        'work_order contains invalid or forbidden keys',
+        { path: 'work_order' }
       );
     }
     const { work_order_id, directive, verification, worker_model_policy } = value.work_order;
 
     if (typeof work_order_id !== 'string' || work_order_id.trim().length === 0) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.work_order_id must be a non-empty string');
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.work_order_id must be a non-empty string', { path: 'work_order.work_order_id' });
     }
     if (Buffer.byteLength(work_order_id, 'utf8') > AUDIT_DECISION_LIMITS.MAX_WORK_ORDER_ID_BYTES) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.work_order_id exceeds maximum size limit of 512 bytes');
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.work_order_id exceeds maximum size limit', { path: 'work_order.work_order_id' });
     }
-    if (/[\x00-\x1F\x7F]/.test(work_order_id)) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.work_order_id contains forbidden control characters');
+    if (FORBIDDEN_SINGLE_LINE_CONTROL_CHARS.test(work_order_id)) {
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.work_order_id contains forbidden control characters', { path: 'work_order.work_order_id' });
     }
 
     if (typeof directive !== 'string' || directive.trim().length === 0) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.directive must be a non-empty string');
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.directive must be a non-empty string', { path: 'work_order.directive' });
     }
     if (Buffer.byteLength(directive, 'utf8') > AUDIT_DECISION_LIMITS.MAX_DIRECTIVE_BYTES) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.directive exceeds maximum size limit of 64 KiB');
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.directive exceeds maximum size limit', { path: 'work_order.directive' });
+    }
+    if (FORBIDDEN_MULTILINE_CONTROL_CHARS.test(directive)) {
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.directive contains forbidden control characters', { path: 'work_order.directive' });
     }
 
     if (!Array.isArray(verification)) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.verification must be an array');
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'work_order.verification must be an array', { path: 'work_order.verification' });
     }
     const wovCount = verification.length;
     if (wovCount < AUDIT_DECISION_LIMITS.MIN_WO_VERIFICATION_ITEMS || wovCount > AUDIT_DECISION_LIMITS.MAX_WO_VERIFICATION_ITEMS) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `work_order.verification must contain between ${AUDIT_DECISION_LIMITS.MIN_WO_VERIFICATION_ITEMS} and ${AUDIT_DECISION_LIMITS.MAX_WO_VERIFICATION_ITEMS} items`
+        'work_order.verification count is out of bounds',
+        { path: 'work_order.verification' }
       );
     }
     for (let i = 0; i < wovCount; i++) {
       const v = verification[i];
       if (typeof v !== 'string' || v.trim().length === 0) {
-        throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `work_order.verification[${i}] must be a non-empty string`);
+        throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `work_order.verification[${i}] must be a non-empty string`, { path: `work_order.verification[${i}]` });
       }
       if (Buffer.byteLength(v, 'utf8') > AUDIT_DECISION_LIMITS.MAX_EVIDENCE_ITEM_BYTES) {
-        throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `work_order.verification[${i}] exceeds 4 KiB limit`);
+        throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `work_order.verification[${i}] exceeds size limit`, { path: `work_order.verification[${i}]` });
+      }
+      if (FORBIDDEN_MULTILINE_CONTROL_CHARS.test(v)) {
+        throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `work_order.verification[${i}] contains forbidden control characters`, { path: `work_order.verification[${i}]` });
       }
     }
 
     if (!Object.values(WORKER_MODEL_POLICIES).includes(worker_model_policy)) {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `work_order.worker_model_policy '${worker_model_policy}' is invalid; allowed: [worker_economy, worker_standard]`
+        'work_order.worker_model_policy is invalid; allowed: [worker_economy, worker_standard]',
+        { path: 'work_order.worker_model_policy' }
       );
     }
   }
@@ -754,32 +882,40 @@ function validateAuditDecisionV1(value, expectedContext) {
   if (!Array.isArray(value.requested_evidence)) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      'requested_evidence must be an array'
+      'requested_evidence must be an array',
+      { path: 'requested_evidence' }
     );
   }
   if (value.requested_evidence.length > AUDIT_DECISION_LIMITS.MAX_REQUESTED_EVIDENCE_ITEMS) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-      `requested_evidence exceeds maximum of ${AUDIT_DECISION_LIMITS.MAX_REQUESTED_EVIDENCE_ITEMS} items`
+      'requested_evidence item count exceeds maximum limit',
+      { path: 'requested_evidence' }
     );
   }
   for (let i = 0; i < value.requested_evidence.length; i++) {
     const re = value.requested_evidence[i];
     if (typeof re !== 'string' || re.trim().length === 0) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `requested_evidence[${i}] must be a non-empty string`);
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `requested_evidence[${i}] must be a non-empty string`, { path: `requested_evidence[${i}]` });
     }
     if (Buffer.byteLength(re, 'utf8') > AUDIT_DECISION_LIMITS.MAX_EVIDENCE_ITEM_BYTES) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `requested_evidence[${i}] exceeds 4 KiB limit`);
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `requested_evidence[${i}] exceeds size limit`, { path: `requested_evidence[${i}]` });
+    }
+    if (FORBIDDEN_MULTILINE_CONTROL_CHARS.test(re)) {
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, `requested_evidence[${i}] contains forbidden control characters`, { path: `requested_evidence[${i}]` });
     }
   }
 
   // 8. blocker
   if (value.blocker !== null) {
     if (typeof value.blocker !== 'string' || value.blocker.trim().length === 0) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'blocker must be a non-empty string or null');
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'blocker must be a non-empty string or null', { path: 'blocker' });
     }
     if (Buffer.byteLength(value.blocker, 'utf8') > AUDIT_DECISION_LIMITS.MAX_BLOCKER_BYTES) {
-      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'blocker exceeds 8 KiB limit');
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'blocker exceeds maximum byte limit', { path: 'blocker' });
+    }
+    if (FORBIDDEN_MULTILINE_CONTROL_CHARS.test(value.blocker)) {
+      throw createAuditDecisionError(ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID, 'blocker contains forbidden control characters', { path: 'blocker' });
     }
   }
 
@@ -789,19 +925,22 @@ function validateAuditDecisionV1(value, expectedContext) {
       if (value.work_order === null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'DISPATCH_WORKER requires work_order != null'
+          'DISPATCH_WORKER requires work_order != null',
+          { decision: 'DISPATCH_WORKER' }
         );
       }
       if (value.requested_evidence.length !== 0) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'DISPATCH_WORKER requires requested_evidence to be empty'
+          'DISPATCH_WORKER requires requested_evidence to be empty',
+          { decision: 'DISPATCH_WORKER' }
         );
       }
       if (value.blocker !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'DISPATCH_WORKER requires blocker == null'
+          'DISPATCH_WORKER requires blocker == null',
+          { decision: 'DISPATCH_WORKER' }
         );
       }
       break;
@@ -810,19 +949,22 @@ function validateAuditDecisionV1(value, expectedContext) {
       if (value.work_order !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'REQUEST_EVIDENCE requires work_order == null'
+          'REQUEST_EVIDENCE requires work_order == null',
+          { decision: 'REQUEST_EVIDENCE' }
         );
       }
       if (value.requested_evidence.length < 1) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'REQUEST_EVIDENCE requires at least 1 requested_evidence item'
+          'REQUEST_EVIDENCE requires at least 1 requested_evidence item',
+          { decision: 'REQUEST_EVIDENCE' }
         );
       }
       if (value.blocker !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'REQUEST_EVIDENCE requires blocker == null'
+          'REQUEST_EVIDENCE requires blocker == null',
+          { decision: 'REQUEST_EVIDENCE' }
         );
       }
       break;
@@ -831,26 +973,30 @@ function validateAuditDecisionV1(value, expectedContext) {
       if (value.work_order !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'APPROVE_WORK_PACKAGE requires work_order == null'
+          'APPROVE_WORK_PACKAGE requires work_order == null',
+          { decision: 'APPROVE_WORK_PACKAGE' }
         );
       }
       if (value.requested_evidence.length !== 0) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'APPROVE_WORK_PACKAGE requires requested_evidence to be empty'
+          'APPROVE_WORK_PACKAGE requires requested_evidence to be empty',
+          { decision: 'APPROVE_WORK_PACKAGE' }
         );
       }
       if (value.blocker !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'APPROVE_WORK_PACKAGE requires blocker == null'
+          'APPROVE_WORK_PACKAGE requires blocker == null',
+          { decision: 'APPROVE_WORK_PACKAGE' }
         );
       }
       for (const iv of value.independent_verification) {
         if (iv.result !== VERIFICATION_RESULTS.PASS) {
           throw createAuditDecisionError(
             ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-            `APPROVE_WORK_PACKAGE requires all independent_verification results to be PASS; found '${iv.result}'`
+            'APPROVE_WORK_PACKAGE requires all independent_verification results to be PASS',
+            { decision: 'APPROVE_WORK_PACKAGE' }
           );
         }
       }
@@ -860,19 +1006,22 @@ function validateAuditDecisionV1(value, expectedContext) {
       if (value.work_order !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'BLOCKED requires work_order == null'
+          'BLOCKED requires work_order == null',
+          { decision: 'BLOCKED' }
         );
       }
       if (value.requested_evidence.length !== 0) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'BLOCKED requires requested_evidence to be empty'
+          'BLOCKED requires requested_evidence to be empty',
+          { decision: 'BLOCKED' }
         );
       }
       if (typeof value.blocker !== 'string' || value.blocker.trim().length === 0) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'BLOCKED requires blocker to be a non-empty string'
+          'BLOCKED requires blocker to be a non-empty string',
+          { decision: 'BLOCKED' }
         );
       }
       break;
@@ -881,19 +1030,22 @@ function validateAuditDecisionV1(value, expectedContext) {
       if (value.work_order !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'STOP requires work_order == null'
+          'STOP requires work_order == null',
+          { decision: 'STOP' }
         );
       }
       if (value.requested_evidence.length !== 0) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'STOP requires requested_evidence to be empty'
+          'STOP requires requested_evidence to be empty',
+          { decision: 'STOP' }
         );
       }
       if (value.blocker !== null) {
         throw createAuditDecisionError(
           ERROR_CODES.AUDIT_DECISION_BRANCH_INVALID,
-          'STOP requires blocker == null'
+          'STOP requires blocker == null',
+          { decision: 'STOP' }
         );
       }
       break;
@@ -901,7 +1053,8 @@ function validateAuditDecisionV1(value, expectedContext) {
     default:
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID,
-        `Unhandled decision type '${value.decision}'`
+        'Unhandled decision type',
+        { path: 'decision' }
       );
   }
 
@@ -950,16 +1103,16 @@ function extractAuditDecisionV1FromTurn(turn, expectedContext) {
   if (turn.status !== 'completed') {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED,
-      `Turn is not completed (status='${turn.status}'); only status='completed' provides decision authority`,
-      { status: turn.status }
+      'Turn is not completed; only status=completed provides decision authority',
+      { status: turn.status ? String(turn.status).slice(0, 32) : 'unknown' }
     );
   }
 
   if (turn.itemsView !== 'full') {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_ITEMS_INCOMPLETE,
-      `Turn itemsView is '${turn.itemsView}'; requires itemsView='full' for complete semantic authority`,
-      { itemsView: turn.itemsView }
+      'Turn itemsView is incomplete; requires itemsView=full for decision authority',
+      { itemsView: turn.itemsView ? String(turn.itemsView).slice(0, 32) : 'unknown' }
     );
   }
 
@@ -990,7 +1143,7 @@ function extractAuditDecisionV1FromTurn(turn, expectedContext) {
   } else if (finalAnswerMessages.length > 1) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_OUTPUT_AMBIGUOUS,
-      `Turn contains ${finalAnswerMessages.length} agentMessage items with phase='final_answer'`
+      'Turn contains multiple agentMessage items with phase=final_answer'
     );
   } else {
     // 0 final_answer messages: ignore commentary, inspect null/undefined phase
@@ -1007,7 +1160,7 @@ function extractAuditDecisionV1FromTurn(turn, expectedContext) {
     } else {
       throw createAuditDecisionError(
         ERROR_CODES.AUDIT_DECISION_OUTPUT_AMBIGUOUS,
-        `Turn contains ${unknownPhaseMessages.length} candidate agentMessages with unknown/null phase`
+        'Turn contains multiple candidate agentMessages with unknown/null phase'
       );
     }
   }
@@ -1025,6 +1178,7 @@ function extractAuditDecisionV1FromTurn(turn, expectedContext) {
 /**
  * High-level helper: await turn completion on adapter and extract validated decision.
  * Validates expectedContext.auditor_thread_id matches threadId before waiting.
+ * Wraps TURN_FAILED into bounded AUDIT_DECISION_TURN_NOT_COMPLETED failure.
  * Does NOT start the turn.
  * @param {Object} adapter
  * @param {Object} params
@@ -1056,22 +1210,38 @@ async function awaitAuditDecisionV1(adapter, params = {}) {
   if (expectedContext.auditor_thread_id !== threadId) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
-      `expectedContext.auditor_thread_id ('${expectedContext.auditor_thread_id}') does not match threadId ('${threadId}')`,
-      { expected: threadId, actual: expectedContext.auditor_thread_id }
+      'AuditDecisionV1 context mismatch at auditor_thread_id',
+      { field: 'auditor_thread_id' }
     );
   }
 
-  const completion = await adapter.waitForTurnCompletion({
-    threadId,
-    turnId,
-    timeoutMs
-  });
+  let completion;
+  try {
+    completion = await adapter.waitForTurnCompletion({
+      threadId,
+      turnId,
+      timeoutMs
+    });
+  } catch (err) {
+    if (err && err.code === 'TURN_FAILED') {
+      throw createAuditDecisionError(
+        ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED,
+        'Turn failed; failed turns provide zero decision authority',
+        { status: 'failed', turnId: String(turnId).slice(0, 64) }
+      );
+    }
+    throw err;
+  }
 
+  // AD-AUTH-02: Bounded trusted metadata only, never attach completion or turn objects
   if (!completion || completion.status !== 'completed' || !completion.turn) {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED,
-      `Turn did not complete successfully (status='${completion ? completion.status : 'null'}')`,
-      { completion }
+      'Turn did not complete successfully; non-completed turns provide zero decision authority',
+      {
+        status: completion && completion.status ? String(completion.status).slice(0, 32) : 'null',
+        turnId: String(turnId).slice(0, 64)
+      }
     );
   }
 
@@ -1085,7 +1255,9 @@ module.exports = {
   WORKER_MODEL_POLICIES,
   AUDIT_DECISION_LIMITS,
   ERROR_CODES,
+  MAX_ERROR_MESSAGE_BYTES,
   createAuditDecisionError,
+  isPlainJsonObject,
   parseStrictJson,
   buildAuditDecisionV1OutputSchema,
   parseAuditDecisionV1Text,

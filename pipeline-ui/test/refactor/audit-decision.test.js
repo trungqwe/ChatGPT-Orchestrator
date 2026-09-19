@@ -1237,8 +1237,307 @@ async function runTests() {
     console.log('PASS: AD-078 — Prompt injection payload blocked by context identity mismatch');
   }
 
+  // AD-079: Valid decision JSON plus top-level "__proto__": { "polluted": true } rejected
+  {
+    const ctx = makeContext();
+    const base = makeValidDecision({ decision: AUDIT_DECISIONS.STOP, work_order: null });
+    const json = JSON.stringify(base).replace(/}$/, ',"__proto__":{"polluted":true}}');
+
+    assert.throws(
+      () => parseAuditDecisionV1Text(json, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-079 — Top-level __proto__ rejected as forbidden extra property');
+  }
+
+  // AD-080: Nested work_order containing "__proto__": {} rejected
+  {
+    const ctx = makeContext();
+    const base = makeValidDecision();
+    const json = JSON.stringify(base).replace('"work_order":{', '"work_order":{"__proto__":{},');
+
+    assert.throws(
+      () => parseAuditDecisionV1Text(json, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-080 — Nested work_order containing __proto__ rejected');
+  }
+
+  // AD-081: independent_verification[0] containing "__proto__": {} rejected
+  {
+    const ctx = makeContext();
+    const base = makeValidDecision({ decision: AUDIT_DECISIONS.STOP, work_order: null });
+    const json = JSON.stringify(base).replace('"independent_verification":[{', '"independent_verification":[{"__proto__":{},');
+
+    assert.throws(
+      () => parseAuditDecisionV1Text(json, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-081 — independent_verification[0] containing __proto__ rejected');
+  }
+
+  // AD-082: Direct JavaScript input with custom polluted prototype at top level rejected
+  {
+    const ctx = makeContext();
+    const customProto = { evilMethod() { return true; } };
+    const objWithCustomProto = Object.create(customProto);
+    Object.assign(objWithCustomProto, makeValidDecision());
+
+    assert.throws(
+      () => validateAuditDecisionV1(objWithCustomProto, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-082 — Direct JavaScript input with custom prototype rejected');
+  }
+
+  // AD-083: Direct JavaScript work_order with unexpected custom prototype rejected
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const customProto = { evilMethod() { return true; } };
+    const woWithCustomProto = Object.create(customProto);
+    Object.assign(woWithCustomProto, d.work_order);
+    d.work_order = woWithCustomProto;
+
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-083 — Direct JavaScript work_order with custom prototype rejected');
+  }
+
+  // AD-084: Strict parser continues to reject duplicate __proto__ keys
+  {
+    const json = '{"__proto__": 1, "__proto__": 2}';
+    assert.throws(
+      () => parseStrictJson(json),
+      { code: ERROR_CODES.AUDIT_DECISION_DUPLICATE_KEY }
+    );
+    console.log('PASS: AD-084 — Duplicate __proto__ keys rejected with AUDIT_DECISION_DUPLICATE_KEY');
+  }
+
+  // AD-085: Near-limit duplicate-key payload with giant key produces bounded error message
+  {
+    const giantKey = 'K'.repeat(60000);
+    const json = `{"${giantKey}": 1, "${giantKey}": 2}`;
+    try {
+      parseStrictJson(json);
+      assert.fail('Should have thrown duplicate key error');
+    } catch (err) {
+      assert.strictEqual(err.code, ERROR_CODES.AUDIT_DECISION_DUPLICATE_KEY);
+      const msgBytes = Buffer.byteLength(err.message, 'utf8');
+      assert.ok(msgBytes <= 1024, `Error message length ${msgBytes} exceeds 1024 bytes`);
+      assert.strictEqual(err.message.includes(giantKey), false, 'Giant key leaked into error message');
+    }
+    console.log('PASS: AD-085 — Giant duplicate key produces bounded error message without key echo');
+  }
+
+  // AD-086: Context mismatch with large model-controlled identity produces bounded error
+  {
+    const ctx = makeContext();
+    const giantActualProject = 'malicious-project-'.repeat(2000);
+    const d = makeValidDecision();
+    d.project_id = giantActualProject;
+
+    try {
+      validateAuditDecisionV1(d, ctx);
+      assert.fail('Should have thrown context mismatch error');
+    } catch (err) {
+      assert.strictEqual(err.code, ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH);
+      const msgBytes = Buffer.byteLength(err.message, 'utf8');
+      assert.ok(msgBytes <= 1024, `Error message length ${msgBytes} exceeds 1024 bytes`);
+      assert.strictEqual(err.message.includes(giantActualProject), false, 'Giant actual project leaked into message');
+      assert.deepStrictEqual(err.details, { field: 'project_id' });
+    }
+    console.log('PASS: AD-086 — Context mismatch with large identity produces bounded field-only error');
+  }
+
+  // AD-087: Failed/non-authoritative turn carrying large agentMessage does not leak into error
+  {
+    const ctx = makeContext();
+    const giantMessage = 'Attacker payload '.repeat(5000);
+    const fakeAdapter = {
+      async waitForTurnCompletion() {
+        return {
+          status: 'failed',
+          turn: {
+            id: 'turn_failed_giant',
+            status: 'failed',
+            itemsView: 'full',
+            items: [
+              { type: 'agentMessage', text: giantMessage, phase: 'final_answer' }
+            ]
+          }
+        };
+      }
+    };
+
+    try {
+      await awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn_failed_giant',
+        expectedContext: ctx
+      });
+      assert.fail('Should have thrown turn not completed error');
+    } catch (err) {
+      assert.strictEqual(err.code, ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED);
+      const msgBytes = Buffer.byteLength(err.message, 'utf8');
+      assert.ok(msgBytes <= 1024, `Error message length ${msgBytes} exceeds 1024 bytes`);
+      assert.strictEqual(err.message.includes('Attacker payload'), false, 'Giant payload leaked into error message');
+      assert.strictEqual(JSON.stringify(err.details).includes('Attacker payload'), false, 'Giant payload leaked into err.details');
+    }
+    console.log('PASS: AD-087 — Non-authoritative turn carrying large agentMessage does not leak into diagnostics');
+  }
+
+  // AD-088: Successful validated result produced from null-prototype parser objects is deeply immutable and prototype-clean
+  {
+    const ctx = makeContext();
+    const rawJson = JSON.stringify(makeValidDecision());
+    const validated = parseAuditDecisionV1Text(rawJson, ctx);
+
+    assert.strictEqual(validated.decision, AUDIT_DECISIONS.DISPATCH_WORKER);
+    assert.strictEqual(Object.isFrozen(validated), true);
+    assert.strictEqual(Object.isFrozen(validated.work_order), true);
+    assert.strictEqual(Object.isFrozen(validated.independent_verification[0]), true);
+
+    const proto = Object.getPrototypeOf(validated);
+    assert.ok(proto === null || proto === Object.prototype);
+    if (validated.work_order) {
+      const woProto = Object.getPrototypeOf(validated.work_order);
+      assert.ok(woProto === null || woProto === Object.prototype);
+    }
+    console.log('PASS: AD-088 — Validated result is deeply immutable with clean prototype');
+  }
+
+  // AD-089: Extra key "constructor" rejected
+  {
+    const ctx = makeContext();
+    const json = JSON.stringify({
+      ...makeValidDecision(),
+      constructor: {}
+    });
+    assert.throws(
+      () => parseAuditDecisionV1Text(json, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-089 — Extra top-level key "constructor" rejected');
+  }
+
+  // AD-090: Extra key "prototype" rejected
+  {
+    const ctx = makeContext();
+    const json = JSON.stringify({
+      ...makeValidDecision(),
+      prototype: {}
+    });
+    assert.throws(
+      () => parseAuditDecisionV1Text(json, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-090 — Extra top-level key "prototype" rejected');
+  }
+
+  // AD-091: Extra key "toString" rejected
+  {
+    const ctx = makeContext();
+    const json = JSON.stringify({
+      ...makeValidDecision(),
+      toString: 'foo'
+    });
+    assert.throws(
+      () => parseAuditDecisionV1Text(json, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-091 — Extra top-level key "toString" rejected');
+  }
+
+  // AD-092: Escaped __proto__ spelling ("__\u0070roto__") rejected
+  {
+    const ctx = makeContext();
+    const json = `{"schema_version":1,"decision":"STOP","project_id":"${ctx.project_id}","audit_subject_id":"${ctx.audit_subject_id}","auditor_thread_id":"${ctx.auditor_thread_id}","workspace_state_observed":"${ctx.workspace_state_observed}","summary":"ok","independent_verification":[{"kind":"SOURCE_INSPECTION","result":"PASS","evidence":"ok"}],"work_order":null,"requested_evidence":[],"blocker":null,"__\\u0070roto__":{}}`;
+    assert.throws(
+      () => parseAuditDecisionV1Text(json, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-092 — Escaped __proto__ spelling rejected');
+  }
+
+  // AD-093: Direct JavaScript independent_verification[0] with custom prototype rejected
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const customProto = { hacked: true };
+    const ivWithCustomProto = Object.create(customProto);
+    Object.assign(ivWithCustomProto, d.independent_verification[0]);
+    d.independent_verification[0] = ivWithCustomProto;
+
+    assert.throws(
+      () => validateAuditDecisionV1(d, ctx),
+      { code: ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID }
+    );
+    console.log('PASS: AD-093 — Direct JavaScript independent_verification item with custom prototype rejected');
+  }
+
+  // AD-094: Nested giant unexpected key in work_order produces bounded error
+  {
+    const ctx = makeContext();
+    const giantKey = 'Z'.repeat(50000);
+    const json = JSON.stringify({
+      ...makeValidDecision(),
+      work_order: {
+        ...makeValidDecision().work_order,
+        [giantKey]: true
+      }
+    });
+    try {
+      parseAuditDecisionV1Text(json, ctx);
+      assert.fail('Should have rejected unexpected key in work_order');
+    } catch (err) {
+      assert.strictEqual(err.code, ERROR_CODES.AUDIT_DECISION_SCHEMA_INVALID);
+      const msgBytes = Buffer.byteLength(err.message, 'utf8');
+      assert.ok(msgBytes <= 1024, `Error message length ${msgBytes} exceeds 1024 bytes`);
+      assert.strictEqual(err.message.includes(giantKey), false, 'Giant key leaked into error message');
+    }
+    console.log('PASS: AD-094 — Nested giant unexpected key produces bounded diagnostic message');
+  }
+
+  // AD-095: Adapter throwing TURN_FAILED wrapped into bounded AUDIT_DECISION_TURN_NOT_COMPLETED
+  {
+    const ctx = makeContext();
+    const failedTurnObj = {
+      id: 'turn_err_1',
+      status: 'failed',
+      items: [{ type: 'agentMessage', text: 'giant payload '.repeat(500) }]
+    };
+    const fakeAdapter = {
+      async waitForTurnCompletion() {
+        const error = new Error('Turn turn_err_1 failed: model failure');
+        error.code = 'TURN_FAILED';
+        error.details = { turn: failedTurnObj };
+        throw error;
+      }
+    };
+
+    try {
+      await awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn_err_1',
+        expectedContext: ctx
+      });
+      assert.fail('Should have thrown turn not completed error');
+    } catch (err) {
+      assert.strictEqual(err.code, ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED);
+      assert.strictEqual(err.details.status, 'failed');
+      assert.strictEqual(err.details.turnId, 'turn_err_1');
+      assert.strictEqual(err.details.turn, undefined, 'Raw turn object leaked into err.details');
+      const msgBytes = Buffer.byteLength(err.message, 'utf8');
+      assert.ok(msgBytes <= 1024, `Error message length ${msgBytes} exceeds 1024 bytes`);
+    }
+    console.log('PASS: AD-095 — Adapter TURN_FAILED wrapped into bounded AUDIT_DECISION_TURN_NOT_COMPLETED without raw turn leakage');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITDECISION TESTS PASSED (AD-001 .. AD-078: 78/78 PASS)');
+  console.log('ALL AUDITDECISION TESTS PASSED (AD-001 .. AD-095: 95/95 PASS)');
   console.log('======================================================================\n');
 }
 

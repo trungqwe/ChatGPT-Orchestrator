@@ -58,7 +58,7 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 34. **NT-V4-AUD-05** (Cross-process resume ID mismatch): Khi resume qua tiến trình mới mà provider trả về `thread.id` khác → fail closed lập tức với `CODEX_APP_SERVER_THREAD_MISMATCH`, không bao giờ nhận thread lạ làm authority.
 35. **NT-V4-AUD-06** (Rollout path isolation): File rollout trên đĩa bị di chuyển hoặc đổi đường dẫn nội bộ → Orchestrator tuyệt đối không suy diễn định danh qua path mà chỉ dùng exact opaque `thread.id`.
 
-## AuditDecisionV1 Semantic Contract Negative Matrix (WP-V4-04: AD-001..AD-078)
+## AuditDecisionV1 Semantic Contract Negative Matrix (WP-V4-04 / WO-V4-04F: AD-001..AD-095)
 
 36. **AD-SCHEMA-01** (Invalid JSON / Prose / Fences): JSON syntax error, markdown code fences (` ```json `), prefix/suffix prose, trailing commas, hoặc nhiều JSON docs trong một message đều bị từ chối fail-closed với `AUDIT_DECISION_INVALID_JSON`.
 37. **AD-SCHEMA-02** (Duplicate Keys Rejection): Khóa trùng lặp ở bất kỳ cấp độ nào (top-level hay nested) bị từ chối với `AUDIT_DECISION_DUPLICATE_KEY`; không cho phép JavaScript "last-key-wins".
@@ -77,3 +77,9 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 50. **AD-TURN-02** (Items Incomplete): Snapshot turn có `turn.itemsView != 'full'` bị từ chối với `AUDIT_DECISION_ITEMS_INCOMPLETE`.
 51. **AD-TURN-03** (Message Phase Selection): Bỏ qua các item không phải `agentMessage` (`reasoning`, `plan`, `fileChange`). Message có `phase == 'commentary'` tuyệt đối không được coi là quyết định. Nếu có nhiều `final_answer` hoặc nhiều unknown-phase messages, từ chối với `AUDIT_DECISION_OUTPUT_AMBIGUOUS`.
 52. **AD-INJECT-01** (Prompt Injection Defense): Các payload giả mạo danh tính dự án hoặc ép buộc approval trong repository bị vô hiệu hóa hoàn toàn bởi outputSchema enums, local recursive parser và exact context checks.
+53. **AD-AUTH-01** (Top-Level __proto__ Injection): JSON payload chứa `"__proto__": { ... }` ở top-level được parser biểu diễn thành own property trên null-prototype object và bị validator từ chối fail-closed với `AUDIT_DECISION_SCHEMA_INVALID`.
+54. **AD-AUTH-02** (Nested __proto__ Injection): Các object con `work_order` hoặc `independent_verification[i]` chứa `"__proto__": { ... }` bị từ chối fail-closed với `AUDIT_DECISION_SCHEMA_INVALID`.
+55. **AD-AUTH-03** (Custom Prototype Direct Validator Input): Gọi trực tiếp `validateAuditDecisionV1()` với JavaScript object có custom prototype (class instance, prototype pollution) bị từ chối bởi `isPlainJsonObject()`.
+56. **AD-AUTH-04** (Giant Duplicate Key Diagnostic): JSON chứa key trùng lặp cực lớn (> 60 KiB) bị từ chối với `AUDIT_DECISION_DUPLICATE_KEY`; error message bị chặn dưới 1024 bytes và không echo chuỗi key độc hại.
+57. **AD-AUTH-05** (Giant Context Mismatch Diagnostic): Model trả về giá trị identity cực lớn gây mismatch; error message và `err.details` chỉ ghi tên trường (`{ field: "project_id" }`) với kích thước ≤ 1024 bytes, không leak giá trị actual/expected.
+58. **AD-AUTH-06** (Raw Terminal Turn Diagnostic Leakage): Turn thất bại hoặc mang payload lớn ném lỗi `AUDIT_DECISION_TURN_NOT_COMPLETED`; không sao chép `completion`, `turn` hay text vào `err.details`. Adapter `TURN_FAILED` được wrap an toàn thành bounded failure.

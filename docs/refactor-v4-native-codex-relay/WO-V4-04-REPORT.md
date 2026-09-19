@@ -236,3 +236,17 @@ All 11 deterministic test suites passed with exit code 0:
 `WP-V4-04` has met all quality gates, architectural invariants, and negative test requirements. The structured semantic authority contract `AuditDecisionV1` is fully verified and ready for external review.
 
 **Status**: `READY_FOR_WP_V4_04_EXTERNAL_REVIEW`
+
+---
+
+### 17. External Review Correction (WO-V4-04F)
+
+- **Original implementation report claim**:
+  LOCAL WORKER CLAIM (`Bounded Diagnostics: PASS`, `Prototype safety: PASS`)
+- **External review**:
+  BLOCKED pending WO-V4-04F
+- **Findings Identified**:
+  - `AD-AUTH-01`: Parser used ordinary object literal `{}` with `obj[key] = val`, causing `__proto__` to invoke internal prototype setter instead of creating own property, potentially evading `additionalProperties` check.
+  - `AD-AUTH-02`: Error diagnostics in duplicate keys, extra keys, and context mismatches echoed unvalidated model-controlled keys or actual values without finite bounds. Adapter `waitForTurnCompletion` failure attached raw turn objects.
+- **Resolution**:
+  Resolved in `WO-V4-04F` via prototype-free `Object.create(null)` representation, `isPlainJsonObject` validation, centralized `MAX_ERROR_MESSAGE_BYTES = 1024`, safe field-only context diagnostics, and full test expansion (AD-001..AD-095).

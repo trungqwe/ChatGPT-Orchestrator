@@ -1,8 +1,8 @@
 # Trust Boundaries và Invariants
 
 1. **Semantic Authority Pipeline**:
-   - Provider `outputSchema` + strict local JSON parsing (with duplicate-key rejection and size bounds) + local schema validation + exact context validation + branch semantics are **all required** before semantic authority exists.
-   - Model output is completely untrusted until all five validation layers succeed.
+   - Provider `outputSchema` + strict local prototype-free JSON parsing (with duplicate-key rejection, prototype mutation prevention, and size bounds) + local schema validation + exact context validation + branch semantics + bounded diagnostic guarantees are **all required** before semantic authority exists.
+   - Model output is completely untrusted until all validation layers succeed.
    - Valid schema output ≠ fresh workspace authority.
 
 2. **Input vs Authority Distinction**:

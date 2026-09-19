@@ -103,7 +103,7 @@ Each item in `independent_verification` must be an object with exactly three req
   - `PASS`
   - `FAIL`
   - `INCONCLUSIVE`
-- **`evidence`**: Non-empty string, UTF-8 byte length ≤ 4096 (4 KiB). No control characters.
+- **`evidence`**: Non-empty string, UTF-8 byte length ≤ 4096 (4 KiB). Allows standard multi-line whitespace (`\t`, `\n`, `\r`); forbids control characters (0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F).
 - **`additionalProperties`**: `false`.
 
 ---
@@ -123,9 +123,9 @@ When `work_order` is an object:
 }
 ```
 
-- **`work_order_id`**: Non-empty string, UTF-8 byte length ≤ 512 bytes. No control characters. No `WO-` prefix required.
-- **`directive`**: Non-empty string, UTF-8 byte length ≤ 65536 (64 KiB).
-- **`verification`**: Array of 1 .. 32 non-empty strings, each UTF-8 byte length ≤ 4096 (4 KiB).
+- **`work_order_id`**: Non-empty string, UTF-8 byte length ≤ 512 bytes. Forbids all control characters (0x00-0x1F, 0x7F). No `WO-` prefix required.
+- **`directive`**: Non-empty string, UTF-8 byte length ≤ 65536 (64 KiB). Allows standard multi-line whitespace (`\t`, `\n`, `\r`); forbids control characters (0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F).
+- **`verification`**: Array of 1 .. 32 non-empty strings, each UTF-8 byte length ≤ 4096 (4 KiB). Allows `\t`, `\n`, `\r`; forbids control characters.
 - **`worker_model_policy`**: Exactly `worker_economy` or `worker_standard`. Concrete model names (e.g. `gpt-5`, `gemini`) are forbidden.
 - **`additionalProperties`**: `false`.
 
