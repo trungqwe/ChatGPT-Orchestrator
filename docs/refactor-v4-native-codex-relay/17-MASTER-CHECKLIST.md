@@ -9,9 +9,9 @@
 - [x] Production bridge calls được quarantine.
 - [x] Registry v2 và migration explicit implemented; auditor thread vẫn unbound sau migration.
 - [x] App Server stdio transport core & semantic adapter implemented (WP-V4-03A).
-- [ ] Real Native Codex accepted (WP-V4-03B).
-- [ ] Thread persistence complete (WP-V4-05).
+- [x] Real Native Codex accepted (WP-V4-03B: real initialize, model/list, thread/start, same-process thread/read, clean close; WP-V4-03 COMPLETE).
 - [ ] AuditDecision complete (WP-V4-04).
+- [ ] Thread persistence & durable cross-process recovery complete (WP-V4-05; no pre-materialization Registry binding).
 - [ ] Model resolver complete (WP-V4-06).
 - [ ] One-shot và shadow proven.
 - [ ] Legacy production path removed.

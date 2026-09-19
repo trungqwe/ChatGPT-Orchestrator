@@ -48,3 +48,12 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 27. Close uncertainty for sent side-effects: Gọi `close()` trong khi request side-effect đã gửi qua stdin đang chờ phản hồi sẽ reject với `CODEX_APP_SERVER_REQUEST_UNCERTAIN`.
 28. Thread start camelCase SandboxMode guard: Adapter `startThread` đảm bảo không bao giờ gửi chuỗi camelCase `readOnly` làm giá trị `sandbox` (CAS-083).
 29. Fake provider wrong SandboxMode enum rejection: Fixture từ chối trực tiếp request `thread/start` nhận `sandbox: "readOnly"` hoặc enum sai với lỗi provider code `-32602` (CAS-084).
+
+## Future Auditor Materialization & Durability Negative Matrix (WP-V4-05 / WO-V4-03BR)
+
+30. **NT-V4-AUD-01** (Zero-turn thread remains unbound): `thread/start` thành công nhưng chưa có lượt audit nào xảy ra → Registry v2 bắt buộc giữ `auditor.thread_id: null`, `auditor.enabled: false`.
+31. **NT-V4-AUD-02** (Crash before first turn): Crash tiến trình sau khi `thread/start` thành công nhưng trước khi có lượt audit đầu tiên → ID provisional bị hủy, không xem là authority bền vững, fail-closed về `AUDITOR_REGISTRATION_REQUIRED`.
+32. **NT-V4-AUD-03** (Zero-turn resume rejection handled gracefully): `thread/resume` trên thread 0-turn trả về provider error `-32600 (no rollout found)` → phân loại là giới hạn pre-materialization tự nhiên của provider, không coi là lỗi transport hỏng hóc, không làm sai lệch Registry.
+33. **NT-V4-AUD-04** (First turn completed without resume proof): Lượt audit đầu tiên hoàn thành nhưng chưa kiểm chứng thành công `thread/resume` sau restart → không được đánh dấu `AUDITOR_BOUND_READY`.
+34. **NT-V4-AUD-05** (Cross-process resume ID mismatch): Khi resume qua tiến trình mới mà provider trả về `thread.id` khác → fail closed lập tức với `CODEX_APP_SERVER_THREAD_MISMATCH`, không bao giờ nhận thread lạ làm authority.
+35. **NT-V4-AUD-06** (Rollout path isolation): File rollout trên đĩa bị di chuyển hoặc đổi đường dẫn nội bộ → Orchestrator tuyệt đối không suy diễn định danh qua path mà chỉ dùng exact opaque `thread.id`.

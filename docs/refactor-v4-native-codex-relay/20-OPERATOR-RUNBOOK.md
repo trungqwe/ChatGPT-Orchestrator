@@ -12,7 +12,7 @@ Không chạy các lệnh apply này trên Registry thật trong work package tr
 
 1. Register canonical project root và worker.
 2. Start relay; kiểm tra registry/store/App Server.
-3. Create auditor thread một lần; kiểm tra exact ID/cwd rồi persist.
+3. Khởi tạo provisional auditor thread (in-memory). Chỉ thực hiện lượt audit thực tế đầu tiên khi contract AuditDecisionV1 (WP-V4-04) đã sẵn sàng. Sau khi vượt qua gate kiểm định durable materialization & exact resume recovery (WP-V4-05), mới persist exact thread_id vào Registry v2. Tuyệt đối không persist zero-turn provisional thread chỉ vì thread/start thành công.
 4. Chọn logical model policy và xem runtime resolution.
 5. Chạy one-shot; quan sát decision/dispatch IDs.
 6. Khi ready, xác nhận fresh snapshot và same-thread review.

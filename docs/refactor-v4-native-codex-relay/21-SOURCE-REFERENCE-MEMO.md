@@ -20,6 +20,7 @@ Kiểm chứng dựa trên schema sinh ra từ chính bản cài đặt Codex (`
    - Hỗ trợ server-initiated requests (như yêu cầu phê duyệt lệnh shell hoặc file change).
    - `review/start` hỗ trợ cả `inline` và `detached`.
    - Streaming các notification `turn/started`, `item/started`, `item/completed`, `turn/completed` (trong đó `turn/completed` có thể không kèm `threadId`).
+   - **Lazy Rollout Materialization (Codex 0.154.0)**: `thread/start` khởi tạo thread trong bộ nhớ với `status: { type: "idle" }` và gán metadata đường dẫn rollout. Tuy nhiên, file `.jsonl` rollout trên đĩa chỉ được tạo khi có lượt rà soát thực tế đầu tiên (`turn/start`). Lệnh `thread/resume` trên một thread rỗng chưa có turn trả về provider error `-32600 (no rollout found)`. Ngược lại, `thread/read` truy vấn trực tiếp session in-memory nên đọc thành công exact thread ID.
 
 2. Our Adapter Policy (WP-V4-03A / WO-V4-03AG):
    - Chỉ cho phép transport stdio JSONL cục bộ với `shell: false`.
@@ -33,11 +34,12 @@ Kiểm chứng dựa trên schema sinh ra từ chính bản cài đặt Codex (`
    - Giới hạn kích thước dòng stdout 8 MiB, giới hạn stderr tail 64 KiB, giới hạn text input 1 MiB.
 
 3. Status & Future V4 Behavior:
-   - WP-V4-03A: PENDING_EXTERNAL_REVIEW (đã hoàn thành WO-V4-03AG Wire Enum Seal, chờ phê duyệt).
-   - WP-V4-03B: NOT YET STARTED (Live App Server smoke & end-to-end verification).
-   - WP-V4-04: Validate cấu trúc `AuditDecisionV1` qua strict schema.
-   - WP-V4-05: Lưu trữ bền vững và phục hồi binding thread ID trong Project Registry v2.
-   - WP-V4-06: Phân giải model policy logic (`auditor_fast`, `auditor_standard`, `auditor_deep`) sang concrete model IDs từ `model/list`.
+   - WP-V4-03A: APPROVED / CLOSED (Wire Enum Seal confirmed).
+   - WP-V4-03B: REAL_RUNTIME_ACCEPTED (Nghiệm thu real App Server 0.154.0 thành công; reclassification WO-V4-03BR xác nhận lazy rollout materialization).
+   - WP-V4-03: APPROVED / CLOSED.
+   - WP-V4-04: NOT STARTED (Validate cấu trúc `AuditDecisionV1` qua strict schema).
+   - WP-V4-05: NOT STARTED (Durable persistence, first materialized real thread, cross-process exact resume, restart recovery).
+   - WP-V4-06: NOT STARTED (Phân giải model policy logic `auditor_fast`, `auditor_standard`, `auditor_deep` sang concrete model IDs từ `model/list`).
 
 ## Repository facts
 
@@ -45,4 +47,4 @@ V3 có Web-specific registry, durable SQLite worker lifecycle, workspace state, 
 
 ## Decisions và proposals
 
-Persistent project thread, App Server control plane, read-only auditor policy và logical model tiers là quyết định V4. WP-V4-03A đã niêm phong chuẩn xác enum dây chuyền `sandbox: "read-only"` qua WO-V4-03AG; WP-V4-03B sẽ nghiệm thu real App Server khi có quyết định bắt đầu.
+Persistent project thread, App Server control plane, read-only auditor policy và logical model tiers là quyết định V4. WP-V4-03 đã đóng gói hoàn chỉnh transport và nghiệm thu real App Server runtime; phân định rõ ranh giới giữa provisional in-memory thread (WP-V4-03B) và durable cross-process bound thread (WP-V4-05). WP-V4-04 tiếp theo tập trung vào contract schema `AuditDecisionV1`.

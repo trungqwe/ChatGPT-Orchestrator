@@ -13,7 +13,8 @@
 | Real Runtime Evidence | LOCAL OPERATOR / AGENT EXECUTION |
 | GitHub Source Evidence | SEPARATE |
 | GitHub CI | NOT_PRESENT |
-| Overall Result | `WP_V4_03B_BLOCKED` |
+| Overall Result | `REAL_RUNTIME_ACCEPTED` (Reclassified per WO-V4-03BR; see Section 17) |
+| Initial Runtime Gate | `WP_V4_03B_BLOCKED` (Retained as baseline evidence) |
 
 ---
 
@@ -138,7 +139,8 @@ Generated TypeScript schema bindings via `codex app-server generate-ts --out <TE
 # 9. Exact Thread Resume Evidence
 
 - Invocation: `adapter.resumeThread({ threadId: T })`
-- Provider response: **BLOCKED / PROVIDER REJECTION**
+- Provider response: **REJECTED (Retained as Empirical Evidence)**
+- Zero-Turn Resume Classification: `NOT_APPLICABLE_PRE_MATERIALIZATION` (Expected provider lazy materialization limit)
 - Exact JSON-RPC Error returned by real App Server:
   ```json
   {
@@ -162,8 +164,8 @@ Generated TypeScript schema bindings via `codex app-server generate-ts --out <TE
 |---|---|---|
 | `thread/start` | `01a0babd-b491-7362-9723-7343f129d29f` | PASS |
 | `thread/read` | `01a0babd-b491-7362-9723-7343f129d29f` | PASS (Exact Match) |
-| `thread/resume` | N/A (Provider Error -32600) | BLOCKED |
-| Identity Stability | **BLOCKED** (cannot verify resume ID) | BLOCKED |
+| `thread/resume` | N/A (Provider Error -32600 retained: no rollout found) | `NOT_APPLICABLE_PRE_MATERIALIZATION` |
+| Live Identity Stability | `01a0babd-b491-7362-9723-7343f129d29f` | **EXACT_ID_STABLE** (Same-Process `thread/read`) |
 
 ---
 
@@ -227,13 +229,24 @@ Generated TypeScript schema bindings via `codex app-server generate-ts --out <TE
 
 # 16. Recommendation
 
-- Result: **`WP_V4_03B_BLOCKED`**
+- Initial Operational Result: `WP_V4_03B_BLOCKED`
+- Post-Reclassification Result (WO-V4-03BR): **`REAL_RUNTIME_ACCEPTED`**
 - Findings:
   1. The core Native Codex App Server stdio transport operates cleanly with the installed `codex-cli 0.154.0` binary.
   2. Handshake (`initialize` / `initialized`), model enumeration (`model/list`), thread creation (`thread/start`), and thread inspection (`thread/read`) were 100% successful against the real provider.
   3. Security enforcement (`approvalPolicy = "never"`, `sandbox = "read-only"`) was verified by provider acceptance.
   4. Process lifecycle and workspace/registry immutability were verified.
-  5. The acceptance is blocked solely on `thread/resume` behavior: Codex App Server v0.154.0 requires an on-disk session rollout file to resume an idle thread, but does not write a rollout file until at least one turn or write action occurs.
-- Proposed Remediation:
-  - Issue a corrective Work Order to specify how Orchestrator handles `thread/resume` vs `thread/read` lifecycle:
-    - E.g., clarify that `thread/read` is the canonical liveness and status query for newly bound / zero-turn threads, while `thread/resume` is used only after turns have been persisted to rollout; OR define the required turn initiation / session persistence behavior.
+  5. The initial blocker (`thread/resume` on zero-turn thread returning `-32600: no rollout found`) was analyzed by external review in WO-V4-03BR and identified as an invalid pre-materialization gate (`INVALID_PRE_MATERIALIZATION_GATE`) rather than a transport or adapter failure.
+
+---
+
+# 17. External Review Reclassification (WO-V4-03BR)
+
+Under Work Order WO-V4-03BR, the runtime acceptance outcome is formally reclassified:
+
+1. **Observed Rejection Retained**: The real-world empirical evidence that `thread/resume` on a zero-turn thread yields `-32600: no rollout found for thread id ...` is retained exactly as observed.
+2. **Provider Lazy Rollout Semantics**: In `codex-cli 0.154.0`, thread sessions are instantiated in memory with `status: { type: "idle" }`. Rollout files on disk (`.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`) are materialized only when the first real turn executes or meaningful content is generated.
+3. **Invalid Previous Gate**: Demanding `thread/resume` on a thread prior to any turn was an incorrect acceptance rule (`INVALID_PRE_MATERIALIZATION_GATE`). Zero-turn resumption is reclassified as `NOT_APPLICABLE_PRE_MATERIALIZATION` (expected provider lazy materialization limit), not a transport failure.
+4. **Transport Acceptance Complete**: Real transport interoperability is 100% proven (`initialize`, `initialized`, `model/list`, `thread/start`, same-process `thread/read`, clean child process termination, and complete workspace/registry immutability).
+5. **Durability Gate Relocation**: Validation of cross-process restart recovery via `thread/resume` is moved to **WP-V4-05** (Thread Persistence and Recovery) where it will be verified after real audit turns have naturally materialized thread history.
+6. **WP-V4-03 Conclusion**: WP-V4-03 is approved and closed. No production code changes or dummy materialization turns are permitted.

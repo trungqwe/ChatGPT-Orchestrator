@@ -5,10 +5,10 @@
 | V4-01 | Architecture reset | Static docs validation |
 | V4-02A | Quarantine Web bridge path | app không spawn/probe bridge |
 | V4-02B | Registry v2 + migration explicit | 39 RG + 52 RV2 và rollback tests; chưa apply trên Registry thật |
-| V4-03A | Transport core implemented | 60 CAS tests pass; fake fixture + deterministic protocol |
-| V4-03B | Real App Server acceptance | REAL_APP_SERVER_ACCEPTANCE_PENDING (opt-in smoke tool sẵn sàng) |
-| V4-04 | AuditDecisionV1 | schema negatives |
-| V4-05 | Thread persistence/recovery | crash tests |
+| V4-03A | Transport core implemented | APPROVED / CLOSED (84 CAS tests pass; fake fixture + deterministic protocol) |
+| V4-03B | Real App Server acceptance | REAL_RUNTIME_ACCEPTED (Real binary initialize, model/list, thread/start, same-process thread/read, clean close; zero-turn resume reclassified per WO-V4-03BR) |
+| V4-04 | AuditDecisionV1 | schema negatives; structured output contract (NOT STARTED) |
+| V4-05 | Thread persistence/recovery | first materialized real thread, cross-process exact resume, no pre-materialization Registry binding, restart recovery crash tests (NOT STARTED) |
 | V4-06 | Model resolver | catalog/fallback tests |
 | V4-07 | Audit/recover CLI | integration tests |
 | V4-08 | Generic worker boundary | Antigravity regression |

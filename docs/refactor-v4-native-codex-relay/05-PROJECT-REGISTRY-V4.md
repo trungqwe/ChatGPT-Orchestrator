@@ -13,3 +13,28 @@ Worker vẫn giới hạn `antigravity`; `worker.model_policy` là `worker_econo
 Migration v1→v2 chỉ chạy qua admin CLI explicit. Preview đọc và hash byte nguồn, validate toàn bộ v1, canonicalize tất cả root, tạo candidate v2 và không ghi file. Apply cần SHA-256 đã preview, đọc lại nguồn, tạo backup byte-exact trong cùng thư mục, ghi temp file, fsync, rename và validate sau ghi. Metadata auditor v1 bị loại bỏ; **không chuyển `task_id` thành `thread_id`**. Mọi project v1 trở thành auditor unbound/disabled và cần đăng ký thread sau này. Không tạo thread trong WP-V4-02B.
 
 Mỗi lần đọc nguồn migration, kể cả lần re-read ngay trước rename, bắt buộc ba snapshot `lstat(path)` → `fstat(fd)` → `lstat(path)`. Pathname trước/sau không được là symlink; cả ba phải là regular file với `dev` và `ino` không null. Identity `dev`/`ino` phải bằng nhau theo cặp pre/fd và fd/post. Nếu thiếu identity hoặc pathname đổi, trả `REGISTRY_CORRUPT` và không dùng byte vừa đọc làm authority. SHA-256 chỉ bổ sung xác thực nội dung sau khi file identity đã được chứng minh.
+
+## Phân định trạng thái Thread Materialization & Ranh giới Registry V2 (WO-V4-03BR)
+
+Kiến trúc phân định chặt chẽ ba trạng thái vòng đời của thread:
+
+1. `UNBOUND`:
+   - `auditor.thread_id == null`, `auditor.enabled == false`.
+   - Trạng thái vận hành suy ra: `AUDITOR_REGISTRATION_REQUIRED`.
+   - Giữ nguyên cấu trúc Registry v2 hiện tại, không thêm cờ phụ.
+
+2. `PROVISIONAL_UNMATERIALIZED`:
+   - `thread/start` thành công trên tiến trình App Server đang chạy; nhận được `thread.id` chính xác; cùng tiến trình có thể dùng `thread/read` để thấy thread.
+   - Chưa có lượt rà soát thực tế nào (`turn/start`), file session rollout trên đĩa chưa được Codex vật chất hóa (lazy rollout materialization).
+   - Chưa chứng minh được khả năng phục hồi liên tiến trình (`thread/resume` qua restart).
+   - Thẩm quyền: **Chỉ tồn tại trong bộ nhớ / cục bộ của phiên làm việc (IN-MEMORY / OPERATION-LOCAL ONLY)**.
+   - **Cấm ghi vào Registry**: Tuyệt đối không ghi provisional thread ID vào Registry v2 (`auditor.thread_id` vẫn phải là `null`, `enabled: false`). Lý do: *thread ID tồn tại ≠ lịch sử auditor bền vững có thể resume*.
+
+3. `DURABLE_BOUND`:
+   - Chỉ đạt được sau khi: `thread/start` có ID hợp lệ + lượt audit thực tế đầu tiên (`turn/start`) hoàn thành có cấu trúc + lịch sử rollout được provider vật chất hóa + vượt qua bài kiểm tra phục hồi/resume liên tiến trình (`thread/resume` trả về đúng exact ID sau restart) tại WP-V4-05.
+   - Khi đó mới ghi `auditor.thread_id = exact_id`, `auditor.enabled = true` vào Registry v2 (`AUDITOR_BOUND_READY`).
+
+**Nguyên tắc bất biến về Registry & Rollout File**:
+- Không thay đổi schema Registry v2: không thêm bất kỳ trường nào như `materialized`, `provisional`, `durable`, `resume_verified`.
+- Tuyệt đối không dùng `thread.path`, rollout path, hoặc session filename làm định danh authority. Định danh auditor duy nhất là opaque `thread.id`.
+- Nghiêm cấm Orchestrator can thiệp filesystem vào rollout: cấm tạo file rollout rỗng, cấm touch file, cấm copy/sửa file `.jsonl` hoặc quét thư mục `.codex/sessions` để ép resume thành công. Provider Codex toàn quyền sở hữu cơ chế persistence của nó.
