@@ -254,12 +254,13 @@ function resolveGitHead(gitBinary, projectRoot, customSpawn) {
 }
 
 /**
- * Resolve porcelain v2 status digest (Section 21).
+ * Resolve porcelain v2 status digest (Section 21 / WO-V3-004G Section 7).
+ * Uses --ignore-submodules=all to eliminate implicit recursive worktree traversal.
  */
 function resolveStatusDigest(gitBinary, projectRoot, customSpawn) {
   const res = runGitCommand(
     gitBinary,
-    ['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none'],
+    ['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=all'],
     projectRoot,
     customSpawn
   );
@@ -277,7 +278,8 @@ function resolveStatusDigest(gitBinary, projectRoot, customSpawn) {
 }
 
 /**
- * Resolve staged diff digest (Section 22 / A-18).
+ * Resolve staged diff digest (Section 22 / A-18 / WO-V3-004G Section 8).
+ * Uses --ignore-submodules=all to eliminate implicit recursive worktree traversal.
  */
 function resolveStagedDiffDigest(gitBinary, projectRoot, customSpawn) {
   const res = runGitCommand(
@@ -291,6 +293,7 @@ function resolveStagedDiffDigest(gitBinary, projectRoot, customSpawn) {
       '--no-textconv',
       '--no-renames',
       '--no-color',
+      '--ignore-submodules=all',
       '--diff-algorithm=myers'
     ],
     projectRoot,
@@ -310,7 +313,8 @@ function resolveStagedDiffDigest(gitBinary, projectRoot, customSpawn) {
 }
 
 /**
- * Resolve unstaged diff digest (Section 23 / A-18).
+ * Resolve unstaged diff digest (Section 23 / A-18 / WO-V3-004G Section 8).
+ * Uses --ignore-submodules=all to eliminate implicit recursive worktree traversal.
  */
 function resolveUnstagedDiffDigest(gitBinary, projectRoot, customSpawn) {
   const res = runGitCommand(
@@ -323,6 +327,7 @@ function resolveUnstagedDiffDigest(gitBinary, projectRoot, customSpawn) {
       '--no-textconv',
       '--no-renames',
       '--no-color',
+      '--ignore-submodules=all',
       '--diff-algorithm=myers'
     ],
     projectRoot,
@@ -552,14 +557,22 @@ function collectUntrackedManifest(gitBinary, projectRoot, customSpawn, customFs)
 }
 
 /**
- * Collect submodule state from index gitlinks and working trees (Sections 41-46 / A-06 / A-07 / WSAUTH-02-05).
+ * Recursively collect submodules safely with explicit worktree containment verification (WO-V3-004G Sections 10-18).
+ * No implicit Git recursion is trusted.
  */
-function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, customFs) {
-  // 1. Discover submodules via index gitlinks (mode 160000)
+function collectRepositorySubmodules(
+  currentRepoRoot,
+  canonicalProjectRoot,
+  projectRelativePrefix,
+  customSpawn,
+  customFs,
+  gitBinary
+) {
+  // 1. Run git ls-files --stage -z in the already-containment-validated repo root
   const lsStageRes = runGitCommand(
     gitBinary,
     ['ls-files', '--stage', '-z'],
-    canonicalProjectRoot,
+    currentRepoRoot,
     customSpawn
   );
 
@@ -567,12 +580,12 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
     const stderr = extractBoundedStderr(lsStageRes.stderr);
     throw new WorkspaceStateError(
       WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
-      `git ls-files --stage failed: ${stderr}`,
+      `git ls-files --stage failed in '${currentRepoRoot}': ${stderr}`,
       { status: lsStageRes.status, stderr }
     );
   }
 
-  const submodules = [];
+  const records = [];
   const buf = lsStageRes.stdout;
   let start = 0;
 
@@ -580,7 +593,6 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
     if (buf[i] === 0) {
       if (i > start) {
         const recordBuf = buf.subarray(start, i);
-        // Find TAB byte separating metadata from path (WSAUTH-03)
         const tabIdx = recordBuf.indexOf(0x09);
         if (tabIdx === -1) {
           throw new WorkspaceStateError(
@@ -611,10 +623,10 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
 
         if (mode === '160000') {
           // Strict UTF-8 decode of path bytes (A-02, WSAUTH-03)
-          let gitRelativePath;
+          let localGitRelativePath;
           try {
             const decoder = new TextDecoder('utf-8', { fatal: true });
-            gitRelativePath = decoder.decode(pathBuf);
+            localGitRelativePath = decoder.decode(pathBuf);
           } catch (err) {
             throw new WorkspaceStateError(
               WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
@@ -622,7 +634,7 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
             );
           }
 
-          if (!gitRelativePath) {
+          if (!localGitRelativePath) {
             throw new WorkspaceStateError(
               WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
               'Submodule path is empty'
@@ -630,53 +642,58 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
           }
 
           // Reject absolute paths
-          if (gitRelativePath.startsWith('/') || /^[a-zA-Z]:/.test(gitRelativePath)) {
+          if (localGitRelativePath.startsWith('/') || /^[a-zA-Z]:/.test(localGitRelativePath)) {
             throw new WorkspaceStateError(
               WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-              `Submodule path must be relative to project root: '${gitRelativePath}'`
+              `Submodule path must be relative: '${localGitRelativePath}'`
             );
           }
 
           // Segment-based traversal check (WSAUTH-04 / WSAUTH-05)
-          const segments = gitRelativePath.split('/');
-          for (const seg of segments) {
+          const localSegments = localGitRelativePath.split('/');
+          for (const seg of localSegments) {
             if (seg === '..') {
               throw new WorkspaceStateError(
                 WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-                `Submodule path contains directory traversal segment '..': '${gitRelativePath}'`
+                `Submodule path contains directory traversal segment '..': '${localGitRelativePath}'`
               );
             }
           }
 
-          // Build filesystem path without modifying gitRelativePath (WSAUTH-05)
-          const submodFullPath = path.resolve(canonicalProjectRoot, ...segments);
+          // Full project-relative Git path (Section 11)
+          const fullProjectRelativePath = projectRelativePrefix
+            ? `${projectRelativePrefix}/${localGitRelativePath}`
+            : localGitRelativePath;
 
-          // Lexical containment verification
-          const relCheck = path.relative(canonicalProjectRoot, submodFullPath);
+          // Build filesystem path for the submodule worktree
+          const submodFsPath = path.resolve(currentRepoRoot, ...localSegments);
+
+          // Lexical containment verification against top-level canonical project root
+          const relCheck = path.relative(canonicalProjectRoot, submodFsPath);
           if (relCheck.startsWith('..') || path.isAbsolute(relCheck) || relCheck === '') {
             throw new WorkspaceStateError(
               WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-              `Submodule path resolves outside project root: '${gitRelativePath}'`
+              `Submodule path resolves outside project root: '${fullProjectRelativePath}'`
             );
           }
 
-          // Submodule worktree symlink / canonical containment check (WSAUTH-04)
+          // Submodule worktree lstat check
           let submodStat = null;
           try {
-            submodStat = customFs.lstatSync(submodFullPath);
+            submodStat = customFs.lstatSync(submodFsPath);
           } catch (err) {
             if (err.code !== 'ENOENT') {
               throw new WorkspaceStateError(
                 WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
-                `Failed to lstat submodule path '${gitRelativePath}': ${err.message}`
+                `Failed to lstat submodule path '${fullProjectRelativePath}': ${err.message}`
               );
             }
           }
 
           if (!submodStat) {
-            // Directory does not exist -> uninitialized (A-06, Section 26)
-            submodules.push({
-              path: gitRelativePath,
+            // Directory does not exist -> uninitialized
+            records.push({
+              path: fullProjectRelativePath,
               recorded_gitlink_sha: gitlinkSha,
               observed_head: null,
               initialized: false,
@@ -685,15 +702,15 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
             continue;
           }
 
-          // If working tree path exists, check if it or any intermediate resolves outside root (WSAUTH-04)
+          // Canonical realpath check: prove canonical path remains beneath top-level project root
           let canonicalSubmod;
           try {
             const realpathFn = customFs.realpathSync.native || customFs.realpathSync;
-            canonicalSubmod = realpathFn(submodFullPath);
+            canonicalSubmod = realpathFn(submodFsPath);
           } catch (err) {
             throw new WorkspaceStateError(
               WORKSPACE_STATE_ERROR_CODES.WORKSPACE_STATE_UNAVAILABLE,
-              `Failed to resolve canonical path for submodule '${gitRelativePath}': ${err.message}`
+              `Failed to resolve canonical path for submodule '${fullProjectRelativePath}': ${err.message}`
             );
           }
 
@@ -701,7 +718,7 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
           if (relCanonical.startsWith('..') || path.isAbsolute(relCanonical) || relCanonical === '') {
             throw new WorkspaceStateError(
               WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH,
-              `Submodule path '${gitRelativePath}' resolves outside project root via symlink: '${canonicalSubmod}'`
+              `Submodule path '${fullProjectRelativePath}' resolves outside project root via symlink: '${canonicalSubmod}'`
             );
           }
 
@@ -713,7 +730,7 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
           } catch {}
 
           if (isInitialized) {
-            // Observed HEAD (WSAUTH-02: fails closed if git command fails)
+            // Observed HEAD (fail-closed if command fails)
             const headRes = runGitCommand(
               gitBinary,
               ['rev-parse', '--verify', 'HEAD'],
@@ -724,7 +741,7 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
               const stderr = extractBoundedStderr(headRes.stderr);
               throw new WorkspaceStateError(
                 WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
-                `git rev-parse --verify HEAD failed for submodule '${gitRelativePath}': ${stderr}`,
+                `git rev-parse --verify HEAD failed for submodule '${fullProjectRelativePath}': ${stderr}`,
                 { status: headRes.status, stderr }
               );
             }
@@ -732,38 +749,51 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
             if (!observedHead || observedHead.length !== 40) {
               throw new WorkspaceStateError(
                 WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
-                `Invalid HEAD commit SHA returned for submodule '${gitRelativePath}': '${observedHead}'`
+                `Invalid HEAD commit SHA returned for submodule '${fullProjectRelativePath}': '${observedHead}'`
               );
             }
 
-            // Dirty status (WSAUTH-02: fails closed if git command fails)
+            // Dirty status (fail-closed if command fails, --ignore-submodules=all to prevent implicit recursion)
             const dirtyRes = runGitCommand(
               gitBinary,
-              ['-C', canonicalSubmod, 'status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none'],
-              canonicalProjectRoot,
+              ['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=all'],
+              canonicalSubmod,
               customSpawn
             );
             if (dirtyRes.status !== 0) {
               const stderr = extractBoundedStderr(dirtyRes.stderr);
               throw new WorkspaceStateError(
                 WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
-                `git status failed for submodule '${gitRelativePath}': ${stderr}`,
+                `git status failed for submodule '${fullProjectRelativePath}': ${stderr}`,
                 { status: dirtyRes.status, stderr }
               );
             }
             const dirtyStatusSha = sha256Hex(dirtyRes.stdout);
 
-            submodules.push({
-              path: gitRelativePath,
+            records.push({
+              path: fullProjectRelativePath,
               recorded_gitlink_sha: gitlinkSha,
               observed_head: observedHead,
               initialized: true,
               dirty_status_sha256: dirtyStatusSha
             });
+
+            // Explicit safe recursion into nested submodules (Section 10)
+            const nestedRecords = collectRepositorySubmodules(
+              canonicalSubmod,
+              canonicalProjectRoot,
+              fullProjectRelativePath,
+              customSpawn,
+              customFs,
+              gitBinary
+            );
+            for (const nr of nestedRecords) {
+              records.push(nr);
+            }
           } else {
-            // Uninitialized (A-06)
-            submodules.push({
-              path: gitRelativePath,
+            // Uninitialized
+            records.push({
+              path: fullProjectRelativePath,
               recorded_gitlink_sha: gitlinkSha,
               observed_head: null,
               initialized: false,
@@ -776,32 +806,27 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
     }
   }
 
-  // 2. Supplementary raw git submodule status --recursive (A-06 / WSAUTH-02)
-  const rawSubmodRes = runGitCommand(
-    gitBinary,
-    ['submodule', 'status', '--recursive'],
-    canonicalProjectRoot,
-    customSpawn
-  );
-  if (rawSubmodRes.status !== 0) {
-    const stderr = extractBoundedStderr(rawSubmodRes.stderr);
-    throw new WorkspaceStateError(
-      WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED,
-      `git submodule status --recursive failed: ${stderr}`,
-      { status: rawSubmodRes.status, stderr }
-    );
-  }
-  const rawSubmoduleStatusSha = sha256Hex(rawSubmodRes.stdout);
+  return records;
+}
 
-  // Deterministic code-unit sorting (A-19)
+/**
+ * Collect safe recursive submodule state (Sections 10-19 / WO-V3-004G).
+ */
+function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, customFs) {
+  const submodules = collectRepositorySubmodules(
+    canonicalProjectRoot,
+    canonicalProjectRoot,
+    '',
+    customSpawn,
+    customFs,
+    gitBinary
+  );
+
+  // Deterministic code-unit sorting by full project-relative path (Section 11 / A-19)
   submodules.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const compositeSubmoduleData = {
-    raw_status_sha256: rawSubmoduleStatusSha,
-    submodules
-  };
-
-  const submoduleSha256 = sha256Hex(Buffer.from(canonicalJsonStringify(compositeSubmoduleData), 'utf8'));
+  const canonicalJson = canonicalJsonStringify(submodules);
+  const submoduleSha256 = sha256Hex(Buffer.from(canonicalJson, 'utf8'));
 
   return {
     submodule_count: submodules.length,
@@ -811,15 +836,16 @@ function collectSubmoduleState(gitBinary, canonicalProjectRoot, customSpawn, cus
 
 /**
  * Single collection pass of all authoritative components.
+ * Submodule containment is validated first to eliminate uncontained worktree inspection.
  */
 function collectAuthoritativeComponents(gitBinary, canonicalRoot, projectId, customSpawn, customFs) {
   const branch = resolveGitBranch(gitBinary, canonicalRoot, customSpawn);
   const head = resolveGitHead(gitBinary, canonicalRoot, customSpawn);
+  const submoduleInfo = collectSubmoduleState(gitBinary, canonicalRoot, customSpawn, customFs);
   const statusSha = resolveStatusDigest(gitBinary, canonicalRoot, customSpawn);
   const stagedDiffSha = resolveStagedDiffDigest(gitBinary, canonicalRoot, customSpawn);
   const unstagedDiffSha = resolveUnstagedDiffDigest(gitBinary, canonicalRoot, customSpawn);
   const untrackedInfo = collectUntrackedManifest(gitBinary, canonicalRoot, customSpawn, customFs);
-  const submoduleInfo = collectSubmoduleState(gitBinary, canonicalRoot, customSpawn, customFs);
 
   return {
     branch,

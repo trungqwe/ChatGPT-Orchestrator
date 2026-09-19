@@ -71,7 +71,7 @@ function commitFile(repoDir, relPath, content, msg = 'initial commit') {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING WORKSPACE-STATE TEST SUITE (WS-001 .. WS-045)');
+  console.log('RUNNING WORKSPACE-STATE TEST SUITE (WS-001 .. WS-051)');
   console.log('======================================================================\n');
 
   const wsPort = createWorkspaceStatePort();
@@ -935,11 +935,12 @@ async function runAllTests() {
 
       const s2 = await wsPort.getWorkspaceState({ project_id: 'super-proj', project_root: superDir });
 
-      assert.notStrictEqual(s1.components.staged_diff_sha256, s2.components.staged_diff_sha256);
+      // Superproject diffs ignore submodules per WO-V3-004G Section 8
+      assert.strictEqual(s1.components.staged_diff_sha256, s2.components.staged_diff_sha256);
       assert.notStrictEqual(s1.components.submodule_status_sha256, s2.components.submodule_status_sha256);
       assert.notStrictEqual(s1.workspace_state_id, s2.workspace_state_id);
 
-      console.log('✓ WS-027 PASSED: Staged gitlink update alters state ID.\n');
+      console.log('✓ WS-027 PASSED: Staged gitlink update alters state ID via submodule component.\n');
     } finally {
       sandbox.cleanup();
     }
@@ -1555,11 +1556,11 @@ async function runAllTests() {
       // Subcase B: submodule status --porcelain=v2 fails
       {
         const customSpawnB = (bin, args, opts) => {
-          if (args.includes('status') && args.includes('-C')) {
+          if (args.includes('status') && opts && opts.cwd && opts.cwd.includes('sub1')) {
             return {
               status: 128,
               stdout: Buffer.alloc(0),
-              stderr: Buffer.from('fatal: injected failure for submodule git -C status\n')
+              stderr: Buffer.from('fatal: injected failure for submodule status\n')
             };
           }
           return child_process.spawnSync(bin, args, opts);
@@ -1575,14 +1576,14 @@ async function runAllTests() {
         assert.strictEqual(caughtB.code, WORKSPACE_STATE_ERROR_CODES.GIT_COMMAND_FAILED);
       }
 
-      // Subcase C: git submodule status --recursive fails
+      // Subcase C: submodule discovery failure (e.g. ls-files --stage fails inside submodule)
       {
         const customSpawnC = (bin, args, opts) => {
-          if (args.includes('submodule') && args.includes('status')) {
+          if (args.includes('ls-files') && args.includes('--stage') && opts && opts.cwd && opts.cwd.includes('sub1')) {
             return {
               status: 128,
               stdout: Buffer.alloc(0),
-              stderr: Buffer.from('fatal: injected failure for git submodule status --recursive\n')
+              stderr: Buffer.from('fatal: injected failure for submodule ls-files --stage\n')
             };
           }
           return child_process.spawnSync(bin, args, opts);
@@ -1815,8 +1816,372 @@ async function runAllTests() {
     }
   }
 
+  // WS-046: Top-level external submodule worktree fails closed before status (WO-V3-004G Section 22)
+  {
+    console.log('[WS-046] Top-level external submodule fails closed before status or diff execution...');
+    const sandbox = createTestSandbox();
+    try {
+      const superDir = path.join(sandbox.dir, 'super-repo');
+      const extDir = path.join(sandbox.dir, 'external-repo');
+
+      initGitRepo(extDir);
+      commitFile(extDir, 'ext.txt', 'external\n');
+
+      initGitRepo(superDir);
+      commitFile(superDir, 'README.md', 'super\n');
+
+      const stageRecord = Buffer.concat([
+        Buffer.from('160000 0123456789abcdef0123456789abcdef01234567 0\tmodules/sub1'),
+        Buffer.from([0])
+      ]);
+
+      const executedCommands = [];
+
+      const customSpawn = (bin, args, opts) => {
+        executedCommands.push({ bin, args, cwd: opts && opts.cwd });
+        if (args.includes('ls-files') && args.includes('--stage')) {
+          return { status: 0, stdout: stageRecord, stderr: Buffer.alloc(0) };
+        }
+        return child_process.spawnSync(bin, args, opts);
+      };
+
+      const injectedFs = {
+        ...fs,
+        lstatSync: (p) => {
+          if (p.includes('modules' + path.sep + 'sub1') || p.includes('modules/sub1')) {
+            return {
+              isSymbolicLink: () => true,
+              isFile: () => false,
+              isDirectory: () => false,
+              mode: 0o120777
+            };
+          }
+          return fs.lstatSync(p);
+        },
+        realpathSync: (p) => {
+          if (p.includes('modules' + path.sep + 'sub1') || p.includes('modules/sub1')) {
+            return extDir; // Escapes project root!
+          }
+          return fs.realpathSync(p);
+        }
+      };
+
+      const port = createWorkspaceStatePort({ spawnSync: customSpawn, fs: injectedFs });
+      let caught = null;
+      try {
+        await port.getWorkspaceState({ project_id: 'p1', project_root: superDir });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH);
+
+      // Verify no command ran inside extDir
+      const ranInExt = executedCommands.some((c) => c.cwd && c.cwd.includes('external-repo'));
+      assert.strictEqual(ranInExt, false, 'No command must execute in external repository');
+
+      // Verify neither superproject status nor diff ran before containment failure
+      const statusRan = executedCommands.some((c) => c.args.includes('status'));
+      const diffRan = executedCommands.some((c) => c.args.includes('diff'));
+      assert.strictEqual(statusRan, false, 'Status must not run before submodule containment check');
+      assert.strictEqual(diffRan, false, 'Diff must not run before submodule containment check');
+
+      console.log('✓ WS-046 PASSED: External submodule fails closed before status/diff with 0 external execution.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-047: Nested submodule worktree escape fails closed (WO-V3-004G Section 23)
+  {
+    console.log('[WS-047] Nested submodule resolving to external repository fails closed with 0 external Git calls...');
+    const sandbox = createTestSandbox();
+    try {
+      const superDir = path.join(sandbox.dir, 'super-repo');
+      const subADir = path.join(sandbox.dir, 'subA-repo');
+      const extBDir = path.join(sandbox.dir, 'extB-repo');
+
+      initGitRepo(extBDir);
+      commitFile(extBDir, 'b.txt', 'b content\n');
+
+      initGitRepo(subADir);
+      commitFile(subADir, 'a.txt', 'a content\n');
+
+      initGitRepo(superDir);
+      commitFile(superDir, 'README.md', 'super\n');
+
+      const subAPathAbs = path.resolve(subADir).replace(/\\/g, '/');
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', subAPathAbs, 'modules/A'], {
+        cwd: superDir,
+        shell: false
+      });
+      child_process.spawnSync('git', ['commit', '-m', 'add subA'], { cwd: superDir, shell: false });
+
+      // Inside modules/A, inject a nested gitlink "vendor/B" whose worktree resolves to extBDir
+      const nestedStageRecord = Buffer.concat([
+        Buffer.from('160000 0123456789abcdef0123456789abcdef01234567 0\tvendor/B'),
+        Buffer.from([0])
+      ]);
+
+      let gitExecutionInsideB = 0;
+
+      const customSpawn = (bin, args, opts) => {
+        if (opts && opts.cwd && opts.cwd.includes('extB-repo')) {
+          gitExecutionInsideB++;
+        }
+        if (args.includes('ls-files') && args.includes('--stage') && opts && opts.cwd && opts.cwd.includes('modules' + path.sep + 'A')) {
+          return { status: 0, stdout: nestedStageRecord, stderr: Buffer.alloc(0) };
+        }
+        return child_process.spawnSync(bin, args, opts);
+      };
+
+      const injectedFs = {
+        ...fs,
+        lstatSync: (p) => {
+          if (p.includes('vendor' + path.sep + 'B') || p.includes('vendor/B')) {
+            return {
+              isSymbolicLink: () => true,
+              isFile: () => false,
+              isDirectory: () => false,
+              mode: 0o120777
+            };
+          }
+          return fs.lstatSync(p);
+        },
+        realpathSync: (p) => {
+          if (p.includes('vendor' + path.sep + 'B') || p.includes('vendor/B')) {
+            return extBDir; // Escapes top-level project root!
+          }
+          return fs.realpathSync(p);
+        }
+      };
+
+      const port = createWorkspaceStatePort({ spawnSync: customSpawn, fs: injectedFs });
+      let caught = null;
+      try {
+        await port.getWorkspaceState({ project_id: 'p1', project_root: superDir });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, WORKSPACE_STATE_ERROR_CODES.UNSAFE_UNTRACKED_PATH);
+      assert.strictEqual(gitExecutionInsideB, 0, 'Zero Git commands must execute in external B');
+
+      console.log('✓ WS-047 PASSED: Nested submodule escape failed closed with 0 Git execution in external repo.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-048: No implicit recursive submodule command (WO-V3-004G Section 24)
+  {
+    console.log('[WS-048] Production code never invokes "git submodule status --recursive" and uses --ignore-submodules=all...');
+    const src = fs.readFileSync(path.join(__dirname, '../../lib/broker/workspace-state.js'), 'utf8');
+
+    // 1. Static source verification
+    assert.strictEqual(src.includes('submodule status --recursive'), false);
+    assert.strictEqual(src.includes("['submodule', 'status'"), false);
+
+    // 2. Runtime execution verification
+    const sandbox = createTestSandbox();
+    try {
+      const repoDir = path.join(sandbox.dir, 'repo');
+      initGitRepo(repoDir);
+      commitFile(repoDir, 'README.md', 'Hello World\n');
+
+      const statusCalls = [];
+      const diffCalls = [];
+      let recursiveSubmoduleCalls = 0;
+
+      const customSpawn = (bin, args, opts) => {
+        if (args.includes('submodule') && args.includes('--recursive')) {
+          recursiveSubmoduleCalls++;
+        }
+        if (args.includes('status')) {
+          statusCalls.push(args);
+        }
+        if (args.includes('diff')) {
+          diffCalls.push(args);
+        }
+        return child_process.spawnSync(bin, args, opts);
+      };
+
+      const port = createWorkspaceStatePort({ spawnSync: customSpawn });
+      await port.getWorkspaceState({ project_id: 'p1', project_root: repoDir });
+
+      assert.strictEqual(recursiveSubmoduleCalls, 0, 'Must never execute git submodule status --recursive');
+      assert.ok(statusCalls.length > 0);
+      for (const call of statusCalls) {
+        assert.ok(call.includes('--ignore-submodules=all'), `Status call must include --ignore-submodules=all: ${call.join(' ')}`);
+      }
+      assert.ok(diffCalls.length > 0);
+      for (const call of diffCalls) {
+        assert.ok(call.includes('--ignore-submodules=all'), `Diff call must include --ignore-submodules=all: ${call.join(' ')}`);
+      }
+
+      console.log('✓ WS-048 PASSED: Zero recursive submodule commands; all status and diff commands ignore submodules.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-049: Nested submodule HEAD change alters superproject workspace_state_id (WO-V3-004G Section 25)
+  {
+    console.log('[WS-049] Nested submodule observed HEAD change alters state ID without superproject commit...');
+    const sandbox = createTestSandbox();
+    try {
+      const superDir = path.join(sandbox.dir, 'super');
+      const subADir = path.join(sandbox.dir, 'subA');
+      const subBDir = path.join(sandbox.dir, 'subB');
+
+      // Create B
+      initGitRepo(subBDir);
+      commitFile(subBDir, 'b.txt', 'b v1\n');
+      commitFile(subBDir, 'b.txt', 'b v2\n', 'commit 2 in B');
+
+      // Create A and add B as submodule inside A: vendor/B
+      initGitRepo(subADir);
+      commitFile(subADir, 'a.txt', 'a content\n');
+      const subBPathAbs = path.resolve(subBDir).replace(/\\/g, '/');
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', subBPathAbs, 'vendor/B'], {
+        cwd: subADir,
+        shell: false
+      });
+      child_process.spawnSync('git', ['commit', '-m', 'add B to A'], { cwd: subADir, shell: false });
+
+      // Create super and add A as submodule: modules/A
+      initGitRepo(superDir);
+      commitFile(superDir, 'README.md', 'super\n');
+      const subAPathAbs = path.resolve(subADir).replace(/\\/g, '/');
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', subAPathAbs, 'modules/A'], {
+        cwd: superDir,
+        shell: false
+      });
+      child_process.spawnSync('git', ['commit', '-m', 'add A to super'], { cwd: superDir, shell: false });
+
+      // Initialize nested submodule B inside super/modules/A
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive'], {
+        cwd: superDir,
+        shell: false
+      });
+
+      const s1 = await wsPort.getWorkspaceState({ project_id: 'p-nested', project_root: superDir });
+      assert.strictEqual(s1.submodule_count, 2); // modules/A and modules/A/vendor/B
+
+      // Checkout HEAD~1 inside B
+      const subAWorktree = path.join(superDir, 'modules', 'A');
+      const subBWorktree = path.join(subAWorktree, 'vendor', 'B');
+      child_process.spawnSync('git', ['checkout', 'HEAD~1'], { cwd: subBWorktree, shell: false });
+
+      const s2 = await wsPort.getWorkspaceState({ project_id: 'p-nested', project_root: superDir });
+
+      assert.notStrictEqual(s1.components.submodule_status_sha256, s2.components.submodule_status_sha256);
+      assert.notStrictEqual(s1.workspace_state_id, s2.workspace_state_id);
+
+      console.log('✓ WS-049 PASSED: Nested submodule HEAD change caught by safe explicit recursive collector.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-050: Nested submodule dirty change alters state ID (WO-V3-004G Section 26)
+  {
+    console.log('[WS-050] Nested submodule dirty content alters state ID (same gitlink, same HEAD)...');
+    const sandbox = createTestSandbox();
+    try {
+      const superDir = path.join(sandbox.dir, 'super');
+      const subADir = path.join(sandbox.dir, 'subA');
+      const subBDir = path.join(sandbox.dir, 'subB');
+
+      initGitRepo(subBDir);
+      commitFile(subBDir, 'b.txt', 'b v1\n');
+
+      initGitRepo(subADir);
+      commitFile(subADir, 'a.txt', 'a content\n');
+      const subBPathAbs = path.resolve(subBDir).replace(/\\/g, '/');
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', subBPathAbs, 'vendor/B'], {
+        cwd: subADir,
+        shell: false
+      });
+      child_process.spawnSync('git', ['commit', '-m', 'add B'], { cwd: subADir, shell: false });
+
+      initGitRepo(superDir);
+      commitFile(superDir, 'README.md', 'super\n');
+      const subAPathAbs = path.resolve(subADir).replace(/\\/g, '/');
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', subAPathAbs, 'modules/A'], {
+        cwd: superDir,
+        shell: false
+      });
+      child_process.spawnSync('git', ['commit', '-m', 'add A'], { cwd: superDir, shell: false });
+
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive'], {
+        cwd: superDir,
+        shell: false
+      });
+
+      const s1 = await wsPort.getWorkspaceState({ project_id: 'p-nested-dirty', project_root: superDir });
+
+      // Modify file inside nested submodule B worktree
+      const subBWorktree = path.join(superDir, 'modules', 'A', 'vendor', 'B');
+      fs.writeFileSync(path.join(subBWorktree, 'b.txt'), 'Modified dirty content in nested submodule B\n');
+
+      const s2 = await wsPort.getWorkspaceState({ project_id: 'p-nested-dirty', project_root: superDir });
+
+      assert.notStrictEqual(s1.components.submodule_status_sha256, s2.components.submodule_status_sha256);
+      assert.notStrictEqual(s1.workspace_state_id, s2.workspace_state_id);
+
+      console.log('✓ WS-050 PASSED: Nested submodule dirty content alters submodule digest and state ID.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // WS-051: Staged gitlink still detected under --ignore-submodules=all (WO-V3-004G Section 27)
+  {
+    console.log('[WS-051] Staging gitlink alters submodule digest and state ID under --ignore-submodules=all...');
+    const sandbox = createTestSandbox();
+    try {
+      const superDir = path.join(sandbox.dir, 'super');
+      const subDir = path.join(sandbox.dir, 'sub');
+
+      initGitRepo(subDir);
+      commitFile(subDir, 'file.txt', 'v1\n');
+
+      initGitRepo(superDir);
+      commitFile(superDir, 'README.md', 'super\n');
+
+      const subPathAbs = path.resolve(subDir).replace(/\\/g, '/');
+      child_process.spawnSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', subPathAbs, 'sub1'], {
+        cwd: superDir,
+        shell: false
+      });
+      child_process.spawnSync('git', ['commit', '-m', 'add sub1'], { cwd: superDir, shell: false });
+
+      const s1 = await wsPort.getWorkspaceState({ project_id: 'p-staged-gitlink', project_root: superDir });
+
+      // Commit new revision in sub1 and stage gitlink in super
+      const subWorktree = path.join(superDir, 'sub1');
+      commitFile(subWorktree, 'file.txt', 'v2 committed in sub\n', 'update sub');
+      child_process.spawnSync('git', ['add', 'sub1'], { cwd: superDir, shell: false });
+
+      const s2 = await wsPort.getWorkspaceState({ project_id: 'p-staged-gitlink', project_root: superDir });
+
+      // Superproject diffs ignore submodules
+      assert.strictEqual(s1.components.staged_diff_sha256, s2.components.staged_diff_sha256);
+      // But dedicated submodule state captures index gitlink update
+      assert.notStrictEqual(s1.components.submodule_status_sha256, s2.components.submodule_status_sha256);
+      assert.notStrictEqual(s1.workspace_state_id, s2.workspace_state_id);
+
+      console.log('✓ WS-051 PASSED: Staged gitlink update alters submodule digest and state ID without diff reliance.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
   console.log('======================================================================');
-  console.log('ALL WORKSPACE-STATE TESTS PASSED (WS-001 .. WS-045: 45/45 PASS)');
+  console.log('ALL WORKSPACE-STATE TESTS PASSED (WS-001 .. WS-051: 51/51 PASS)');
   console.log('======================================================================\n');
 }
 
