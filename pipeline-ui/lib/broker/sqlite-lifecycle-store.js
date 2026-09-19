@@ -25,7 +25,13 @@ const ACTIVE_STATES_SQL = ACTIVE_STATES.map(s => `'${s}'`).join(', ');
 /**
  * Deserializes and detaches SQLite database row into standard dispatch record.
  * Uses v8.deserialize for lossless reconstruction of complex JS types.
- * Supports backward-compatibility with plain string error values.
+ *
+ * LCAUTH-08 Read Contract:
+ * - SQL NULL => omit optional property (field absent)
+ * - serialized undefined => own property exists, value === undefined
+ * - serialized null => own property exists, value === null
+ * - serialized object/string => own property exists, value is deserialized
+ * - plain string => backward-compatible support for legacy TEXT error
  */
 function rowToDispatch(row) {
   if (!row) return null;
@@ -43,12 +49,15 @@ function rowToDispatch(row) {
     created_at: row.created_at,
     updated_at: row.updated_at
   };
+
   if (row.error !== null && row.error !== undefined) {
     dispatch.error = typeof row.error === 'string' ? row.error : v8.deserialize(row.error);
   }
+
   if (row.diagnostics !== null && row.diagnostics !== undefined) {
-    dispatch.diagnostics = v8.deserialize(row.diagnostics);
+    dispatch.diagnostics = typeof row.diagnostics === 'string' ? row.diagnostics : v8.deserialize(row.diagnostics);
   }
+
   return dispatch;
 }
 
@@ -70,45 +79,114 @@ function rowToHistory(row) {
 }
 
 /**
- * Validates table shapes (columns) for dispatches and history tables (LCAUTH-02).
+ * Validates table shapes, column constraints, primary keys, and data affinities (LCAUTH-06).
  */
 function validateSchemaShape(db) {
+  // 1. Validate dispatches table shape
   const dispatchesTableInfo = db.prepare("PRAGMA table_info('dispatches')").all();
   if (!dispatchesTableInfo || dispatchesTableInfo.length === 0) {
     throw new Error("Required table 'dispatches' is missing");
   }
-  const dispatchCols = new Set(dispatchesTableInfo.map(c => c.name));
-  const requiredDispatchCols = [
-    'seq', 'dispatch_id', 'project_id', 'work_order_id',
-    'expected_workspace_state_id', 'request_fingerprint', 'directive',
-    'audit_metadata', 'state', 'error', 'diagnostics',
-    'created_at', 'updated_at'
+
+  const dispatchColMap = new Map(dispatchesTableInfo.map(c => [c.name, c]));
+
+  // Required column definitions and affinities
+  const expectedDispatchCols = [
+    { name: 'seq', type: ['INTEGER'], pk: 1, notnull: null },
+    { name: 'dispatch_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'project_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'work_order_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'expected_workspace_state_id', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'request_fingerprint', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'directive', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'audit_metadata', type: ['BLOB'], pk: 0, notnull: 0 },
+    { name: 'state', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'error', type: ['BLOB', 'TEXT'], pk: 0, notnull: 0 },
+    { name: 'diagnostics', type: ['BLOB'], pk: 0, notnull: 0 },
+    { name: 'created_at', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'updated_at', type: ['TEXT'], pk: 0, notnull: 1 }
   ];
-  for (const col of requiredDispatchCols) {
-    if (!dispatchCols.has(col)) {
-      throw new Error(`Required dispatch column '${col}' is missing`);
+
+  for (const exp of expectedDispatchCols) {
+    const col = dispatchColMap.get(exp.name);
+    if (!col) {
+      throw new Error(`Required dispatch column '${exp.name}' is missing`);
+    }
+
+    const colType = (col.type || '').toUpperCase();
+    if (!exp.type.includes(colType)) {
+      throw new Error(`Dispatch column '${exp.name}' has invalid declared type '${col.type}' (expected ${exp.type.join(' or ')})`);
+    }
+
+    if (exp.pk !== null && col.pk !== exp.pk) {
+      throw new Error(`Dispatch column '${exp.name}' has invalid primary-key position (expected ${exp.pk}, got ${col.pk})`);
+    }
+
+    if (exp.notnull === 1 && col.notnull !== 1 && col.pk === 0) {
+      throw new Error(`Required dispatch column '${exp.name}' must be NOT NULL`);
     }
   }
 
+  // 2. Validate dispatch_id uniqueness at database level (Section 6)
+  const idxList = db.prepare("PRAGMA index_list('dispatches')").all();
+  let dispatchIdUnique = false;
+  for (const idx of idxList) {
+    if (idx.unique === 1 && idx.partial === 0) {
+      const idxCols = db.prepare(`PRAGMA index_info('${idx.name}')`).all();
+      if (idxCols.length === 1 && idxCols[0].name === 'dispatch_id') {
+        dispatchIdUnique = true;
+        break;
+      }
+    }
+  }
+  if (!dispatchIdUnique) {
+    throw new Error("Required unique constraint or unique index on 'dispatches.dispatch_id' is missing");
+  }
+
+  // 3. Validate history table shape
   const historyTableInfo = db.prepare("PRAGMA table_info('history')").all();
   if (!historyTableInfo || historyTableInfo.length === 0) {
     throw new Error("Required table 'history' is missing");
   }
-  const historyCols = new Set(historyTableInfo.map(c => c.name));
-  const requiredHistoryCols = [
-    'history_seq', 'project_id', 'dispatch_id', 'work_order_id',
-    'previous_state', 'next_state', 'timestamp', 'iso', 'patch'
+
+  const historyColMap = new Map(historyTableInfo.map(c => [c.name, c]));
+
+  const expectedHistoryCols = [
+    { name: 'history_seq', type: ['INTEGER'], pk: 1, notnull: null },
+    { name: 'project_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'dispatch_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'work_order_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'previous_state', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'next_state', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'timestamp', type: ['INTEGER'], pk: 0, notnull: 1 },
+    { name: 'iso', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'patch', type: ['BLOB'], pk: 0, notnull: 0 }
   ];
-  for (const col of requiredHistoryCols) {
-    if (!historyCols.has(col)) {
-      throw new Error(`Required history column '${col}' is missing`);
+
+  for (const exp of expectedHistoryCols) {
+    const col = historyColMap.get(exp.name);
+    if (!col) {
+      throw new Error(`Required history column '${exp.name}' is missing`);
+    }
+
+    const colType = (col.type || '').toUpperCase();
+    if (!exp.type.includes(colType)) {
+      throw new Error(`History column '${exp.name}' has invalid declared type '${col.type}' (expected ${exp.type.join(' or ')})`);
+    }
+
+    if (exp.pk !== null && col.pk !== exp.pk) {
+      throw new Error(`History column '${exp.name}' has invalid primary-key position (expected ${exp.pk}, got ${col.pk})`);
+    }
+
+    if (exp.notnull === 1 && col.notnull !== 1 && col.pk === 0) {
+      throw new Error(`Required history column '${exp.name}' must be NOT NULL`);
     }
   }
 }
 
 /**
- * Validates that idx_active_project is UNIQUE, partial, on project_id,
- * and covers exactly the authoritative active states (LCAUTH-02).
+ * Validates that idx_active_project is strictly UNIQUE, partial, on project_id,
+ * and its predicate covers ONLY the exact authoritative active states (LCAUTH-07).
  */
 function validateActiveIndex(db) {
   const idxList = db.prepare("PRAGMA index_list('dispatches')").all();
@@ -133,11 +211,18 @@ function validateActiveIndex(db) {
     throw new Error("Cannot retrieve SQL definition for 'idx_active_project'");
   }
 
-  const match = masterRow.sql.match(/WHERE\s+state\s+IN\s*\(([^)]+)\)/i);
-  if (!match) {
-    throw new Error("Index 'idx_active_project' must contain a partial WHERE clause on state IN (...)");
+  const whereMatch = masterRow.sql.match(/\bWHERE\s+(.+)$/i);
+  if (!whereMatch) {
+    throw new Error("Index 'idx_active_project' must contain a partial WHERE clause");
   }
-  const indexStates = match[1]
+
+  const rawPredicate = whereMatch[1].trim().replace(/;$/, '');
+  const strictMatch = rawPredicate.match(/^\(?\s*state\s+IN\s*\(([^()]+)\)\s*\)?$/i);
+  if (!strictMatch) {
+    throw new Error("Index 'idx_active_project' must contain a partial WHERE clause on state IN (...) with exact ACTIVE_STATES and no extra conditions");
+  }
+
+  const indexStates = strictMatch[1]
     .split(',')
     .map(s => s.trim().replace(/^['"]|['"]$/g, ''))
     .sort();
@@ -166,7 +251,7 @@ function validatePersistedSemantics(db) {
         throw new Error(`Corrupt database: dispatch '${row.dispatch_id}' has corrupt audit_metadata: ${err.message}`);
       }
     }
-    if (row.diagnostics !== null && row.diagnostics !== undefined) {
+    if (row.diagnostics !== null && row.diagnostics !== undefined && typeof row.diagnostics !== 'string') {
       try {
         v8.deserialize(row.diagnostics);
       } catch (err) {
@@ -212,7 +297,7 @@ function validatePersistedSemantics(db) {
     historyByDispatch.get(h.dispatch_id).push(h);
   }
 
-  // Consistency check (Section 26)
+  // Consistency check
   for (const d of dispatches) {
     const dHist = historyByDispatch.get(d.dispatch_id);
     if (!dHist || dHist.length === 0) {
@@ -229,7 +314,7 @@ function validatePersistedSemantics(db) {
 }
 
 /**
- * Factory for creating a durable SQLite-backed lifecycle store (WO-V3-006PF).
+ * Factory for creating a durable SQLite-backed lifecycle store (WO-V3-006PG).
  */
 function createSqliteLifecycleStore(options = {}) {
   const clock = options.clock || {
@@ -252,14 +337,14 @@ function createSqliteLifecycleStore(options = {}) {
   try {
     db = new DatabaseSync(dbPath);
 
-    // Best-effort POSIX permissions on database file (Section 27)
+    // Best-effort POSIX permissions on database file
     if (process.platform !== 'win32') {
       try {
         fs.chmodSync(dbPath, 0o600);
       } catch {}
     }
 
-    // Connection-local durability pragmas (Section 17)
+    // Connection-local durability pragmas
     db.exec('PRAGMA foreign_keys = ON;');
     db.exec('PRAGMA busy_timeout = 5000;');
     db.exec('PRAGMA synchronous = FULL;');
@@ -277,7 +362,7 @@ function createSqliteLifecycleStore(options = {}) {
         throw new Error(`Corrupt database: empty schema with unsupported user_version (${userVersion})`);
       }
 
-      // Genuinely fresh DB: initialize schema transactionally (Section 16)
+      // Genuinely fresh DB: initialize schema transactionally
       db.exec('BEGIN IMMEDIATE');
       try {
         db.exec(`
@@ -319,8 +404,13 @@ function createSqliteLifecycleStore(options = {}) {
         try { db.exec('ROLLBACK'); } catch {}
         throw err;
       }
+
+      // Fresh schema self-validation (Section 26)
+      validateSchemaShape(db);
+      validateActiveIndex(db);
+      validatePersistedSemantics(db);
     } else {
-      // Existing DB: check user_version (Section 15, 32 / LCAUTH-03)
+      // Existing DB: check user_version
       if (userVersion === 0) {
         throw new Error('Corrupt or partial database: user_version is 0 but user schema objects exist');
       }
@@ -328,23 +418,23 @@ function createSqliteLifecycleStore(options = {}) {
         throw new Error(`Unsupported schema version: expected ${SCHEMA_VERSION}, found ${userVersion}`);
       }
 
-      // Physical integrity check (Section 8)
+      // Physical integrity check
       const qc = db.prepare('PRAGMA quick_check').get();
       if (!qc || qc.quick_check !== 'ok') {
         throw new Error(`Database physical integrity check failed: ${qc ? qc.quick_check : 'null'}`);
       }
 
-      // Shape validation (Section 12 / LCAUTH-02)
+      // Shape validation (LCAUTH-06)
       validateSchemaShape(db);
 
-      // Active index validation (Section 13 / LCAUTH-02)
+      // Active index validation (LCAUTH-07)
       validateActiveIndex(db);
 
-      // Semantic authority validation (Section 7, 25, 26 / LCAUTH-01)
+      // Semantic authority validation (LCAUTH-01)
       validatePersistedSemantics(db);
     }
 
-    // Apply persistent WAL mode ONLY after successful validation (Section 17)
+    // Apply persistent WAL mode ONLY after successful validation
     db.exec('PRAGMA journal_mode = WAL;');
 
     // Prepared Statements
@@ -439,7 +529,7 @@ function createSqliteLifecycleStore(options = {}) {
     }
 
     /**
-     * Active dispatch lookup (LCAUTH-01 / Section 9, 11).
+     * Active dispatch lookup (LCAUTH-01).
      * Inspects all dispatches for project. Fails closed on any unknown state.
      * Never returns null/IDLE if a corrupt row exists.
      */
@@ -478,9 +568,9 @@ function createSqliteLifecycleStore(options = {}) {
     }
 
     /**
-     * Atomic Begin Dispatch (LCAUTH-01 / Section 10).
+     * Atomic Begin Dispatch (LCAUTH-01, LCAUTH-08).
      * Inside BEGIN IMMEDIATE transaction, validates persisted state domain for project.
-     * If any row has unknown state, rolls back and fails closed without inserting.
+     * Persists SQL NULL for absent optional fields, v8 serialization for explicitly present values.
      */
     function beginDispatch(projectId, record) {
       ensureOpen();
@@ -503,7 +593,7 @@ function createSqliteLifecycleStore(options = {}) {
       try {
         db.exec('BEGIN IMMEDIATE');
 
-        // 1. Validate all existing project rows for corruption (Section 10)
+        // 1. Validate all existing project rows for corruption
         const projectRows = getProjectDispatchesStmt.all(projectId);
         let activeRow = null;
 
@@ -565,19 +655,23 @@ function createSqliteLifecycleStore(options = {}) {
           };
         }
 
-        // 4. Lossless serialization of structured fields (Sections 10, 19 / LCAUTH-04)
+        // 4. Lossless serialization of structured fields (LCAUTH-08)
         let auditBlob = null;
         if (record.audit_metadata !== undefined && record.audit_metadata !== null) {
           auditBlob = v8.serialize(record.audit_metadata);
         }
+
+        // LCAUTH-08: SQL NULL is absence sentinel; serialize explicitly present null/undefined/value
         let diagBlob = null;
-        if (record.diagnostics !== undefined && record.diagnostics !== null) {
+        if (Object.hasOwn(record, 'diagnostics')) {
           diagBlob = v8.serialize(record.diagnostics);
         }
+
         let errorBlob = null;
-        if (record.error !== undefined && record.error !== null) {
+        if (Object.hasOwn(record, 'error')) {
           errorBlob = v8.serialize(record.error);
         }
+
         const expectedWs = record.expected_workspace_state_id !== undefined
           ? record.expected_workspace_state_id
           : null;
@@ -669,7 +763,7 @@ function createSqliteLifecycleStore(options = {}) {
     }
 
     /**
-     * Transition Dispatch State (Sections 18-20, LCAUTH-04).
+     * Transition Dispatch State (LCAUTH-08).
      */
     function transition(dispatchId, nextState, patch = {}) {
       ensureOpen();
@@ -731,16 +825,15 @@ function createSqliteLifecycleStore(options = {}) {
         const nowIso = clock.iso();
         const nowTs = clock.now();
 
+        // LCAUTH-08: Check explicit property presence
         let newError = row.error;
-        if (patch && Object.prototype.hasOwnProperty.call(patch, 'error')) {
-          newError = patch.error !== undefined ? v8.serialize(patch.error) : null;
+        if (patch && typeof patch === 'object' && Object.hasOwn(patch, 'error')) {
+          newError = v8.serialize(patch.error);
         }
 
         let newDiagBlob = row.diagnostics;
-        if (patch && Object.prototype.hasOwnProperty.call(patch, 'diagnostics')) {
-          newDiagBlob = patch.diagnostics !== undefined && patch.diagnostics !== null
-            ? v8.serialize(patch.diagnostics)
-            : null;
+        if (patch && typeof patch === 'object' && Object.hasOwn(patch, 'diagnostics')) {
+          newDiagBlob = v8.serialize(patch.diagnostics);
         }
 
         updateDispatchStmt.run(nextState, nowIso, newError, newDiagBlob, dispatchId);

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * SQLite Lifecycle Store Test Suite (SL-001 .. SL-030)
+ * SQLite Lifecycle Store Test Suite (SL-001 .. SL-047)
  *
  * Validates the durable SQLite lifecycle store implementation conforming to
  * the exact existing store interface, including cross-process concurrency,
@@ -87,7 +87,7 @@ function createBrokerHarness({
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING SQLITE LIFECYCLE STORE TEST SUITE (SL-001 .. SL-040)');
+  console.log('RUNNING SQLITE LIFECYCLE STORE TEST SUITE (SL-001 .. SL-047)');
   console.log('======================================================================\n');
 
   // SL-001: create new DB/schema
@@ -1752,8 +1752,640 @@ async function runAllTests() {
     console.log('✓ SL-040 PASSED: store contract patch conformance (memory vs SQLite) verified');
   }
 
+  // ------------------------------------------------------------------
+  // SL-041: Extra active-index predicate rejected (LCAUTH-07)
+  // ------------------------------------------------------------------
+  {
+    const dbPath = getTempDbPath('sl-041-extra-predicate');
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project
+      ON dispatches(project_id)
+      WHERE state IN (
+        'DISPATCHING',
+        'DISPATCH_ACCEPTED',
+        'RUNNING',
+        'DISPATCH_UNCERTAIN'
+      )
+      AND project_id <> 'bypass';
+      PRAGMA user_version = 1;
+    `);
+    db.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath });
+    }, /idx_active_project/i);
+
+    console.log('✓ SL-041 PASSED: extra active-index predicate rejected');
+  }
+
+  // ------------------------------------------------------------------
+  // SL-042: Sequence column not primary key (LCAUTH-06)
+  // ------------------------------------------------------------------
+  {
+    // Subcase A: dispatches.seq is not PRIMARY KEY
+    const dbPathA = getTempDbPath('sl-042-dispatches-seq-not-pk');
+    const dbA = new DatabaseSync(dbPathA);
+    dbA.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbA.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathA });
+    }, /Dispatch column 'seq' has invalid primary-key position/);
+
+    // Subcase B: history.history_seq is not PRIMARY KEY
+    const dbPathB = getTempDbPath('sl-042-history-seq-not-pk');
+    const dbB = new DatabaseSync(dbPathB);
+    dbB.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbB.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathB });
+    }, /History column 'history_seq' has invalid primary-key position/);
+
+    console.log('✓ SL-042 PASSED: sequence column not primary key rejected');
+  }
+
+  // ------------------------------------------------------------------
+  // SL-043: Dispatch ID not unique (LCAUTH-06)
+  // ------------------------------------------------------------------
+  {
+    const dbPath = getTempDbPath('sl-043-dispatch-id-not-unique');
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    db.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath });
+    }, /Required unique constraint or unique index on 'dispatches.dispatch_id' is missing/);
+
+    console.log('✓ SL-043 PASSED: dispatch_id without unique constraint rejected');
+  }
+
+  // ------------------------------------------------------------------
+  // SL-044: Required NOT-NULL contract (LCAUTH-06)
+  // ------------------------------------------------------------------
+  {
+    // Subcase A: dispatches.project_id is nullable
+    const dbPathA = getTempDbPath('sl-044-project-id-nullable');
+    const dbA = new DatabaseSync(dbPathA);
+    dbA.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbA.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathA });
+    }, /Required dispatch column 'project_id' must be NOT NULL/);
+
+    // Subcase B: dispatches.state is nullable
+    const dbPathB = getTempDbPath('sl-044-state-nullable');
+    const dbB = new DatabaseSync(dbPathB);
+    dbB.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbB.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathB });
+    }, /Required dispatch column 'state' must be NOT NULL/);
+
+    // Subcase C: history.next_state is nullable
+    const dbPathC = getTempDbPath('sl-044-next-state-nullable');
+    const dbC = new DatabaseSync(dbPathC);
+    dbC.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbC.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathC });
+    }, /Required history column 'next_state' must be NOT NULL/);
+
+    console.log('✓ SL-044 PASSED: required NOT-NULL contract verified');
+  }
+
+  // ------------------------------------------------------------------
+  // SL-045: Incompatible type shape (LCAUTH-06)
+  // ------------------------------------------------------------------
+  {
+    // Subcase A: seq TEXT
+    const dbPathA = getTempDbPath('sl-045-seq-text');
+    const dbA = new DatabaseSync(dbPathA);
+    dbA.exec(`
+      CREATE TABLE dispatches (
+        seq TEXT PRIMARY KEY,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbA.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathA });
+    }, /Dispatch column 'seq' has invalid declared type 'TEXT'/);
+
+    // Subcase B: history_seq TEXT
+    const dbPathB = getTempDbPath('sl-045-history-seq-text');
+    const dbB = new DatabaseSync(dbPathB);
+    dbB.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state TEXT NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbB.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathB });
+    }, /History column 'history_seq' has invalid declared type 'TEXT'/);
+
+    // Subcase C: state BLOB
+    const dbPathC = getTempDbPath('sl-045-state-blob');
+    const dbC = new DatabaseSync(dbPathC);
+    dbC.exec(`
+      CREATE TABLE dispatches (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        expected_workspace_state_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        directive TEXT NOT NULL,
+        audit_metadata BLOB,
+        state BLOB NOT NULL,
+        error BLOB,
+        diagnostics BLOB,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        dispatch_id TEXT NOT NULL,
+        work_order_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        patch BLOB
+      );
+      CREATE UNIQUE INDEX idx_active_project ON dispatches(project_id) WHERE state IN ('DISPATCHING', 'DISPATCH_ACCEPTED', 'RUNNING', 'DISPATCH_UNCERTAIN');
+      PRAGMA user_version = 1;
+    `);
+    dbC.close();
+
+    assert.throws(() => {
+      createSqliteLifecycleStore({ dbPath: dbPathC });
+    }, /Dispatch column 'state' has invalid declared type 'BLOB'/);
+
+    console.log('✓ SL-045 PASSED: incompatible column type shapes rejected');
+  }
+
+  // ------------------------------------------------------------------
+  // SL-046: Null / undefined patch parity (LCAUTH-08)
+  // ------------------------------------------------------------------
+  {
+    const testPatches = [
+      { name: 'error: null', patch: { error: null } },
+      { name: 'error: undefined', patch: { error: undefined } },
+      { name: 'diagnostics: null', patch: { diagnostics: null } },
+      { name: 'diagnostics: undefined', patch: { diagnostics: undefined } },
+      { name: 'error: null, diagnostics: undefined', patch: { error: null, diagnostics: undefined } }
+    ];
+
+    for (let i = 0; i < testPatches.length; i++) {
+      const { name, patch } = testPatches[i];
+      const memStore = createMemoryLifecycleStore();
+      const dbPath = getTempDbPath(`sl-046-patch-${i}`);
+      const sqlStore = createSqliteLifecycleStore({ dbPath });
+
+      const record = {
+        dispatch_id: `D-PARITY-${i}`,
+        project_id: `proj-p46-${i}`,
+        work_order_id: `WO-P46-${i}`,
+        expected_workspace_state_id: null,
+        request_fingerprint: `fp-p46-${i}`,
+        directive: 'parity-test',
+        audit_metadata: null
+      };
+
+      const memBegin = memStore.beginDispatch(record.project_id, record);
+      const sqlBegin = sqlStore.beginDispatch(record.project_id, record);
+      assert.strictEqual(memBegin.ok, true);
+      assert.strictEqual(sqlBegin.ok, true);
+
+      // Verify clean initial state has neither error nor diagnostics
+      assert.strictEqual(Object.hasOwn(memBegin.dispatch, 'error'), false);
+      assert.strictEqual(Object.hasOwn(sqlBegin.dispatch, 'error'), false);
+      assert.strictEqual(Object.hasOwn(memBegin.dispatch, 'diagnostics'), false);
+      assert.strictEqual(Object.hasOwn(sqlBegin.dispatch, 'diagnostics'), false);
+
+      // Legal transition to terminal failure state
+      const memRes = memStore.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_FAILED, patch);
+      const sqlRes = sqlStore.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_FAILED, patch);
+
+      assert.strictEqual(sqlRes.ok, true);
+      assert.strictEqual(memRes.ok, true);
+      assert.strictEqual(sqlRes.dispatch.state, memRes.dispatch.state);
+
+      // Compare error hasOwn & value
+      assert.strictEqual(
+        Object.hasOwn(sqlRes.dispatch, 'error'),
+        Object.hasOwn(memRes.dispatch, 'error'),
+        `error hasOwn parity for ${name}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'error')) {
+        assert.strictEqual(sqlRes.dispatch.error, memRes.dispatch.error);
+      }
+
+      // Compare diagnostics hasOwn & value
+      assert.strictEqual(
+        Object.hasOwn(sqlRes.dispatch, 'diagnostics'),
+        Object.hasOwn(memRes.dispatch, 'diagnostics'),
+        `diagnostics hasOwn parity for ${name}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'diagnostics')) {
+        assert.strictEqual(sqlRes.dispatch.diagnostics, memRes.dispatch.diagnostics);
+      }
+
+      // History patch parity
+      const memHist = memStore.getProjectHistory(record.project_id);
+      const sqlHist = sqlStore.getProjectHistory(record.project_id);
+      assert.strictEqual(sqlHist.length, 2);
+      assert.strictEqual(memHist.length, 2);
+      const memPatch = memHist[1].patch;
+      const sqlPatch = sqlHist[1].patch;
+      assert.strictEqual(Object.hasOwn(sqlPatch, 'error'), Object.hasOwn(memPatch, 'error'));
+      assert.strictEqual(sqlPatch.error, memPatch.error);
+      assert.strictEqual(Object.hasOwn(sqlPatch, 'diagnostics'), Object.hasOwn(memPatch, 'diagnostics'));
+      assert.strictEqual(sqlPatch.diagnostics, memPatch.diagnostics);
+
+      // Close and reopen SQLite store; verify persistence parity
+      sqlStore.close();
+      const reopenedStore = createSqliteLifecycleStore({ dbPath });
+      const reloaded = reopenedStore.getDispatch(record.dispatch_id);
+
+      assert.strictEqual(
+        Object.hasOwn(reloaded, 'error'),
+        Object.hasOwn(memRes.dispatch, 'error'),
+        `reloaded error hasOwn parity for ${name}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'error')) {
+        assert.strictEqual(reloaded.error, memRes.dispatch.error);
+      }
+
+      assert.strictEqual(
+        Object.hasOwn(reloaded, 'diagnostics'),
+        Object.hasOwn(memRes.dispatch, 'diagnostics'),
+        `reloaded diagnostics hasOwn parity for ${name}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'diagnostics')) {
+        assert.strictEqual(reloaded.diagnostics, memRes.dispatch.diagnostics);
+      }
+
+      // Detachment verification: mutate returned object, ensure store remains unpolluted
+      sqlRes.dispatch.error = 'mutated-error';
+      sqlRes.dispatch.diagnostics = 'mutated-diagnostics';
+      const freshLookup = reopenedStore.getDispatch(record.dispatch_id);
+      assert.notStrictEqual(freshLookup.error, 'mutated-error');
+      assert.notStrictEqual(freshLookup.diagnostics, 'mutated-diagnostics');
+
+      reopenedStore.close();
+    }
+
+    console.log('✓ SL-046 PASSED: null / undefined patch parity verified across stores');
+  }
+
+  // ------------------------------------------------------------------
+  // SL-047: Initial optional field parity (LCAUTH-08)
+  // ------------------------------------------------------------------
+  {
+    const initialRecords = [
+      { desc: 'no error field, no diagnostics field', rec: {} },
+      { desc: 'error: undefined, no diagnostics', rec: { error: undefined } },
+      { desc: 'error: null, no diagnostics', rec: { error: null } },
+      { desc: 'no error field, diagnostics: undefined', rec: { diagnostics: undefined } },
+      { desc: 'no error field, diagnostics: null', rec: { diagnostics: null } },
+      { desc: 'error: undefined, diagnostics: null', rec: { error: undefined, diagnostics: null } },
+      { desc: 'error: null, diagnostics: undefined', rec: { error: null, diagnostics: undefined } }
+    ];
+
+    for (let i = 0; i < initialRecords.length; i++) {
+      const { desc, rec } = initialRecords[i];
+      const memStore = createMemoryLifecycleStore();
+      const dbPath = getTempDbPath(`sl-047-init-${i}`);
+      const sqlStore = createSqliteLifecycleStore({ dbPath });
+
+      const fullRecord = {
+        dispatch_id: `D-INIT-${i}`,
+        project_id: `proj-init-${i}`,
+        work_order_id: `WO-INIT-${i}`,
+        expected_workspace_state_id: null,
+        request_fingerprint: `fp-init-${i}`,
+        directive: 'init-parity-test',
+        audit_metadata: null,
+        ...rec
+      };
+
+      const memRes = memStore.beginDispatch(fullRecord.project_id, fullRecord);
+      const sqlRes = sqlStore.beginDispatch(fullRecord.project_id, fullRecord);
+
+      assert.strictEqual(memRes.ok, true, `mem beginDispatch ok for ${desc}`);
+      assert.strictEqual(sqlRes.ok, true, `sql beginDispatch ok for ${desc}`);
+
+      // Compare returned shape: error property
+      assert.strictEqual(
+        Object.hasOwn(sqlRes.dispatch, 'error'),
+        Object.hasOwn(memRes.dispatch, 'error'),
+        `error hasOwn match for ${desc}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'error')) {
+        assert.strictEqual(sqlRes.dispatch.error, memRes.dispatch.error, `error value match for ${desc}`);
+      }
+
+      // Compare returned shape: diagnostics property
+      assert.strictEqual(
+        Object.hasOwn(sqlRes.dispatch, 'diagnostics'),
+        Object.hasOwn(memRes.dispatch, 'diagnostics'),
+        `diagnostics hasOwn match for ${desc}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'diagnostics')) {
+        assert.strictEqual(sqlRes.dispatch.diagnostics, memRes.dispatch.diagnostics, `diagnostics value match for ${desc}`);
+      }
+
+      // Close and reopen SQLite store; check reloaded observable shape
+      sqlStore.close();
+      const reopenedStore = createSqliteLifecycleStore({ dbPath });
+      const reloaded = reopenedStore.getDispatch(fullRecord.dispatch_id);
+
+      assert.strictEqual(
+        Object.hasOwn(reloaded, 'error'),
+        Object.hasOwn(memRes.dispatch, 'error'),
+        `reloaded error hasOwn match for ${desc}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'error')) {
+        assert.strictEqual(reloaded.error, memRes.dispatch.error, `reloaded error value match for ${desc}`);
+      }
+
+      assert.strictEqual(
+        Object.hasOwn(reloaded, 'diagnostics'),
+        Object.hasOwn(memRes.dispatch, 'diagnostics'),
+        `reloaded diagnostics hasOwn match for ${desc}`
+      );
+      if (Object.hasOwn(memRes.dispatch, 'diagnostics')) {
+        assert.strictEqual(reloaded.diagnostics, memRes.dispatch.diagnostics, `reloaded diagnostics value match for ${desc}`);
+      }
+
+      reopenedStore.close();
+    }
+
+    console.log('✓ SL-047 PASSED: initial optional field parity verified across stores');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL SQLITE LIFECYCLE STORE TESTS PASSED (SL-001 .. SL-040: 40/40 PASS)');
+  console.log('ALL SQLITE LIFECYCLE STORE TESTS PASSED (SL-001 .. SL-047: 47/47 PASS)');
   console.log('======================================================================');
 }
 
