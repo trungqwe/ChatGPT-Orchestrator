@@ -6,7 +6,7 @@
 - [x] Runtime `model/list`; pluggable workers.
 - [x] Durable lifecycle, freshness và fail-closed recovery.
 - [x] Bridge runtime, installed app và submodule đã bị gỡ.
-- [ ] Production bridge calls được quarantine.
+- [x] Production bridge calls được quarantine.
 - [ ] Registry v2 và App Server adapter implemented.
 - [ ] One-shot và shadow proven.
 - [ ] Legacy production path removed.

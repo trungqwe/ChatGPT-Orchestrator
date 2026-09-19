@@ -11,4 +11,4 @@
 | Web proxy/UI paths | REMOVE_LATER | Chỉ sau shadow/live validation |
 | `codex-chatgpt-web` submodule/runtime/app | REMOVED_EARLY | Operator yêu cầu gỡ ngay; production references phải quarantine trước |
 
-`pipeline-ui/package.json` description: `DEFERRED_TO_IMPLEMENTATION_CLEANUP`.
+`pipeline-ui/package.json` description: `UPDATED_DURING_V4_02A_QUARANTINE`.

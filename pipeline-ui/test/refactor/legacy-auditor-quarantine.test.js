@@ -28,7 +28,7 @@ async function run() {
   ];
   for (const relative of productionFiles) {
     const source = fs.readFileSync(path.join(ROOT, relative), 'utf8');
-    assert.doesNotMatch(source, /codex-chatgpt-web|127\.0\.0\.1:17841|chatgpt-web\//i, `${relative} still references the removed bridge`);
+    assert.doesNotMatch(source, /codex-chatgpt-web|127\.0\.0\.1:17841|chatgpt-web\/|\bcodex\s+exec\b/i, `${relative} still references the removed bridge or auditor execution`);
   }
 
   const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
