@@ -17,7 +17,7 @@ Registry v2 và migration phải kiểm tra riêng: v1 normal runtime load, khô
 
 RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-lstat thiếu `dev`/`ino`, pre/fd lệch, fd/post lệch, và identity giá trị `0` vẫn phải so sánh. Lần đọc lại ngay trước rename phải áp dụng cùng gate; nếu fail, target v1 không đổi và không có rename v2, dù backup an toàn đã được tạo.
 
-## App Server Stdio Transport Negative Matrix (WP-V4-03A / WO-V4-03AF: CAS-001..CAS-082)
+## App Server Stdio Transport Negative Matrix (WP-V4-03A / WO-V4-03AG: CAS-001..CAS-084)
 
 1. Dòng stdout malformed: Bất kỳ dòng nào không parse được JSON hợp lệ lập tức fail transport với `CODEX_APP_SERVER_PROTOCOL_ERROR`, không bỏ qua để tiếp tục.
 2. Dòng stdout vượt ngưỡng (oversized line): Dòng dài hơn `maxLineSizeBytes` (8 MiB mặc định) trước khi có ký tự xuống dòng ngắt kết nối với `CODEX_APP_SERVER_PROTOCOL_LIMIT`.
@@ -46,3 +46,5 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 25. Read thread ID mismatch: Response của `thread/read` có `thread.id` khác với request bị từ chối với `CODEX_APP_SERVER_THREAD_MISMATCH`.
 26. Ambiguous response shape: Response có cả `result` và `error` hoặc không có trường nào bị từ chối với `CODEX_APP_SERVER_PROTOCOL_ERROR`.
 27. Close uncertainty for sent side-effects: Gọi `close()` trong khi request side-effect đã gửi qua stdin đang chờ phản hồi sẽ reject với `CODEX_APP_SERVER_REQUEST_UNCERTAIN`.
+28. Thread start camelCase SandboxMode guard: Adapter `startThread` đảm bảo không bao giờ gửi chuỗi camelCase `readOnly` làm giá trị `sandbox` (CAS-083).
+29. Fake provider wrong SandboxMode enum rejection: Fixture từ chối trực tiếp request `thread/start` nhận `sandbox: "readOnly"` hoặc enum sai với lỗi provider code `-32602` (CAS-084).

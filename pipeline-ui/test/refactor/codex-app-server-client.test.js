@@ -2,7 +2,7 @@
 
 /**
  * Codex App Server Stdio Transport & Adapter Test Suite
- * CAS-001 .. CAS-082
+ * CAS-001 .. CAS-084
  */
 
 const assert = require('assert');
@@ -34,7 +34,7 @@ function createTestAdapter(options = {}) {
 }
 
 async function runTests() {
-  console.log('Starting Codex App Server Client & Adapter test suite (CAS-001 .. CAS-082)...\n');
+  console.log('Starting Codex App Server Client & Adapter test suite (CAS-001 .. CAS-084)...\n');
 
   // CAS-001: Spawns via argument array, shell: false
   {
@@ -1192,7 +1192,7 @@ async function runTests() {
     console.log('PASS: CAS-060 — Child fixture processes guaranteed cleanup in finally blocks');
   }
 
-  // CAS-061: thread/start sends sandbox=readOnly
+  // CAS-061: thread/start sends sandbox=read-only
   {
     let sentRequestParams = null;
     const adapter = createTestAdapter();
@@ -1207,8 +1207,8 @@ async function runTests() {
       };
       await adapter.startThread({ cwd: 'D:\\test\\workspace' });
       assert.notStrictEqual(sentRequestParams, null);
-      assert.strictEqual(sentRequestParams.sandbox, 'readOnly');
-      console.log('PASS: CAS-061 — thread/start sends sandbox=readOnly');
+      assert.strictEqual(sentRequestParams.sandbox, 'read-only');
+      console.log('PASS: CAS-061 — thread/start sends sandbox=read-only');
     } finally {
       await adapter.close();
     }
@@ -1682,7 +1682,7 @@ async function runTests() {
     const STABLE_CONTRACT = {
       threadStart: {
         approvalPolicy: 'never',
-        sandbox: 'readOnly',
+        sandbox: 'read-only',
         forbiddenFields: ['readOnly', 'workspaceWrite', 'dangerFullAccess']
       },
       initializedNotification: {
@@ -1700,10 +1700,12 @@ async function runTests() {
       reviewEvidence: {
         itemType: 'exitedReviewMode',
         evidenceField: 'review'
-      }
+      },
+      turnSandboxPolicyReadOnlyType: 'readOnly'
     };
 
-    assert.strictEqual(STABLE_CONTRACT.threadStart.sandbox, 'readOnly');
+    assert.strictEqual(STABLE_CONTRACT.threadStart.sandbox, 'read-only');
+    assert.strictEqual(STABLE_CONTRACT.turnSandboxPolicyReadOnlyType, 'readOnly');
     assert.strictEqual(STABLE_CONTRACT.threadStart.approvalPolicy, 'never');
     assert.strictEqual(STABLE_CONTRACT.turnStatus.initial, 'inProgress');
     assert.strictEqual(STABLE_CONTRACT.reviewEvidence.evidenceField, 'review');
@@ -1711,8 +1713,56 @@ async function runTests() {
     console.log('PASS: CAS-082 — provider contract snapshot asserts key stable field names');
   }
 
+  // CAS-083: thread/start never sends camelCase readOnly SandboxMode
+  {
+    let sentRequestParams = null;
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const origSendRequest = adapter._client.sendRequest.bind(adapter._client);
+      adapter._client.sendRequest = function(method, params, options) {
+        if (method === 'thread/start') {
+          sentRequestParams = params;
+        }
+        return origSendRequest(method, params, options);
+      };
+      await adapter.startThread({ cwd: 'D:\\test\\workspace' });
+      assert.notStrictEqual(sentRequestParams, null);
+      assert.notStrictEqual(sentRequestParams.sandbox, 'readOnly', 'CAS-083: sandbox must not be camelCase readOnly');
+      assert.strictEqual(sentRequestParams.sandbox, 'read-only', 'CAS-083: sandbox must be kebab-case read-only');
+      console.log('PASS: CAS-083 — thread/start never sends camelCase readOnly SandboxMode');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-084: fake provider rejects wrong thread SandboxMode enum
+  {
+    const client = createTestClient();
+    try {
+      await client.initialize();
+      let caught = null;
+      try {
+        await client.sendRequest('thread/start', {
+          cwd: 'D:\\test\\workspace',
+          approvalPolicy: 'never',
+          sandbox: 'readOnly' // Invalid camelCase SandboxMode enum
+        }, { isSideEffecting: true });
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_PROVIDER_ERROR');
+      assert.strictEqual(caught.details.providerError.code, -32602);
+      assert.strictEqual(caught.details.providerError.message.includes('invalid sandbox mode'), true);
+      console.log('PASS: CAS-084 — fake provider rejects wrong thread SandboxMode enum');
+    } finally {
+      await client.close();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-082: 82/82 PASS)');
+  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-084: 84/84 PASS)');
   console.log('======================================================================');
 }
 

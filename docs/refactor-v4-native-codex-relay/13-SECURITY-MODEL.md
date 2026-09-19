@@ -10,6 +10,6 @@
 - Exact correlation: Tương quan ID request đơn điệu duy nhất. Unknown response ID hoặc trùng lặp response ID đều fail-closed.
 - Response shape validation: Yêu cầu chính xác một trong hai trường `result` hoặc `error`. Nếu có cả hai hoặc không có trường nào, fail-closed với `CODEX_APP_SERVER_PROTOCOL_ERROR`.
 - Side-effect uncertainty: Timeout sau write, đóng client (`close()`) khi request đã ghi đang chờ, hoặc tiến trình con chết đột ngột đối với các lệnh có tác dụng phụ (`thread/start`, `turn/start`, `review/start`, `turn/interrupt`) đều gán mã `CODEX_APP_SERVER_REQUEST_UNCERTAIN` và không tự động retry để tránh nhân đôi thread/turn.
-- Read-only auditor profile: Cấu hình provider chuẩn `sandbox: "readOnly"` và `approvalPolicy: "never"`; chặn đứng và từ chối các trường tự chế như `readOnly`, `dangerFullAccess` hay `workspaceWrite`.
+- Read-only auditor profile: Cấu hình provider chuẩn `sandbox: "read-only"` (`SandboxMode` enum dạng kebab-case) và `approvalPolicy: "never"`; phân biệt rõ với `SandboxPolicy` dạng camelCase ở cấp turn; chặn đứng và từ chối các trường tự chế như `readOnly` boolean, `dangerFullAccess` hay `workspaceWrite`.
 - Exact-child shutdown: Quản lý vòng đời tiến trình con qua tham chiếu PID chính xác. Đóng stdin, đợi graceful exit, rồi gửi tín hiệu SIGTERM/SIGKILL tới đúng child PID. Tuyệt đối không dùng `taskkill` hay `pkill` theo tên tiến trình.
 - Bảo vệ Registry và Worker: Client/adapter không ghi đè Project Registry, không gọi Broker và không dispatch worker.

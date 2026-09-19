@@ -10,11 +10,11 @@
 
 Mọi request có correlation ID và idempotency fingerprint. Timeout sau send nhưng chưa biết outcome là `UNCERTAIN`, không auto-retry.
 
-## Transport Core Protocol (WP-V4-03A / WO-V4-03AF Conformance Seal)
+## Transport Core Protocol (WP-V4-03A / WO-V4-03AG Wire Enum Seal)
 
 - Local Stdio JSONL: Giao tiếp qua `codex app-server --listen stdio://` với `shell: false`. Không dùng WebSocket/Unix socket trong v4 MVP.
 - Handshake Authority: Khởi tạo bằng request `initialize` (với static clientInfo) -> chờ response -> gửi notification `initialized` với `params: {}` có write authority (chờ ghi thành công vào stdin) -> chuyển sang trạng thái `READY`. Nếu ghi lỗi, chuyển sang `FAILED`.
-- Thread Start Contract: Gửi payload chuẩn `{ cwd: "<absolute>", approvalPolicy: "never", sandbox: "readOnly" }`. Không gửi các boolean tự chế như `readOnly`, `workspaceWrite`, `dangerFullAccess`. Không forward bất kỳ test-only parameters có tiền tố `_`.
+- Thread Start Contract: Gửi payload chuẩn `{ cwd: "<absolute>", approvalPolicy: "never", sandbox: "read-only" }`. Thuộc tính `sandbox` ở cấp thread là `SandboxMode` (kebab-case `"read-only"`), phân biệt rõ với `TurnStartParams.sandboxPolicy.type` là `SandboxPolicy` (camelCase `"readOnly"`). Không gửi các boolean tự chế như `readOnly`, `workspaceWrite`, `dangerFullAccess`. Không forward bất kỳ test-only parameters có tiền tố `_`.
 - Request Correlation: Request ID cục bộ đơn điệu `cas_req_X`, tương quan 1-1 với response. Response bắt buộc phải có đúng một trong hai trường `result` hoặc `error` (nếu có cả hai hoặc không có trường nào sẽ báo `CODEX_APP_SERVER_PROTOCOL_ERROR`). Response trùng ID hoặc unknown ID gây protocol error fail-closed.
 - Notifications: Các message có `method` và không có `id`. Notification không thể giải phóng pending request.
 - Turn Completion Authority: Provider chuẩn gửi notification `turn/completed` với `{ turn: { id, status } }` không bắt buộc có `threadId`. Adapter duy trì bounded local ownership map (`turnId -> threadId`) và bounded completion cache (tối đa 4,096 records) để loại bỏ race condition khi turn hoàn thành trước khi waiter đăng ký.

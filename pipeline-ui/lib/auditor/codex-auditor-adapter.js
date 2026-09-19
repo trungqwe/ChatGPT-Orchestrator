@@ -11,6 +11,17 @@ const ALLOWED_REVIEW_TARGET_TYPES = new Set([
   'custom'
 ]);
 
+/**
+ * Thread lifecycle sandbox modes (ThreadStartParams.sandbox -> SandboxMode enum).
+ * Uses kebab-case: 'read-only' | 'workspace-write' | 'danger-full-access'.
+ * NOTE: Distinct from TurnStartParams.sandboxPolicy.type which uses camelCase SandboxPolicy ('readOnly', etc.).
+ */
+const THREAD_SANDBOX_MODES = Object.freeze({
+  READ_ONLY: 'read-only',
+  WORKSPACE_WRITE: 'workspace-write',
+  DANGER_FULL_ACCESS: 'danger-full-access'
+});
+
 const MAX_INPUT_TEXT_BYTES = 1024 * 1024; // 1 MiB
 const MAX_OUTPUT_SCHEMA_BYTES = 512 * 1024; // 512 KiB
 
@@ -198,7 +209,7 @@ class CodexAuditorAdapter {
     const requestParams = {
       cwd,
       approvalPolicy: 'never',
-      sandbox: 'readOnly'
+      sandbox: 'read-only'
     };
 
     const result = await this._client.sendRequest('thread/start', requestParams, {
@@ -785,6 +796,7 @@ class CodexAuditorAdapter {
 module.exports = {
   CodexAuditorAdapter,
   ALLOWED_REVIEW_TARGET_TYPES,
+  THREAD_SANDBOX_MODES,
   MAX_INPUT_TEXT_BYTES,
   MAX_OUTPUT_SCHEMA_BYTES,
   deepDetach

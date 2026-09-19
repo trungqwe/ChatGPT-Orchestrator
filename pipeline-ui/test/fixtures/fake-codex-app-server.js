@@ -221,6 +221,19 @@ rl.on('line', (line) => {
     }
 
     case 'thread/start': {
+      // Validate sandbox against official SandboxMode enum ('read-only' | 'workspace-write' | 'danger-full-access')
+      const VALID_SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+      if (params.sandbox !== undefined && !VALID_SANDBOX_MODES.has(params.sandbox)) {
+        writeLine({
+          id,
+          error: {
+            code: -32602,
+            message: `Invalid params for thread/start: invalid sandbox mode '${params.sandbox}', expected one of ['read-only', 'workspace-write', 'danger-full-access']`
+          }
+        });
+        return;
+      }
+
       let threadId = 'thr_fake_001';
       let sessionId = 'ses_fake_001';
 
