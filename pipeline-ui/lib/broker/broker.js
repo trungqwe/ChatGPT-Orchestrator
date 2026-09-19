@@ -304,6 +304,7 @@ function createBroker(dependencies = {}) {
         project_id: request.project_id,
         work_order_id: request.work_order_id,
         dispatch_id: dispatchId,
+        expected_workspace_state_id: request.expected_workspace_state_id,
         directive: request.directive
       });
     } catch (err) {
@@ -614,6 +615,22 @@ function createBroker(dependencies = {}) {
         };
       }
     } else if (waitRes.ok === false) {
+      if (waitRes.code === ERROR_CODES.PROVENANCE_AMBIGUOUS) {
+        const tRes = safeTransition(request.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, {
+          error: waitRes.error || 'Provenance ambiguous'
+        });
+        if (!tRes.ok) {
+          return tRes;
+        }
+        return {
+          ok: false,
+          code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
+          dispatch_id: request.dispatch_id,
+          state: DISPATCH_STATES.PROVENANCE_AMBIGUOUS,
+          error: waitRes.error || 'Provenance ambiguous'
+        };
+      }
+
       if (waitRes.definitive) {
         const tRes = safeTransition(request.dispatch_id, DISPATCH_STATES.DISPATCH_FAILED, {
           error: waitRes.error || 'Definitive worker failure'

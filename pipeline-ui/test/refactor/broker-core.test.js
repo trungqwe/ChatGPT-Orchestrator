@@ -108,7 +108,7 @@ function baseValidRequest(overrides = {}) {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING BROKER CORE TEST SUITE (BC-001 .. BC-048)');
+  console.log('RUNNING BROKER CORE TEST SUITE (BC-001 .. BC-051)');
   console.log('======================================================================');
 
   // -----------------------------------------------------------------------
@@ -1537,8 +1537,114 @@ async function runAllTests() {
     console.log('✓ BC-048 PASSED: transition exception after READY_FOR_REVIEW caught and returned LIFECYCLE_STORE_FAILURE.');
   }
 
+  // -----------------------------------------------------------------------
+  // BC-049: workerPort.dispatch receives expected_workspace_state_id (A-08 / BC-049)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-049] Testing workerPort.dispatch receives expected_workspace_state_id...');
+  {
+    const expectedWsId = 'sha256:custom-expected-ws-state-id';
+    const { broker, workerCalls } = createTestHarness({
+      workspaceStates: {
+        'ai-multi-task': { workspace_state_id: expectedWsId }
+      }
+    });
+    const req = baseValidRequest({ expected_workspace_state_id: expectedWsId });
+    const res = await broker.dispatchWorker(req);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(workerCalls.dispatch.length, 1);
+    assert.strictEqual(workerCalls.dispatch[0].expected_workspace_state_id, expectedWsId);
+    assert.strictEqual(workerCalls.dispatch[0].project_id, 'ai-multi-task');
+    assert.strictEqual(workerCalls.dispatch[0].work_order_id, 'WO-018');
+    console.log('✓ BC-049 PASSED: worker receives exact expected_workspace_state_id from validated dispatch request.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-050: workerPort.wait returns PROVENANCE_AMBIGUOUS (A-07, A-08 / BC-050)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-050] Testing workerPort.wait returns exact PROVENANCE_AMBIGUOUS...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => ({
+        ok: false,
+        code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
+        dispatch_id: args.dispatch_id,
+        work_order_id: args.work_order_id,
+        error: 'Marker JSON truncated'
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const { broker, lifecycleStore } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    assert.strictEqual(dispRes.ok, true);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    assert.strictEqual(waitRes.state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS);
+
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(stored.state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ BC-050 PASSED: workerPort.wait PROVENANCE_AMBIGUOUS transitions lifecycle to PROVENANCE_AMBIGUOUS.');
+  }
+
+  // -----------------------------------------------------------------------
+  // BC-051: provenance transition failure reports LIFECYCLE_STORE_FAILURE (A-08 / BC-051)
+  // -----------------------------------------------------------------------
+  console.log('\n[BC-051] Testing provenance transition failure reports LIFECYCLE_STORE_FAILURE...');
+  {
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => ({
+        ok: false,
+        code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
+        dispatch_id: args.dispatch_id,
+        work_order_id: args.work_order_id,
+        error: 'Marker JSON truncated'
+      }),
+      status: async () => ({ ok: true })
+    };
+
+    const baseStore = createMemoryLifecycleStore();
+    const throwingStore = {
+      ...baseStore,
+      transition: (id, nextState, patch) => {
+        if (nextState === DISPATCH_STATES.PROVENANCE_AMBIGUOUS) {
+          throw new Error('Store transition crashed during PROVENANCE_AMBIGUOUS');
+        }
+        return baseStore.transition(id, nextState, patch);
+      }
+    };
+
+    const { broker, lifecycleStore } = createTestHarness({
+      workerPort: customWorkerPort,
+      lifecycleStore: throwingStore
+    });
+
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+    assert.strictEqual(dispRes.ok, true);
+
+    const waitRes = await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 10
+    });
+
+    assert.strictEqual(waitRes.ok, false);
+    assert.strictEqual(waitRes.code, ERROR_CODES.LIFECYCLE_STORE_FAILURE);
+    const stored = lifecycleStore.getDispatch(dispRes.dispatch_id);
+    assert.notStrictEqual(stored.state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ BC-051 PASSED: provenance transition failure caught and returned LIFECYCLE_STORE_FAILURE.');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-048: 48/48 PASS)');
+  console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-051: 51/51 PASS)');
   console.log('======================================================================');
 }
 
