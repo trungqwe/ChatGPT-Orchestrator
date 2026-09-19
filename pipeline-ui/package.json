@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "desktop": "electron desktop-main.js",
-    "test": "node test/refactor/legacy-auditor-quarantine.test.js && node test/native-transition.test.js && node test/refactor/agent-broker-cli.test.js && node test/refactor/sqlite-lifecycle-store.test.js && node test/refactor/broker-core.test.js && node test/refactor/worker-adapter.test.js && node test/refactor/workspace-state.test.js && node test/refactor/registry.test.js",
+    "test": "node test/refactor/legacy-auditor-quarantine.test.js && node test/native-transition.test.js && node test/refactor/agent-broker-cli.test.js && node test/refactor/sqlite-lifecycle-store.test.js && node test/refactor/broker-core.test.js && node test/refactor/worker-adapter.test.js && node test/refactor/workspace-state.test.js && node test/refactor/registry.test.js && node test/refactor/registry-v2-migration.test.js",
     "test:legacy-api": "node test/pipeline-api.test.js",
     "test:legacy-closed-loop": "node test/closed-loop.test.js"
   },

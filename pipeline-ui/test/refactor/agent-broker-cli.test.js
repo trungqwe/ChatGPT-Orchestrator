@@ -81,15 +81,15 @@ async function createTestEnv(name) {
     worker: {
       engine: 'antigravity',
       session_id: 'sess-001',
-      enabled: true
+      enabled: true,
+      model_policy: 'worker_standard'
     },
     auditor: {
-      engine: 'codex',
-      task_id: 'task-audit-001',
-      task_id_verified: false,
-      expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High',
-      mode: 'full-harness',
-      managed_by_orchestrator: false
+      engine: 'codex_app_server',
+      thread_id: null,
+      cwd: repoDir,
+      enabled: false,
+      model_policy: 'auditor_standard'
     },
     policy: {
       max_active_dispatches: 1,
@@ -1336,14 +1336,13 @@ async function runAllTests() {
       project_id: 'project-two',
       project_name: 'Project Two',
       project_root: repoDir2,
-      worker: { engine: 'antigravity', session_id: 'sess-002', enabled: true },
+      worker: { engine: 'antigravity', session_id: 'sess-002', enabled: true, model_policy: 'worker_standard' },
       auditor: {
-        engine: 'codex',
-        task_id: 'task-audit-002',
-        task_id_verified: false,
-        expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High',
-        mode: 'full-harness',
-        managed_by_orchestrator: false
+        engine: 'codex_app_server',
+        thread_id: null,
+        cwd: repoDir2,
+        enabled: false,
+        model_policy: 'auditor_standard'
       },
       policy: { max_active_dispatches: 1, require_workspace_state: true }
     });
@@ -1683,8 +1682,8 @@ async function runAllTests() {
       project_id: uniqueProjectId,
       project_name: 'Custom Isolation Project',
       project_root: repoDir,
-      worker: { engine: 'antigravity', session_id: 'sess-041', enabled: true },
-      auditor: { engine: 'codex', task_id: 'task-041', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      worker: { engine: 'antigravity', session_id: 'sess-041', enabled: true, model_policy: 'worker_standard' },
+      auditor: { engine: 'codex_app_server', thread_id: null, cwd: repoDir, enabled: false, model_policy: 'auditor_standard' },
       policy: { max_active_dispatches: 1, require_workspace_state: true }
     });
 
@@ -1724,8 +1723,8 @@ async function runAllTests() {
       project_id: uniqueId,
       project_name: 'Temp Fixture',
       project_root: repoDir,
-      worker: { engine: 'antigravity', session_id: 'sess-042', enabled: true },
-      auditor: { engine: 'codex', task_id: 'task-042', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      worker: { engine: 'antigravity', session_id: 'sess-042', enabled: true, model_policy: 'worker_standard' },
+      auditor: { engine: 'codex_app_server', thread_id: null, cwd: repoDir, enabled: false, model_policy: 'auditor_standard' },
       policy: { max_active_dispatches: 1, require_workspace_state: true }
     });
 
@@ -1754,8 +1753,8 @@ async function runAllTests() {
       project_id: uniqueId,
       project_name: 'Process Project',
       project_root: repoDir,
-      worker: { engine: 'antigravity', session_id: 'sess-043', enabled: true },
-      auditor: { engine: 'codex', task_id: 'task-043', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      worker: { engine: 'antigravity', session_id: 'sess-043', enabled: true, model_policy: 'worker_standard' },
+      auditor: { engine: 'codex_app_server', thread_id: null, cwd: repoDir, enabled: false, model_policy: 'auditor_standard' },
       policy: { max_active_dispatches: 1, require_workspace_state: true }
     });
 
@@ -1803,8 +1802,8 @@ async function runAllTests() {
       project_id: uniqueId,
       project_name: 'Process Project',
       project_root: repoDir,
-      worker: { engine: 'antigravity', session_id: 'sess-044', enabled: true },
-      auditor: { engine: 'codex', task_id: 'task-044', task_id_verified: false, expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High', mode: 'full-harness', managed_by_orchestrator: false },
+      worker: { engine: 'antigravity', session_id: 'sess-044', enabled: true, model_policy: 'worker_standard' },
+      auditor: { engine: 'codex_app_server', thread_id: null, cwd: repoDir, enabled: false, model_policy: 'auditor_standard' },
       policy: { max_active_dispatches: 1, require_workspace_state: true }
     });
 

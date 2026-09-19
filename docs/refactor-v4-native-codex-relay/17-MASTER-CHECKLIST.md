@@ -7,6 +7,7 @@
 - [x] Durable lifecycle, freshness và fail-closed recovery.
 - [x] Bridge runtime, installed app và submodule đã bị gỡ.
 - [x] Production bridge calls được quarantine.
-- [ ] Registry v2 và App Server adapter implemented.
+- [x] Registry v2 và migration explicit implemented; auditor thread vẫn unbound sau migration.
+- [ ] App Server adapter implemented.
 - [ ] One-shot và shadow proven.
 - [ ] Legacy production path removed.

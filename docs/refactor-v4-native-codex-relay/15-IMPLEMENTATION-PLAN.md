@@ -4,7 +4,7 @@
 |---|---|---|
 | V4-01 | Architecture reset | Static docs validation |
 | V4-02A | Quarantine Web bridge path | app không spawn/probe bridge |
-| V4-02B | Registry v2 + migration | rollback tests |
+| V4-02B | Registry v2 + migration explicit | 39 RG + 45 RV2 và rollback tests; chưa apply trên Registry thật |
 | V4-03 | App Server client | fixtures + opt-in smoke |
 | V4-04 | AuditDecisionV1 | schema negatives |
 | V4-05 | Thread persistence/recovery | crash tests |

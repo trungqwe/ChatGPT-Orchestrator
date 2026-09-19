@@ -1,5 +1,15 @@
 # Operator runbook
 
+## Migration Registry v1→v2 sau khi được review
+
+1. Dừng các writer của Registry. Chạy `node pipeline-ui/registry-v2-migrate.js preview --registry-file <đường-dẫn-tuyệt-đối>`.
+2. Ghi lại `source_sha256`, `project_count` và `requires_auditor_registration`; đối chiếu danh sách project. Preview không ghi file.
+3. Chạy `node pipeline-ui/registry-v2-migrate.js apply --registry-file <cùng-đường-dẫn> --expected-source-sha256 <SHA-256-ở-bước-1>`.
+4. Ghi lại `backup_path`; kiểm tra backup chứa đúng byte v1 và Registry mới có `schema_version: 2`.
+5. Mỗi migrated auditor đều có `thread_id: null`, `enabled: false`; chưa tạo thread ở WP-V4-02B. Worker mapping vẫn khả dụng. Chỉ đăng ký thread sau khi App Server transport được triển khai và review.
+
+Không chạy các lệnh apply này trên Registry thật trong work package triển khai máy móc.
+
 1. Register canonical project root và worker.
 2. Start relay; kiểm tra registry/store/App Server.
 3. Create auditor thread một lần; kiểm tra exact ID/cwd rồi persist.

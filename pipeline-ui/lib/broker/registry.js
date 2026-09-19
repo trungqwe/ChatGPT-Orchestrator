@@ -15,7 +15,15 @@ const REGISTRY_ERROR_CODES = Object.freeze({
   DUPLICATE_PROJECT_ROOT: 'DUPLICATE_PROJECT_ROOT',
   INVALID_PROJECT_ROOT: 'INVALID_PROJECT_ROOT',
   PROJECT_ROOT_UNAVAILABLE: 'PROJECT_ROOT_UNAVAILABLE',
-  REGISTRY_PERSIST_FAILED: 'REGISTRY_PERSIST_FAILED'
+  REGISTRY_PERSIST_FAILED: 'REGISTRY_PERSIST_FAILED',
+  REGISTRY_MIGRATION_REQUIRED: 'REGISTRY_MIGRATION_REQUIRED',
+  REGISTRY_MIGRATION_SOURCE_CHANGED: 'REGISTRY_MIGRATION_SOURCE_CHANGED',
+  REGISTRY_BACKUP_FAILED: 'REGISTRY_BACKUP_FAILED',
+  REGISTRY_MIGRATION_PERSIST_FAILED: 'REGISTRY_MIGRATION_PERSIST_FAILED',
+  REGISTRY_MIGRATION_VERIFY_FAILED: 'REGISTRY_MIGRATION_VERIFY_FAILED',
+  REGISTRY_MIGRATION_ROLLBACK_FAILED: 'REGISTRY_MIGRATION_ROLLBACK_FAILED',
+  AUDITOR_CWD_MISMATCH: 'AUDITOR_CWD_MISMATCH',
+  INVALID_REQUEST: 'INVALID_REQUEST'
 });
 
 /**
@@ -47,14 +55,13 @@ const ALLOWED_PROJECT_KEYS = new Set([
   'auditor',
   'policy'
 ]);
-const ALLOWED_WORKER_KEYS = new Set(['engine', 'session_id', 'enabled']);
+const ALLOWED_WORKER_KEYS = new Set(['engine', 'session_id', 'enabled', 'model_policy']);
 const ALLOWED_AUDITOR_KEYS = new Set([
   'engine',
-  'task_id',
-  'task_id_verified',
-  'expected_model_label',
-  'mode',
-  'managed_by_orchestrator'
+  'thread_id',
+  'cwd',
+  'enabled',
+  'model_policy'
 ]);
 const ALLOWED_POLICY_KEYS = new Set([
   'max_active_dispatches',
@@ -68,6 +75,41 @@ function hasOnlyAllowedKeys(obj, allowedSet) {
     }
   }
   return true;
+}
+
+function getAuditorBindingState(auditor) {
+  if (auditor.thread_id === null) return 'AUDITOR_REGISTRATION_REQUIRED';
+  return auditor.enabled ? 'AUDITOR_BOUND_READY' : 'AUDITOR_BOUND_DISABLED';
+}
+
+const V1_WORKER_KEYS = new Set(['engine', 'session_id', 'enabled']);
+const V1_AUDITOR_KEYS = new Set(['engine', 'task_id', 'task_id_verified', 'expected_model_label', 'mode', 'managed_by_orchestrator']);
+
+function validateV1Document(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc) || !hasOnlyAllowedKeys(doc, ALLOWED_TOP_LEVEL_KEYS) || doc.schema_version !== 1 || !doc.projects || typeof doc.projects !== 'object' || Array.isArray(doc.projects)) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, 'Invalid Registry v1 document');
+  }
+  const roots = new Set();
+  for (const [id, p] of Object.entries(doc.projects)) {
+    if (!p || typeof p !== 'object' || Array.isArray(p) || !hasOnlyAllowedKeys(p, ALLOWED_PROJECT_KEYS) || id !== p.project_id || !PROJECT_ID_REGEX.test(id) || typeof p.project_name !== 'string' || !p.project_name.trim()) {
+      throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, `Invalid v1 project: ${id}`);
+    }
+    validateProjectRootShape(p.project_root);
+    if (!p.worker || typeof p.worker !== 'object' || Array.isArray(p.worker) || !hasOnlyAllowedKeys(p.worker, V1_WORKER_KEYS) || p.worker.engine !== 'antigravity' || typeof p.worker.session_id !== 'string' || !p.worker.session_id.trim() || p.worker.enabled !== true) {
+      throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, `Invalid v1 worker: ${id}`);
+    }
+    const a = p.auditor;
+    if (!a || typeof a !== 'object' || Array.isArray(a) || !hasOnlyAllowedKeys(a, V1_AUDITOR_KEYS) || a.engine !== 'codex' || typeof a.task_id !== 'string' || !a.task_id.trim() || typeof a.task_id_verified !== 'boolean' || typeof a.expected_model_label !== 'string' || !a.expected_model_label.trim() || a.mode !== 'full-harness' || a.managed_by_orchestrator !== false) {
+      throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, `Invalid v1 auditor: ${id}`);
+    }
+    if (!p.policy || typeof p.policy !== 'object' || Array.isArray(p.policy) || !hasOnlyAllowedKeys(p.policy, ALLOWED_POLICY_KEYS) || p.policy.max_active_dispatches !== 1 || p.policy.require_workspace_state !== true) {
+      throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, `Invalid v1 policy: ${id}`);
+    }
+    const key = computeRootIdentityKey(p.project_root);
+    if (roots.has(key)) throw new RegistryError(REGISTRY_ERROR_CODES.DUPLICATE_PROJECT_ROOT, 'Duplicate v1 project root');
+    roots.add(key);
+  }
+  return doc;
 }
 
 /**
@@ -296,6 +338,9 @@ function validateProjectRecord(project) {
       `worker.enabled must be strictly true in v3 MVP, got ${project.worker.enabled}`
     );
   }
+  if (!['worker_economy', 'worker_standard'].includes(project.worker.model_policy)) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, 'Invalid worker.model_policy');
+  }
 
   // 5. auditor
   if (!project.auditor || typeof project.auditor !== 'object' || Array.isArray(project.auditor)) {
@@ -311,41 +356,21 @@ function validateProjectRecord(project) {
       `auditor descriptor contains unknown fields: ${unknownKeys.join(', ')}`
     );
   }
-  if (project.auditor.engine !== 'codex') {
-    throw new RegistryError(
-      REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
-      `auditor.engine must be 'codex', got '${project.auditor.engine}'`
-    );
+  if (project.auditor.engine !== 'codex_app_server') {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, 'auditor.engine must be codex_app_server');
   }
-  if (typeof project.auditor.task_id !== 'string' || !project.auditor.task_id.trim()) {
-    throw new RegistryError(
-      REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
-      'auditor.task_id must be a non-empty string'
-    );
+  const threadId = project.auditor.thread_id;
+  if (threadId !== null && (typeof threadId !== 'string' || !threadId.trim() || Buffer.byteLength(threadId, 'utf8') > 512 || /[\x00-\x1f\x7f]/.test(threadId))) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, 'auditor.thread_id must be null or a bounded opaque ID without controls');
   }
-  if (typeof project.auditor.task_id_verified !== 'boolean') {
-    throw new RegistryError(
-      REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
-      'auditor.task_id_verified must be an explicit boolean'
-    );
+  if (typeof project.auditor.enabled !== 'boolean' || (project.auditor.enabled && threadId === null)) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, 'auditor.enabled requires a bound thread_id');
   }
-  if (typeof project.auditor.expected_model_label !== 'string' || !project.auditor.expected_model_label.trim()) {
-    throw new RegistryError(
-      REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
-      'auditor.expected_model_label must be a non-empty string'
-    );
+  if (!['auditor_fast', 'auditor_standard', 'auditor_deep'].includes(project.auditor.model_policy)) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, 'Invalid auditor.model_policy');
   }
-  if (project.auditor.mode !== 'full-harness') {
-    throw new RegistryError(
-      REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
-      `auditor.mode must be 'full-harness', got '${project.auditor.mode}'`
-    );
-  }
-  if (project.auditor.managed_by_orchestrator !== false) {
-    throw new RegistryError(
-      REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
-      `auditor.managed_by_orchestrator must be false in v3 MVP, got ${project.auditor.managed_by_orchestrator}`
-    );
+  if (typeof project.auditor.cwd !== 'string' || !project.auditor.cwd.trim()) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID, 'auditor.cwd must be an absolute project path');
   }
 
   // 6. policy
@@ -399,10 +424,10 @@ function validateRegistryDocument(doc) {
     );
   }
 
-  if (doc.schema_version !== 1) {
+  if (doc.schema_version !== 2) {
     throw new RegistryError(
       REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID,
-      `Unsupported schema_version: ${doc.schema_version}. Expected 1`
+      `Unsupported schema_version: ${doc.schema_version}. Expected 2`
     );
   }
 
@@ -427,6 +452,10 @@ function validateRegistryDocument(doc) {
 
     // REG-01 / Section 8: Structural root shape enforcement on persisted projects
     validateProjectRootShape(project.project_root);
+    validateProjectRootShape(project.auditor.cwd);
+    if (project.auditor.cwd !== project.project_root) {
+      throw new RegistryError(REGISTRY_ERROR_CODES.AUDITOR_CWD_MISMATCH, 'Persisted auditor.cwd must equal project_root');
+    }
 
     const identityKey = computeRootIdentityKey(project.project_root);
     if (seenRootIdentities.has(identityKey)) {
@@ -442,6 +471,146 @@ function validateRegistryDocument(doc) {
   return doc;
 }
 
+function readMigrationSource(registryFilePath, customFs) {
+  if (!path.isAbsolute(registryFilePath)) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.INVALID_REQUEST, 'registryFilePath must be absolute');
+  }
+  let descriptor;
+  try {
+    const before = customFs.lstatSync(registryFilePath);
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error('Source must be a regular non-symlink file');
+    descriptor = customFs.openSync(registryFilePath, 'r');
+    const opened = customFs.fstatSync(descriptor);
+    if (!opened.isFile() || (before.ino && opened.ino && (before.ino !== opened.ino || before.dev !== opened.dev))) throw new Error('Source identity changed');
+    const raw = customFs.readFileSync(descriptor);
+    const after = customFs.lstatSync(registryFilePath);
+    if (!after.isFile() || after.isSymbolicLink() || (opened.ino && after.ino && (opened.ino !== after.ino || opened.dev !== after.dev))) throw new Error('Source identity changed');
+    return { raw, sha256: crypto.createHash('sha256').update(raw).digest('hex') };
+  } catch (error) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_CORRUPT, `Cannot safely read registry migration source: ${error.message}`);
+  } finally {
+    if (descriptor !== undefined) customFs.closeSync(descriptor);
+  }
+}
+
+function parseMigrationSource(raw) {
+  try { return JSON.parse(raw.toString('utf8')); }
+  catch { throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_CORRUPT, 'Malformed Registry JSON'); }
+}
+
+function buildV2Candidate(source, customFs) {
+  validateV1Document(source);
+  const projects = {};
+  const roots = new Set();
+  for (const [id, p] of Object.entries(source.projects)) {
+    const { canonicalRoot, identityKey } = canonicalizeProjectRoot(p.project_root, customFs);
+    if (roots.has(identityKey)) throw new RegistryError(REGISTRY_ERROR_CODES.DUPLICATE_PROJECT_ROOT, 'Duplicate canonical project root');
+    roots.add(identityKey);
+    projects[id] = {
+      project_id: p.project_id,
+      project_name: p.project_name,
+      project_root: canonicalRoot,
+      worker: { engine: p.worker.engine, session_id: p.worker.session_id, enabled: p.worker.enabled, model_policy: 'worker_standard' },
+      auditor: { engine: 'codex_app_server', thread_id: null, cwd: canonicalRoot, enabled: false, model_policy: 'auditor_standard' },
+      policy: { ...p.policy }
+    };
+  }
+  const candidate = { schema_version: 2, projects };
+  validateRegistryDocument(candidate);
+  return candidate;
+}
+
+function previewV1ToV2Migration(options = {}) {
+  const customFs = options.fs || fs;
+  if (!options.registryFilePath) throw new RegistryError(REGISTRY_ERROR_CODES.INVALID_REQUEST, 'Explicit registryFilePath required');
+  const source = readMigrationSource(options.registryFilePath, customFs);
+  const parsed = parseMigrationSource(source.raw);
+  if (parsed.schema_version === 2) {
+    validateRegistryDocument(parsed);
+    return { ok: true, migration_required: false, state: 'ALREADY_V2', source_schema_version: 2, target_schema_version: 2, source_sha256: source.sha256, project_count: Object.keys(parsed.projects).length, requires_auditor_registration: [], would_write: false };
+  }
+  const candidate = buildV2Candidate(parsed, customFs);
+  return {
+    ok: true,
+    migration_required: true,
+    source_schema_version: 1,
+    target_schema_version: 2,
+    source_sha256: source.sha256,
+    project_count: Object.keys(candidate.projects).length,
+    requires_auditor_registration: Object.keys(candidate.projects),
+    legacy_auditor_metadata_discarded: true,
+    would_write: false,
+    candidate: structuredClone(candidate)
+  };
+}
+
+function applyV1ToV2Migration(options = {}) {
+  const customFs = options.fs || fs;
+  const registryFilePath = options.registryFilePath;
+  if (!registryFilePath || !path.isAbsolute(registryFilePath) || !/^[a-fA-F0-9]{64}$/.test(options.expected_source_sha256 || '')) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.INVALID_REQUEST, 'Explicit absolute registryFilePath and expected_source_sha256 required');
+  }
+  const source = readMigrationSource(registryFilePath, customFs);
+  if (source.sha256.toLowerCase() !== options.expected_source_sha256.toLowerCase()) {
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_SOURCE_CHANGED, 'Registry changed after preview');
+  }
+  const parsed = parseMigrationSource(source.raw);
+  if (parsed.schema_version === 2) {
+    validateRegistryDocument(parsed);
+    return { ok: true, changed: false, state: 'ALREADY_V2', source_schema_version: 2, target_schema_version: 2, source_sha256: source.sha256, project_count: Object.keys(parsed.projects).length, requires_auditor_registration: [] };
+  }
+  const candidate = buildV2Candidate(parsed, customFs);
+  const dir = path.dirname(registryFilePath);
+  const backupPath = `${registryFilePath}.v1.${Date.now()}.${source.sha256.slice(0, 12)}.${crypto.randomBytes(4).toString('hex')}.bak`;
+  const mode = process.platform === 'win32' ? 0o666 : 0o600;
+  let backupFd;
+  let backupCreated = false;
+  try {
+    backupFd = customFs.openSync(backupPath, 'wx', mode);
+    backupCreated = true;
+    customFs.writeFileSync(backupFd, source.raw);
+    customFs.fsyncSync(backupFd);
+    customFs.closeSync(backupFd); backupFd = undefined;
+  } catch (error) {
+    if (backupFd !== undefined) try { customFs.closeSync(backupFd); } catch {}
+    if (backupCreated) try { customFs.unlinkSync(backupPath); } catch {}
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_BACKUP_FAILED, `Cannot create migration backup: ${error.message}`);
+  }
+  const tempPath = path.join(dir, `.registry-v2.${crypto.randomBytes(12).toString('hex')}.tmp`);
+  const expectedV2 = Buffer.from(JSON.stringify(candidate, null, 2) + '\n', 'utf8');
+  let tempFd;
+  try {
+    tempFd = customFs.openSync(tempPath, 'wx', mode);
+    customFs.writeFileSync(tempFd, expectedV2);
+    customFs.fsyncSync(tempFd);
+    customFs.closeSync(tempFd); tempFd = undefined;
+    const current = readMigrationSource(registryFilePath, customFs);
+    if (current.sha256 !== source.sha256) throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_SOURCE_CHANGED, 'Registry changed during migration');
+    customFs.renameSync(tempPath, registryFilePath);
+  } catch (error) {
+    if (tempFd !== undefined) try { customFs.closeSync(tempFd); } catch {}
+    try { customFs.unlinkSync(tempPath); } catch {}
+    if (error instanceof RegistryError && error.code === REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_SOURCE_CHANGED) throw error;
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_PERSIST_FAILED, `Cannot atomically persist v2 Registry: ${error.message}`);
+  }
+  try {
+    const writtenRaw = readMigrationSource(registryFilePath, customFs).raw;
+    if (!writtenRaw.equals(expectedV2)) throw new Error('Written Registry bytes differ from validated candidate');
+    const written = parseMigrationSource(writtenRaw);
+    validateRegistryDocument(written);
+  } catch (error) {
+    try {
+      const restoreTemp = path.join(dir, `.registry-restore.${crypto.randomBytes(12).toString('hex')}.tmp`);
+      customFs.copyFileSync(backupPath, restoreTemp);
+      customFs.renameSync(restoreTemp, registryFilePath);
+    } catch (rollbackError) {
+      throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_ROLLBACK_FAILED, `Verification and rollback failed; target=${registryFilePath}; backup=${backupPath}`);
+    }
+    throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_VERIFY_FAILED, `Verification failed; source restored from ${backupPath}`);
+  }
+  return { ok: true, changed: true, source_schema_version: 1, target_schema_version: 2, source_sha256: source.sha256, backup_path: backupPath, project_count: Object.keys(candidate.projects).length, requires_auditor_registration: Object.keys(candidate.projects) };
+}
+
 /**
  * Create Project Registry
  *
@@ -454,7 +623,7 @@ function createProjectRegistry(options = {}) {
 
   // In-memory authoritative state
   let inMemoryData = {
-    schema_version: 1,
+    schema_version: 2,
     projects: {}
   };
 
@@ -546,7 +715,7 @@ function createProjectRegistry(options = {}) {
 
     if (!exists) {
       inMemoryData = {
-        schema_version: 1,
+        schema_version: 2,
         projects: {}
       };
       return inMemoryData;
@@ -572,6 +741,9 @@ function createProjectRegistry(options = {}) {
       );
     }
 
+    if (parsed && parsed.schema_version === 1) {
+      throw new RegistryError(REGISTRY_ERROR_CODES.REGISTRY_MIGRATION_REQUIRED, 'Explicit Registry v1 to v2 migration required');
+    }
     // Structural validation (A-02: structural validation != runtime availability)
     validateRegistryDocument(parsed);
 
@@ -670,8 +842,13 @@ function createProjectRegistry(options = {}) {
 
       const candidate = {
         ...validated,
-        project_root: canonicalRoot
+        project_root: canonicalRoot,
+        auditor: { ...validated.auditor, cwd: canonicalRoot }
       };
+      const auditorRoot = canonicalizeProjectRoot(validated.auditor.cwd, customFs);
+      if (auditorRoot.identityKey !== identityKey) {
+        throw new RegistryError(REGISTRY_ERROR_CODES.AUDITOR_CWD_MISMATCH, 'auditor.cwd does not match canonical project_root');
+      }
 
       // 3. Check for duplicate canonical root against all OTHER registered projects
       for (const [existingId, existingProject] of Object.entries(inMemoryData.projects)) {
@@ -693,7 +870,7 @@ function createProjectRegistry(options = {}) {
       };
 
       const nextRegistry = {
-        schema_version: 1,
+        schema_version: 2,
         projects: nextProjects
       };
 
@@ -733,7 +910,7 @@ function createProjectRegistry(options = {}) {
       delete nextProjects[id];
 
       const nextRegistry = {
-        schema_version: 1,
+        schema_version: 2,
         projects: nextProjects
       };
 
@@ -881,5 +1058,9 @@ module.exports = {
   canonicalizeProjectRoot,
   validateProjectRecord,
   validateRegistryDocument,
-  createProjectRegistry
+  createProjectRegistry,
+  getAuditorBindingState,
+  validateV1Document,
+  previewV1ToV2Migration,
+  applyV1ToV2Migration
 };

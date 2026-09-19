@@ -45,15 +45,15 @@ function makeValidProject(id, rootPath, overrides = {}) {
       engine: 'antigravity',
       session_id: `session-${id}-01`,
       enabled: true,
+      model_policy: 'worker_standard',
       ...(overrides.worker || {})
     },
     auditor: {
-      engine: 'codex',
-      task_id: `task-${id}-01`,
-      task_id_verified: false,
-      expected_model_label: 'ChatGPT Web — GPT-5.6 Sol High',
-      mode: 'full-harness',
-      managed_by_orchestrator: false,
+      engine: 'codex_app_server',
+      thread_id: null,
+      cwd: rootPath,
+      enabled: false,
+      model_policy: 'auditor_standard',
       ...(overrides.auditor || {})
     },
     policy: {
@@ -81,7 +81,7 @@ async function runAllTests() {
       assert.strictEqual(projects.length, 0);
 
       const validated = registry.validate();
-      assert.strictEqual(validated.schema_version, 1);
+      assert.strictEqual(validated.schema_version, 2);
       assert.deepStrictEqual(validated.projects, {});
 
       // No default projects guessed
@@ -121,12 +121,11 @@ async function runAllTests() {
       assert.strictEqual(loaded.worker.engine, 'antigravity');
       assert.strictEqual(loaded.worker.session_id, 'session-my-project-01');
       assert.strictEqual(loaded.worker.enabled, true);
-      assert.strictEqual(loaded.auditor.engine, 'codex');
-      assert.strictEqual(loaded.auditor.task_id, 'task-my-project-01');
-      assert.strictEqual(loaded.auditor.task_id_verified, false);
-      assert.strictEqual(loaded.auditor.expected_model_label, 'ChatGPT Web — GPT-5.6 Sol High');
-      assert.strictEqual(loaded.auditor.mode, 'full-harness');
-      assert.strictEqual(loaded.auditor.managed_by_orchestrator, false);
+      assert.strictEqual(loaded.auditor.engine, 'codex_app_server');
+      assert.strictEqual(loaded.auditor.thread_id, null);
+      assert.strictEqual(loaded.auditor.cwd, loaded.project_root);
+      assert.strictEqual(loaded.auditor.enabled, false);
+      assert.strictEqual(loaded.auditor.model_policy, 'auditor_standard');
       assert.strictEqual(loaded.policy.max_active_dispatches, 1);
       assert.strictEqual(loaded.policy.require_workspace_state, true);
 
@@ -346,16 +345,11 @@ async function runAllTests() {
         assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.REGISTRY_SCHEMA_INVALID);
       };
 
-      // Wrong engine
-      await testAuditorVariation({ engine: 'openai', task_id: 't-1', task_id_verified: false, expected_model_label: 'GPT-5', mode: 'full-harness', managed_by_orchestrator: false });
-      // Wrong mode
-      await testAuditorVariation({ engine: 'codex', task_id: 't-1', task_id_verified: false, expected_model_label: 'GPT-5', mode: 'autonomous', managed_by_orchestrator: false });
-      // managed_by_orchestrator = true
-      await testAuditorVariation({ engine: 'codex', task_id: 't-1', task_id_verified: false, expected_model_label: 'GPT-5', mode: 'full-harness', managed_by_orchestrator: true });
-      // Missing expected_model_label
-      await testAuditorVariation({ engine: 'codex', task_id: 't-1', task_id_verified: false, expected_model_label: '', mode: 'full-harness', managed_by_orchestrator: false });
-      // Missing task_id
-      await testAuditorVariation({ engine: 'codex', task_id: '   ', task_id_verified: false, expected_model_label: 'GPT-5', mode: 'full-harness', managed_by_orchestrator: false });
+      await testAuditorVariation({ engine: 'openai' });
+      await testAuditorVariation({ thread_id: '', enabled: true });
+      await testAuditorVariation({ thread_id: null, enabled: true });
+      await testAuditorVariation({ model_policy: 'unknown' });
+      await testAuditorVariation({ task_id: 'retired-task' });
 
       console.log('✓ RG-009 PASSED: All invalid auditor variations rejected with REGISTRY_SCHEMA_INVALID.\n');
     } finally {
@@ -505,7 +499,7 @@ async function runAllTests() {
       fs.mkdirSync(root, { recursive: true });
 
       const mismatchedDoc = {
-        schema_version: 1,
+        schema_version: 2,
         projects: {
           'key-alpha': makeValidProject('key-beta', root)
         }
@@ -580,11 +574,11 @@ async function runAllTests() {
 
       const fetched = await registry.getProject('proj-immutable');
       fetched.worker.session_id = 'MUTATED_SESSION';
-      fetched.auditor.task_id = 'MUTATED_TASK';
+      fetched.auditor.thread_id = 'MUTATED_TASK';
 
       const refetched = await registry.getProject('proj-immutable');
       assert.strictEqual(refetched.worker.session_id, 'session-proj-immutable-01');
-      assert.strictEqual(refetched.auditor.task_id, 'task-proj-immutable-01');
+      assert.strictEqual(refetched.auditor.thread_id, null);
 
       console.log('✓ RG-016 PASSED: getProject returns deeply detached object.\n');
     } finally {
@@ -875,7 +869,7 @@ async function runAllTests() {
       const concreteRegistry = createProjectRegistry({ registryFilePath: regFile });
       await concreteRegistry.putProject(makeValidProject('broker-target', projDir, {
         worker: { session_id: 'exact-worker-sess-999' },
-        auditor: { task_id: 'exact-auditor-task-888' }
+        auditor: { thread_id: 'opaque-test-thread', enabled: false }
       }));
 
       const fakeWorkspacePort = {
@@ -917,7 +911,8 @@ async function runAllTests() {
       // Exact descriptors passed to worker
       assert.strictEqual(passedToWorker.project.project_id, 'broker-target');
       assert.strictEqual(passedToWorker.project.worker.session_id, 'exact-worker-sess-999');
-      assert.strictEqual(passedToWorker.project.auditor.task_id, 'exact-auditor-task-888');
+      assert.strictEqual(passedToWorker.project.auditor.thread_id, 'opaque-test-thread');
+      assert.strictEqual(passedToWorker.project.worker.model_policy, 'worker_standard');
 
       console.log('✓ RG-026 PASSED: Broker integration dispatched exact registered descriptors to worker.\n');
     } finally {
@@ -1129,13 +1124,13 @@ async function runAllTests() {
 
       const snapshot = registry.validate();
       snapshot.projects['proj-a'].worker.session_id = 'ATTACKER_SESSION';
-      snapshot.projects['proj-a'].auditor.task_id = 'ATTACKER_TASK';
+      snapshot.projects['proj-a'].auditor.thread_id = 'ATTACKER_TASK';
       snapshot.projects['proj-a'].policy.max_active_dispatches = 999;
       snapshot.projects['proj-a'].project_root = 'C:\\Other';
 
       const refetched = await registry.getProject('proj-a');
       assert.strictEqual(refetched.worker.session_id, 'session-proj-a-01');
-      assert.strictEqual(refetched.auditor.task_id, 'task-proj-a-01');
+      assert.strictEqual(refetched.auditor.thread_id, null);
       assert.strictEqual(refetched.policy.max_active_dispatches, 1);
       assert.strictEqual(refetched.project_root, projDir);
 
@@ -1155,7 +1150,7 @@ async function runAllTests() {
     try {
       const regFile = path.join(sandbox.dir, 'projects.json');
       const badDoc = {
-        schema_version: 1,
+        schema_version: 2,
         projects: {
           bad: makeValidProject('bad', '.')
         }
@@ -1184,7 +1179,7 @@ async function runAllTests() {
     try {
       const regFile = path.join(sandbox.dir, 'projects.json');
       const badDoc = {
-        schema_version: 1,
+        schema_version: 2,
         projects: {
           'bad-root-rel': makeValidProject('bad-root-rel', '\\SomeFolder')
         }
@@ -1403,7 +1398,7 @@ async function runAllTests() {
       const missingAbsRoot = path.join(sandbox.dir, 'missing-folder');
 
       const docWithMissingAbs = {
-        schema_version: 1,
+        schema_version: 2,
         projects: {
           'proj-missing-abs': makeValidProject('proj-missing-abs', missingAbsRoot)
         }
@@ -1413,7 +1408,7 @@ async function runAllTests() {
       // Structural load must succeed
       const registry = createProjectRegistry({ registryFilePath: regFile });
       const validated = registry.validate();
-      assert.strictEqual(validated.schema_version, 1);
+      assert.strictEqual(validated.schema_version, 2);
       assert.ok(validated.projects['proj-missing-abs']);
 
       // Runtime getProject must fail closed
