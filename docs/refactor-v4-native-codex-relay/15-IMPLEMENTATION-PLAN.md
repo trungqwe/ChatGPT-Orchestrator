@@ -4,8 +4,9 @@
 |---|---|---|
 | V4-01 | Architecture reset | Static docs validation |
 | V4-02A | Quarantine Web bridge path | app không spawn/probe bridge |
-| V4-02B | Registry v2 + migration explicit | 39 RG + 45 RV2 và rollback tests; chưa apply trên Registry thật |
-| V4-03 | App Server client | fixtures + opt-in smoke |
+| V4-02B | Registry v2 + migration explicit | 39 RG + 52 RV2 và rollback tests; chưa apply trên Registry thật |
+| V4-03A | Transport core implemented | 60 CAS tests pass; fake fixture + deterministic protocol |
+| V4-03B | Real App Server acceptance | REAL_APP_SERVER_ACCEPTANCE_PENDING (opt-in smoke tool sẵn sàng) |
 | V4-04 | AuditDecisionV1 | schema negatives |
 | V4-05 | Thread persistence/recovery | crash tests |
 | V4-06 | Model resolver | catalog/fallback tests |
