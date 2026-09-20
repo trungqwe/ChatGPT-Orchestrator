@@ -54,10 +54,11 @@ not yet been hydrated.
 
 ### 3.1 `sqlite-auditor-recovery-store.js` — Schema V2
 
-**V1 → V2 migration:**
-- Physical integrity → exact V1 schema shape → V1 persisted semantics → history chain — all validated before any schema/data mutation.
-- Migration transaction adds authority columns; sets `authority_version = 0` and `NULL` for all authority fields on migrated V1 rows.
-- After migration: `PRAGMA user_version = 2`, then full V2 validation before accepting the database.
+**V1 → V2 migration guarantee:**
+- V1 validates before mutation (`PRAGMA integrity_check`, `validateSchemaShapeV1()`, `validatePersistedSemanticsV1()`).
+- V1→V2 `ALTER TABLE` + `PRAGMA user_version = 2` update + V2 integrity/schema/semantic validation (`PRAGMA integrity_check`, `validateSchemaShapeV2()`, `validatePersistedSemanticsV2()`) all occur **inside the migration transaction before it commits**.
+- Any migration-phase failure rolls back to V1 (`user_version = 1`, 0 V2 columns, original active rows and history preserved byte-semantically) and fails closed.
+- A normal common V2 validation still runs after commit/open as a second defensive gate.
 
 **New V2 columns:**
 ```sql
@@ -106,7 +107,16 @@ External review identified four corrective requirements addressed in R2-R1:
 1. **Persisted root self-canonicalization (R2-R1-01):** `assertBootstrapAuthorityMatchesRegistry` now canonicalizes `active.expected_project_root` via `canonicalizeProjectRoot()` and proves its actual filesystem identity equals `active.expected_project_root_identity`.
 2. **Canonical cwd proof (R2-R1-02):** `project.auditor.cwd` is validated via production `canonicalizeProjectRoot()`, proving actual filesystem canonical identity equals stored authority rather than relying on lexical normalization alone. Fails closed if missing, inaccessible, non-directory, or drifting.
 3. **Persisted authority is live authority (R2-R1-03):** Immediately after `beginBootstrap()`, live bootstrap re-reads `persistedBootstrap = recoveryStore.getActiveBootstrap(projectId)`, verifies that persistence recorded the intended bootstrap authority, and uses `persistedBootstrap.*` fields exclusively for all subsequent post-persistence bind-capable operations (resume adapter cwd, drift checks, Registry bind parameters).
-4. **No provider call precedes successful authority proof:** Provider client processes are only constructed after complete authority proof passes, using the proven canonical root as `cwd`.
+4. **Post-persistence authority self-verification:** No post-persistence recovery, uncertainty-inspection, resume-verification, or Registry-bind-capable provider action proceeds until persisted bootstrap authority has been self-verified against the current Registry.
+
+### 3.5 WO-V4-05AG-R2-R2 Migration Atomicity & Rollback Hardening
+
+External review identified that post-migration V2 validation previously ran only after `COMMIT`, preventing rollback if proposed V2 state was invalid.
+Under R2-R2:
+- The migration transaction performs in-transaction V2 validation (`PRAGMA integrity_check`, `validateSchemaShapeV2`, `validatePersistedSemanticsV2`) before `COMMIT`.
+- Any exception during schema/data mutation or in-transaction V2 validation executes `ROLLBACK`, restoring the database to schema V1 (`user_version = 1`, 11 columns, no V2 columns, original active rows and history preserved byte-semantically), and fails closed.
+- Post-commit common open-time V2 validation remains as a secondary defensive check.
+- Deterministic test ARS-080 proves that in-transaction V2 validation failure triggers rollback and leaves the DB at schema V1.
 
 ---
 
@@ -127,17 +137,17 @@ External review identified four corrective requirements addressed in R2-R1:
 | Registry V2 Migration | **52/52 PASS** |
 | Codex App Server Client | **84/84 PASS** |
 | **AuditDecision (AD)** | **122/122 PASS** |
-| **Auditor Recovery Store (ARS)** | **78/78 PASS** |
+| **Auditor Recovery Store (ARS)** | **82/82 PASS** |
 | **Auditor Thread Lifecycle (ATL)** | **114/114 PASS** |
 
-**Actual counts (not inferred): AD=122, ARS=78, ATL=114.**
+**Actual counts (not inferred): AD=122, ARS=82, ATL=114.**
 
 ### 4.2 New Tests Added
 
 | Suite | Tests | Range |
 |-------|-------|-------|
 | AuditDecision | 22 | AD-101..AD-122 |
-| Auditor Recovery Store | 17 | ARS-062..ARS-078 |
+| Auditor Recovery Store | 21 | ARS-062..ARS-082 |
 | Auditor Thread Lifecycle | 24 | ATL-091..ATL-114 |
 
 ### 4.3 Real R8 State — Read-Only Verification

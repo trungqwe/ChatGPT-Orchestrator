@@ -2581,8 +2581,233 @@ async function runTests() {
     }
   }
 
+  // ARS-079: Successful migration still passes and satisfies all V2 contracts
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+
+      // Snapshot pre-migration state via raw SQLite read
+      const { DatabaseSync } = require('node:sqlite');
+      const rawBefore = new DatabaseSync(dbPath);
+      const beforeRow = rawBefore.prepare('SELECT * FROM auditor_bootstrap WHERE project_id = ?').get('proj-legacy-01');
+      const beforeHistory = rawBefore.prepare('SELECT * FROM auditor_bootstrap_history WHERE project_id = ? ORDER BY history_seq ASC').all('proj-legacy-01');
+      rawBefore.close();
+
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      assert.ok(store);
+
+      const active = store.getActiveBootstrap('proj-legacy-01');
+      assert.ok(active);
+      assert.strictEqual(active.authority_version, 0);
+      assert.strictEqual(active.expected_project_root, null);
+      assert.strictEqual(active.expected_project_root_identity, null);
+      assert.strictEqual(active.expected_auditor_model_policy, null);
+      assert.strictEqual(active.state, beforeRow.state);
+      assert.strictEqual(active.turn_id, beforeRow.turn_id);
+      assert.strictEqual(active.decision_json, beforeRow.decision_json);
+      assert.strictEqual(active.decision_sha256, beforeRow.decision_sha256);
+
+      const hist = store.getHistory('proj-legacy-01', 'op-legacy-01');
+      assert.strictEqual(hist.length, beforeHistory.length);
+      for (let i = 0; i < hist.length; i++) {
+        assert.strictEqual(hist[i].previous_state, beforeHistory[i].previous_state);
+        assert.strictEqual(hist[i].next_state, beforeHistory[i].next_state);
+      }
+      store.close();
+
+      const rawAfter = new DatabaseSync(dbPath);
+      assert.strictEqual(rawAfter.prepare('PRAGMA user_version;').get().user_version, 2);
+      rawAfter.close();
+
+      console.log('PASS: ARS-079 — Successful migration still passes and satisfies all V2 contracts');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-080: Post-migration validation failure rolls back to V1 and fails closed
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawBefore = new DatabaseSync(dbPath);
+      const beforeRow = rawBefore.prepare('SELECT * FROM auditor_bootstrap WHERE project_id = ?').get('proj-legacy-01');
+      const beforeHistory = rawBefore.prepare('SELECT * FROM auditor_bootstrap_history WHERE project_id = ? ORDER BY history_seq ASC').all('proj-legacy-01');
+      const beforeCols = rawBefore.prepare("PRAGMA table_info('auditor_bootstrap')").all();
+      assert.strictEqual(beforeCols.length, 11);
+      rawBefore.close();
+
+      const origPrepare = DatabaseSync.prototype.prepare;
+      let integrityCheckCount = 0;
+      let injectedFailureOccurred = false;
+
+      try {
+        DatabaseSync.prototype.prepare = function(sql, ...args) {
+          if (typeof sql === 'string' && sql.includes('PRAGMA integrity_check')) {
+            integrityCheckCount++;
+            if (integrityCheckCount === 2) {
+              injectedFailureOccurred = true;
+              throw new Error('Deterministic fault injection: in-transaction V2 validation failure');
+            }
+          }
+          return origPrepare.call(this, sql, ...args);
+        };
+
+        assert.throws(
+          () => createSqliteAuditorRecoveryStoreRaw({ dbPath }),
+          (err) => {
+            return err !== null && err !== undefined;
+          }
+        );
+      } finally {
+        DatabaseSync.prototype.prepare = origPrepare;
+      }
+
+      assert.strictEqual(injectedFailureOccurred, true, 'Fault injection must have been triggered');
+
+      // Raw inspection of the database after failure and prototype restoration
+      const rawAfter = new DatabaseSync(dbPath, { readOnly: true });
+      const userVersionRow = rawAfter.prepare('PRAGMA user_version;').get();
+      assert.strictEqual(userVersionRow.user_version, 1, 'user_version must remain 1 after rollback');
+
+      const afterCols = rawAfter.prepare("PRAGMA table_info('auditor_bootstrap')").all();
+      assert.strictEqual(afterCols.length, 11, 'auditor_bootstrap column count must be 11');
+
+      const colNames = new Set(afterCols.map(c => c.name));
+      assert.strictEqual(colNames.has('authority_version'), false, 'authority_version must be absent');
+      assert.strictEqual(colNames.has('expected_project_root'), false, 'expected_project_root must be absent');
+      assert.strictEqual(colNames.has('expected_project_root_identity'), false, 'expected_project_root_identity must be absent');
+      assert.strictEqual(colNames.has('expected_auditor_model_policy'), false, 'expected_auditor_model_policy must be absent');
+
+      const afterRow = rawAfter.prepare('SELECT * FROM auditor_bootstrap WHERE project_id = ?').get('proj-legacy-01');
+      assert.ok(afterRow, 'Original active row must be present');
+      assert.strictEqual(afterRow.state, beforeRow.state, 'State must be unchanged');
+      assert.strictEqual(afterRow.decision_json, beforeRow.decision_json, 'Decision JSON must be byte-exact unchanged');
+      assert.strictEqual(afterRow.decision_sha256, beforeRow.decision_sha256, 'Decision sha256 must be unchanged');
+      assert.strictEqual(afterRow.turn_id, beforeRow.turn_id, 'turn_id must be unchanged');
+
+      const afterHistory = rawAfter.prepare('SELECT * FROM auditor_bootstrap_history WHERE project_id = ? ORDER BY history_seq ASC').all('proj-legacy-01');
+      assert.strictEqual(afterHistory.length, beforeHistory.length, 'History length must be unchanged');
+      for (let i = 0; i < afterHistory.length; i++) {
+        assert.strictEqual(afterHistory[i].previous_state, beforeHistory[i].previous_state);
+        assert.strictEqual(afterHistory[i].next_state, beforeHistory[i].next_state);
+        assert.strictEqual(afterHistory[i].timestamp, beforeHistory[i].timestamp);
+      }
+      rawAfter.close();
+
+      console.log('PASS: ARS-080 — Post-migration validation failure rolls back to V1 and fails closed');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-081: Pre-migration failure fails closed before any migration mutation occurs
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      // Case A: Corrupt V1 schema
+      createGenuineV1Database(dbPath, { corrupt: 'rogue_col' });
+      assert.throws(
+        () => createSqliteAuditorRecoveryStoreRaw({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID }
+      );
+
+      const { DatabaseSync } = require('node:sqlite');
+      let rawDb = new DatabaseSync(dbPath, { readOnly: true });
+      assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 1);
+      let cols = rawDb.prepare("PRAGMA table_info('auditor_bootstrap')").all();
+      let colNames = new Set(cols.map(c => c.name));
+      assert.strictEqual(colNames.has('authority_version'), false);
+      assert.strictEqual(colNames.has('expected_project_root'), false);
+      assert.strictEqual(colNames.has('expected_project_root_identity'), false);
+      assert.strictEqual(colNames.has('expected_auditor_model_policy'), false);
+      rawDb.close();
+
+      // Case B: Broken V1 history chain
+      const { dir: dir2, dbPath: dbPath2 } = createTempDbPath();
+      try {
+        createGenuineV1Database(dbPath2, { corrupt: 'broken_history' });
+        assert.throws(
+          () => createSqliteAuditorRecoveryStoreRaw({ dbPath: dbPath2 }),
+          { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+        );
+
+        rawDb = new DatabaseSync(dbPath2, { readOnly: true });
+        assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 1);
+        cols = rawDb.prepare("PRAGMA table_info('auditor_bootstrap')").all();
+        assert.strictEqual(cols.length, 11);
+        colNames = new Set(cols.map(c => c.name));
+        assert.strictEqual(colNames.has('authority_version'), false);
+        assert.strictEqual(colNames.has('expected_project_root'), false);
+        assert.strictEqual(colNames.has('expected_project_root_identity'), false);
+        assert.strictEqual(colNames.has('expected_auditor_model_policy'), false);
+        rawDb.close();
+      } finally {
+        cleanupTempDir(dir2);
+      }
+
+      console.log('PASS: ARS-081 — Pre-migration validation failure leaves database at V1 without V2 columns');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-082: Reopen after successful migration passes V2 validation and preserves legacy state
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawBefore = new DatabaseSync(dbPath);
+      const beforeRow = rawBefore.prepare('SELECT * FROM auditor_bootstrap WHERE project_id = ?').get('proj-legacy-01');
+      const beforeHistory = rawBefore.prepare('SELECT * FROM auditor_bootstrap_history WHERE project_id = ? ORDER BY history_seq ASC').all('proj-legacy-01');
+      rawBefore.close();
+
+      // First open: performs migration from V1 to V2
+      const store1 = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      assert.ok(store1);
+      store1.close();
+
+      // Verify PRAGMA user_version is 2
+      const rawMid = new DatabaseSync(dbPath);
+      assert.strictEqual(rawMid.prepare('PRAGMA user_version;').get().user_version, 2);
+      rawMid.close();
+
+      // Reopen fresh store on the migrated database
+      const store2 = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      assert.ok(store2);
+
+      const active = store2.getActiveBootstrap('proj-legacy-01');
+      assert.ok(active);
+      assert.strictEqual(active.authority_version, 0);
+      assert.strictEqual(active.expected_project_root, null);
+      assert.strictEqual(active.expected_project_root_identity, null);
+      assert.strictEqual(active.expected_auditor_model_policy, null);
+      assert.strictEqual(active.state, beforeRow.state);
+      assert.strictEqual(active.turn_id, beforeRow.turn_id);
+      assert.strictEqual(active.decision_json, beforeRow.decision_json);
+      assert.strictEqual(active.decision_sha256, beforeRow.decision_sha256);
+
+      const hist = store2.getHistory('proj-legacy-01', 'op-legacy-01');
+      assert.strictEqual(hist.length, beforeHistory.length);
+      for (let i = 0; i < hist.length; i++) {
+        assert.strictEqual(hist[i].previous_state, beforeHistory[i].previous_state);
+        assert.strictEqual(hist[i].next_state, beforeHistory[i].next_state);
+      }
+      store2.close();
+
+      console.log('PASS: ARS-082 — Reopen after successful migration passes V2 validation and preserves legacy state');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-078: 78/78 PASS)');
+  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-082: 82/82 PASS)');
   console.log('======================================================================\n');
 }
 

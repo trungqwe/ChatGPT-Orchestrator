@@ -1024,6 +1024,23 @@ function createSqliteAuditorRecoveryStore(options = {}) {
           ALTER TABLE auditor_bootstrap ADD COLUMN expected_auditor_model_policy TEXT;
           PRAGMA user_version = ${SCHEMA_VERSION};
         `);
+
+        // D. STILL INSIDE THE SAME TRANSACTION:
+        // PRAGMA integrity_check
+        // validateSchemaShapeV2()
+        // validatePersistedSemanticsV2()
+        const inTxCheck = db.prepare('PRAGMA integrity_check;').get();
+        if (!inTxCheck || inTxCheck.integrity_check !== 'ok') {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+            `Physical integrity check failed during migration: ${inTxCheck ? inTxCheck.integrity_check : 'null'}`
+          );
+        }
+
+        validateSchemaShapeV2(db);
+        validatePersistedSemanticsV2(db);
+
+        // E. only after all V2 validation succeeds
         db.exec('COMMIT;');
       } catch (err) {
         try { db.exec('ROLLBACK;'); } catch {}
