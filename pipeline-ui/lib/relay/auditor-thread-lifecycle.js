@@ -51,8 +51,22 @@ class AuditorLifecycleError extends Error {
  * Verify that the active bootstrap authority matches the fresh Registry record.
  * Fails closed with AUDITOR_LIFECYCLE_PRECONDITION_FAILED if drift is detected.
  *
+ * Sequence:
+ * 1. active exists
+ * 2. project exists
+ * 3. authority_version == 1
+ * 4. canonicalize active.expected_project_root
+ * 5. require its canonical identity == active.expected_project_root_identity
+ * 6. canonicalize current project.project_root
+ * 7. require its canonical identity == active.expected_project_root_identity
+ * 8. require project.auditor exists
+ * 9. canonicalize project.auditor.cwd
+ * 10. require its canonical identity == active.expected_project_root_identity
+ * 11. require current auditor.model_policy == active.expected_auditor_model_policy
+ *
  * @param {Object} active
  * @param {Object} project
+ * @returns {Object} verifiedAuthority { canonicalProjectRoot, identityKey, modelPolicy }
  */
 function assertBootstrapAuthorityMatchesRegistry(active, project) {
   if (!active || typeof active !== 'object') {
@@ -75,13 +89,46 @@ function assertBootstrapAuthorityMatchesRegistry(active, project) {
     );
   }
 
-  // Canonicalize current registry project root using production authority
-  let canonicalRoot;
-  let identityKey;
+  // 4-5. Canonicalize persisted expected_project_root and prove filesystem identity equals expected_project_root_identity (R2-R1-01)
+  if (typeof active.expected_project_root !== 'string' || !active.expected_project_root.trim()) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      'Cannot verify authority: active.expected_project_root is missing or invalid'
+    );
+  }
+
+  let canonicalPersistedRoot;
+  let persistedIdentityKey;
+  try {
+    const res = canonicalizeProjectRoot(active.expected_project_root);
+    canonicalPersistedRoot = res.canonicalRoot;
+    persistedIdentityKey = res.identityKey;
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Failed to canonicalize persisted expected_project_root '${active.expected_project_root}': ${err.message}`
+    );
+  }
+
+  if (persistedIdentityKey !== active.expected_project_root_identity) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Persisted project root self-verification failed for project '${active.project_id}': filesystem identity '${persistedIdentityKey}' does not match stored expected_project_root_identity '${active.expected_project_root_identity}'`
+    );
+  }
+
+  // 6-7. Canonicalize current registry project root using production authority and verify match
+  if (typeof project.project_root !== 'string' || !project.project_root.trim()) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      'Registry project_root is missing or invalid'
+    );
+  }
+
+  let registryIdentityKey;
   try {
     const res = canonicalizeProjectRoot(project.project_root);
-    canonicalRoot = res.canonicalRoot;
-    identityKey = res.identityKey;
+    registryIdentityKey = res.identityKey;
   } catch (err) {
     throw new AuditorLifecycleError(
       LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
@@ -89,14 +136,49 @@ function assertBootstrapAuthorityMatchesRegistry(active, project) {
     );
   }
 
-  if (identityKey !== active.expected_project_root_identity) {
+  if (registryIdentityKey !== active.expected_project_root_identity) {
     throw new AuditorLifecycleError(
       LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      `Project root drift detected for project '${active.project_id}': registry identity '${identityKey}' does not match expected identity '${active.expected_project_root_identity}'`
+      `Project root drift detected for project '${active.project_id}': registry identity '${registryIdentityKey}' does not match expected identity '${active.expected_project_root_identity}'`
     );
   }
 
-  const currentPolicy = project.auditor?.model_policy;
+  // 8. Require project.auditor exists
+  if (!project.auditor || typeof project.auditor !== 'object') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${active.project_id}' is missing auditor configuration`
+    );
+  }
+
+  // 9-10. Canonicalize project.auditor.cwd and prove canonical filesystem identity equals expected_project_root_identity (R2-R1-02)
+  if (typeof project.auditor.cwd !== 'string' || !project.auditor.cwd.trim()) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${active.project_id}' auditor is missing valid cwd`
+    );
+  }
+
+  let cwdIdentityKey;
+  try {
+    const res = canonicalizeProjectRoot(project.auditor.cwd);
+    cwdIdentityKey = res.identityKey;
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Failed to canonicalize auditor cwd '${project.auditor.cwd}': ${err.message}`
+    );
+  }
+
+  if (cwdIdentityKey !== active.expected_project_root_identity) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Auditor cwd drift detected for project '${active.project_id}': cwd identity '${cwdIdentityKey}' does not match expected identity '${active.expected_project_root_identity}'`
+    );
+  }
+
+  // 11. Require current auditor.model_policy == active.expected_auditor_model_policy
+  const currentPolicy = project.auditor.model_policy;
   if (currentPolicy !== active.expected_auditor_model_policy) {
     throw new AuditorLifecycleError(
       LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
@@ -104,15 +186,11 @@ function assertBootstrapAuthorityMatchesRegistry(active, project) {
     );
   }
 
-  if (project.auditor?.cwd) {
-    const cwdIdentity = computeRootIdentityKey(project.auditor.cwd);
-    if (cwdIdentity !== active.expected_project_root_identity) {
-      throw new AuditorLifecycleError(
-        LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-        `Auditor cwd drift detected for project '${active.project_id}': cwd identity '${cwdIdentity}' does not match expected identity '${active.expected_project_root_identity}'`
-      );
-    }
-  }
+  return {
+    canonicalProjectRoot: canonicalPersistedRoot,
+    identityKey: persistedIdentityKey,
+    modelPolicy: currentPolicy
+  };
 }
 
 /**
@@ -382,6 +460,57 @@ async function bootstrapAuditorThread(options) {
     throw err;
   }
 
+  // R2-R1-03: Immediately re-read persisted authority from recovery journal
+  const persistedBootstrap = recoveryStore.getActiveBootstrap(projectId);
+  if (!persistedBootstrap) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Persisted bootstrap row missing after beginBootstrap for project '${projectId}'`
+    );
+  }
+
+  if (
+    persistedBootstrap.operation_id !== operationId ||
+    persistedBootstrap.thread_id !== threadId ||
+    persistedBootstrap.authority_version !== 1
+  ) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Persisted bootstrap row does not match intended bootstrap authority for project '${projectId}'`
+    );
+  }
+
+  // Original local values may be used only to verify that persistence recorded the intended bootstrap authority
+  if (
+    persistedBootstrap.expected_project_root !== expectedProjectRoot ||
+    persistedBootstrap.expected_project_root_identity !== expectedProjectRootIdentity ||
+    persistedBootstrap.expected_auditor_model_policy !== expectedAuditorModelPolicy
+  ) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Persisted bootstrap authority disagrees with captured bootstrap authority for project '${projectId}'`
+    );
+  }
+
+  // Self-verify persisted authority against Registry
+  try {
+    assertBootstrapAuthorityMatchesRegistry(persistedBootstrap, project);
+  } catch (err) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw err;
+  }
+
   const expectedContext = Object.freeze({
     project_id: projectId,
     audit_subject_id: auditSubjectId,
@@ -507,18 +636,18 @@ async function bootstrapAuditorThread(options) {
       `Project '${projectId}' not found in registry before resume`
     );
   }
-  assertBootstrapAuthorityMatchesRegistry({
-    authority_version: 1,
-    project_id: projectId,
-    expected_project_root: expectedProjectRoot,
-    expected_project_root_identity: expectedProjectRootIdentity,
-    expected_auditor_model_policy: expectedAuditorModelPolicy
-  }, freshProjectForResume);
+  const verifiedResumeAuthority = assertBootstrapAuthorityMatchesRegistry(
+    persistedBootstrap,
+    freshProjectForResume
+  );
 
   // 13-14. Spawn second client in new independent process and verify exact thread/resume
   let client2 = null;
   try {
-    client2 = await adapterFactory({ phase: 'resume_verify', cwd: expectedProjectRoot });
+    client2 = await adapterFactory({
+      phase: 'resume_verify',
+      cwd: verifiedResumeAuthority.canonicalProjectRoot
+    });
     if (typeof client2.initialize === 'function' && !client2.isInitialized) {
       await client2.initialize();
     }
@@ -565,13 +694,7 @@ async function bootstrapAuditorThread(options) {
     if (!freshProjectForBind) {
       throw new Error(`Project '${projectId}' not found in registry before bind`);
     }
-    assertBootstrapAuthorityMatchesRegistry({
-      authority_version: 1,
-      project_id: projectId,
-      expected_project_root: expectedProjectRoot,
-      expected_project_root_identity: expectedProjectRootIdentity,
-      expected_auditor_model_policy: expectedAuditorModelPolicy
-    }, freshProjectForBind);
+    assertBootstrapAuthorityMatchesRegistry(persistedBootstrap, freshProjectForBind);
   } catch (err) {
     throw new AuditorLifecycleError(
       LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_REGISTRY_BIND_FAILED,
@@ -585,8 +708,8 @@ async function bootstrapAuditorThread(options) {
     bindResult = await registryPort.bindAuditorThread({
       project_id: projectId,
       thread_id: threadId,
-      expected_project_root: expectedProjectRoot,
-      expected_model_policy: expectedAuditorModelPolicy
+      expected_project_root: persistedBootstrap.expected_project_root,
+      expected_model_policy: persistedBootstrap.expected_auditor_model_policy
     });
   } catch (err) {
     throw new AuditorLifecycleError(
@@ -818,12 +941,12 @@ async function recoverAuditorBootstrap(options) {
       );
     }
 
-    // Drift validation before recovery thread/resume (Detail 8)
-    assertBootstrapAuthorityMatchesRegistry(active, project);
+    // Drift validation before recovery thread/resume (Detail 8, R2-R1-01)
+    const verifiedAuthority = assertBootstrapAuthorityMatchesRegistry(active, project);
 
     let client = null;
     try {
-      client = await adapterFactory({ phase: 'resume_verify', cwd: active.expected_project_root });
+      client = await adapterFactory({ phase: 'resume_verify', cwd: verifiedAuthority.canonicalProjectRoot });
       if (typeof client.initialize === 'function' && !client.isInitialized) {
         await client.initialize();
       }
@@ -1122,14 +1245,14 @@ async function resolveAuditorBootstrapUncertainty(options) {
     };
   }
 
-  // Drift validation before uncertainty provider read (Detail 8)
+  // Drift validation before uncertainty provider read (Detail 8, R2-R1-01)
   if (active.authority_version !== 1) {
     throw new AuditorLifecycleError(
       LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
       `Cannot resolve uncertainty for bootstrap with authority_version ${active.authority_version}: requires authority_version === 1`
     );
   }
-  assertBootstrapAuthorityMatchesRegistry(active, project);
+  const verifiedAuthority = assertBootstrapAuthorityMatchesRegistry(active, project);
 
   // Spawn fresh inspection client (guaranteed close in finally block)
   let client = null;
@@ -1137,7 +1260,7 @@ async function resolveAuditorBootstrapUncertainty(options) {
   try {
     client = await adapterFactory({
       phase: 'uncertainty_inspect',
-      cwd: active.expected_project_root
+      cwd: verifiedAuthority.canonicalProjectRoot
     });
     if (typeof client.initialize === 'function' && !client.isInitialized) {
       await client.initialize();

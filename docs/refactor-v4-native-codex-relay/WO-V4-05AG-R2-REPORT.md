@@ -69,7 +69,7 @@ expected_auditor_model_policy  TEXT
 
 **`beginBootstrap()`:** requires `authority_version === 1`, non-empty string authority fields.
 
-**`transitionState()`:** throws `AUDITOR_RECOVERY_AUTHORITY_IMMUTABLE` on any authority field in patch.
+**`transitionState()`:** throws `AUDITOR_RECOVERY_INVALID_REQUEST` on any authority field in patch (immutable authority fields cannot be patched).
 
 **`LEGACY_AUTHORITY_RETIRED`:** terminal history marker; `transitionState()` rejects transitions to it.
 
@@ -84,9 +84,9 @@ expected_auditor_model_policy  TEXT
 
 **`bootstrapAuditorThread()`:** Canonicalizes `project_root` via `canonicalizeProjectRoot` before any provider call. Persists `authority_version: 1` with all three authority fields atomically via `beginBootstrap()`. Validates drift before second App Server resume and before Registry bind.
 
-**`recoverAuditorBootstrap()`:** Rejects bind-capable states (`DECISION_VALIDATED`, `RESUME_VERIFYING`, `RESUME_VERIFIED`, `REGISTRY_BINDING`) with `AUDITOR_LIFECYCLE_AUTHORITY_REQUIRED` if `authority_version !== 1` — zero `resumeThread`, zero `bindAuditorThread`, active row remains. Validates drift before each boundary using stored authority fields. Preserves `AUDIT_TERMINAL_NO_DECISION` cleanup for `authority_version === 0`.
+**`recoverAuditorBootstrap()`:** Rejects bind-capable states (`DECISION_VALIDATED`, `RESUME_VERIFYING`, `RESUME_VERIFIED`, `REGISTRY_BINDING`) with `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` if `authority_version !== 1` — zero `resumeThread`, zero `bindAuditorThread`, active row remains. Validates drift before each boundary using stored authority fields. Preserves `AUDIT_TERMINAL_NO_DECISION` cleanup for `authority_version === 0`.
 
-**`resolveAuditorBootstrapUncertainty()`:** Rejects with `AUDITOR_LIFECYCLE_AUTHORITY_REQUIRED` if `authority_version !== 1`. Validates drift before spawning inspection client using `active.expected_project_root` as `cwd`.
+**`resolveAuditorBootstrapUncertainty()`:** Rejects with `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` if `authority_version !== 1`. Validates drift before spawning inspection client using `active.expected_project_root` as `cwd`.
 
 **`retireLegacyAuditorBootstrapWithoutAuthority({ projectId, operationId })`:** New exported API delegating to `recoveryStore.retireLegacyBootstrap()`.
 
@@ -99,6 +99,14 @@ expected_auditor_model_policy  TEXT
 | `interrupted` / `failed` | any | any | Return early — 0 hydration, 0 decision authority |
 
 Hydration locates exactly one turn with `id === turnId`. Requires hydrated turn to be `completed` and `itemsView === 'full'`. Strictly read-only: zero model turn consumption.
+
+### 3.4 WO-V4-05AG-R2-R1 Hardening & Corrections
+
+External review identified four corrective requirements addressed in R2-R1:
+1. **Persisted root self-canonicalization (R2-R1-01):** `assertBootstrapAuthorityMatchesRegistry` now canonicalizes `active.expected_project_root` via `canonicalizeProjectRoot()` and proves its actual filesystem identity equals `active.expected_project_root_identity`.
+2. **Canonical cwd proof (R2-R1-02):** `project.auditor.cwd` is validated via production `canonicalizeProjectRoot()`, proving actual filesystem canonical identity equals stored authority rather than relying on lexical normalization alone. Fails closed if missing, inaccessible, non-directory, or drifting.
+3. **Persisted authority is live authority (R2-R1-03):** Immediately after `beginBootstrap()`, live bootstrap re-reads `persistedBootstrap = recoveryStore.getActiveBootstrap(projectId)`, verifies that persistence recorded the intended bootstrap authority, and uses `persistedBootstrap.*` fields exclusively for all subsequent post-persistence bind-capable operations (resume adapter cwd, drift checks, Registry bind parameters).
+4. **No provider call precedes successful authority proof:** Provider client processes are only constructed after complete authority proof passes, using the proven canonical root as `cwd`.
 
 ---
 
@@ -120,9 +128,9 @@ Hydration locates exactly one turn with `id === turnId`. Requires hydrated turn 
 | Codex App Server Client | **84/84 PASS** |
 | **AuditDecision (AD)** | **122/122 PASS** |
 | **Auditor Recovery Store (ARS)** | **78/78 PASS** |
-| **Auditor Thread Lifecycle (ATL)** | **110/110 PASS** |
+| **Auditor Thread Lifecycle (ATL)** | **114/114 PASS** |
 
-**Actual counts (not inferred): AD=122, ARS=78, ATL=110.**
+**Actual counts (not inferred): AD=122, ARS=78, ATL=114.**
 
 ### 4.2 New Tests Added
 
@@ -130,7 +138,7 @@ Hydration locates exactly one turn with `id === turnId`. Requires hydrated turn 
 |-------|-------|-------|
 | AuditDecision | 22 | AD-101..AD-122 |
 | Auditor Recovery Store | 17 | ARS-062..ARS-078 |
-| Auditor Thread Lifecycle | 20 | ATL-091..ATL-110 |
+| Auditor Thread Lifecycle | 24 | ATL-091..ATL-114 |
 
 ### 4.3 Real R8 State — Read-Only Verification
 
