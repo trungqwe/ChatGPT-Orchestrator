@@ -15,7 +15,8 @@ const {
 const {
   REGISTRY_ERROR_CODES,
   getAuditorBindingState,
-  computeRootIdentityKey
+  computeRootIdentityKey,
+  canonicalizeProjectRoot
 } = require('../broker/registry');
 
 /**
@@ -43,6 +44,74 @@ class AuditorLifecycleError extends Error {
     this.name = 'AuditorLifecycleError';
     this.code = code;
     this.details = details;
+  }
+}
+
+/**
+ * Verify that the active bootstrap authority matches the fresh Registry record.
+ * Fails closed with AUDITOR_LIFECYCLE_PRECONDITION_FAILED if drift is detected.
+ *
+ * @param {Object} active
+ * @param {Object} project
+ */
+function assertBootstrapAuthorityMatchesRegistry(active, project) {
+  if (!active || typeof active !== 'object') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      'assertBootstrapAuthorityMatchesRegistry requires an active bootstrap record'
+    );
+  }
+  if (!project || typeof project !== 'object') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      'assertBootstrapAuthorityMatchesRegistry requires a project record'
+    );
+  }
+
+  if (active.authority_version !== 1) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Cannot verify authority: active bootstrap has authority_version ${active.authority_version}, requires 1`
+    );
+  }
+
+  // Canonicalize current registry project root using production authority
+  let canonicalRoot;
+  let identityKey;
+  try {
+    const res = canonicalizeProjectRoot(project.project_root);
+    canonicalRoot = res.canonicalRoot;
+    identityKey = res.identityKey;
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Failed to canonicalize registry project root '${project.project_root}': ${err.message}`
+    );
+  }
+
+  if (identityKey !== active.expected_project_root_identity) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project root drift detected for project '${active.project_id}': registry identity '${identityKey}' does not match expected identity '${active.expected_project_root_identity}'`
+    );
+  }
+
+  const currentPolicy = project.auditor?.model_policy;
+  if (currentPolicy !== active.expected_auditor_model_policy) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Auditor model policy drift detected for project '${active.project_id}': registry policy '${currentPolicy}' does not match expected policy '${active.expected_auditor_model_policy}'`
+    );
+  }
+
+  if (project.auditor?.cwd) {
+    const cwdIdentity = computeRootIdentityKey(project.auditor.cwd);
+    if (cwdIdentity !== active.expected_project_root_identity) {
+      throw new AuditorLifecycleError(
+        LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+        `Auditor cwd drift detected for project '${active.project_id}': cwd identity '${cwdIdentity}' does not match expected identity '${active.expected_project_root_identity}'`
+      );
+    }
   }
 }
 
@@ -191,6 +260,21 @@ async function bootstrapAuditorThread(options) {
     }
   }
 
+  // Canonicalize bootstrap-time project root and capture bootstrap authority (Detail 3)
+  let expectedProjectRoot;
+  let expectedProjectRootIdentity;
+  try {
+    const res = canonicalizeProjectRoot(project.project_root);
+    expectedProjectRoot = res.canonicalRoot;
+    expectedProjectRootIdentity = res.identityKey;
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Failed to canonicalize project root '${project.project_root}': ${err.message}`
+    );
+  }
+  const expectedAuditorModelPolicy = project.auditor.model_policy;
+
   // 2. Validate no active bootstrap in recovery journal
   const existingActive = recoveryStore.getActiveBootstrap(projectId);
   if (existingActive) {
@@ -247,13 +331,13 @@ async function bootstrapAuditorThread(options) {
   let client1 = null;
   let threadId = null;
   try {
-    client1 = await adapterFactory({ phase: 'provisional', cwd: project.project_root });
+    client1 = await adapterFactory({ phase: 'provisional', cwd: expectedProjectRoot });
     if (typeof client1.initialize === 'function' && !client1.isInitialized) {
       await client1.initialize();
     }
 
     const threadRes = await client1.startThread({
-      cwd: project.project_root,
+      cwd: expectedProjectRoot,
       sandbox: 'read-only'
     });
 
@@ -279,7 +363,11 @@ async function bootstrapAuditorThread(options) {
       operation_id: operationId,
       audit_subject_id: auditSubjectId,
       thread_id: threadId,
-      workspace_state_observed: workspaceStateObserved
+      workspace_state_observed: workspaceStateObserved,
+      authority_version: 1,
+      expected_project_root: expectedProjectRoot,
+      expected_project_root_identity: expectedProjectRootIdentity,
+      expected_auditor_model_policy: expectedAuditorModelPolicy
     });
   } catch (err) {
     if (client1) {
@@ -403,10 +491,34 @@ async function bootstrapAuditorThread(options) {
     next_state: AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFYING
   });
 
+  // Re-read fresh project from registry to perform drift validation before second-process resume (Detail 8)
+  let freshProjectForResume;
+  try {
+    freshProjectForResume = await registryPort.getProject(projectId);
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Failed to read project '${projectId}' from registry before resume: ${err.message}`
+    );
+  }
+  if (!freshProjectForResume) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' not found in registry before resume`
+    );
+  }
+  assertBootstrapAuthorityMatchesRegistry({
+    authority_version: 1,
+    project_id: projectId,
+    expected_project_root: expectedProjectRoot,
+    expected_project_root_identity: expectedProjectRootIdentity,
+    expected_auditor_model_policy: expectedAuditorModelPolicy
+  }, freshProjectForResume);
+
   // 13-14. Spawn second client in new independent process and verify exact thread/resume
   let client2 = null;
   try {
-    client2 = await adapterFactory({ phase: 'resume_verify', cwd: project.project_root });
+    client2 = await adapterFactory({ phase: 'resume_verify', cwd: expectedProjectRoot });
     if (typeof client2.initialize === 'function' && !client2.isInitialized) {
       await client2.initialize();
     }
@@ -446,14 +558,35 @@ async function bootstrapAuditorThread(options) {
     next_state: AUDITOR_BOOTSTRAP_STATES.REGISTRY_BINDING
   });
 
+  // Re-read fresh project from registry to perform drift validation before Registry bind (Detail 8)
+  let freshProjectForBind;
+  try {
+    freshProjectForBind = await registryPort.getProject(projectId);
+    if (!freshProjectForBind) {
+      throw new Error(`Project '${projectId}' not found in registry before bind`);
+    }
+    assertBootstrapAuthorityMatchesRegistry({
+      authority_version: 1,
+      project_id: projectId,
+      expected_project_root: expectedProjectRoot,
+      expected_project_root_identity: expectedProjectRootIdentity,
+      expected_auditor_model_policy: expectedAuditorModelPolicy
+    }, freshProjectForBind);
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_REGISTRY_BIND_FAILED,
+      `Registry bind validation failed for project '${projectId}': ${err.message}`
+    );
+  }
+
   // 18. Call atomic Registry bind API
   let bindResult;
   try {
     bindResult = await registryPort.bindAuditorThread({
       project_id: projectId,
       thread_id: threadId,
-      expected_project_root: project.project_root,
-      expected_model_policy: project.auditor.model_policy
+      expected_project_root: expectedProjectRoot,
+      expected_model_policy: expectedAuditorModelPolicy
     });
   } catch (err) {
     throw new AuditorLifecycleError(
@@ -602,13 +735,20 @@ async function recoverAuditorBootstrap(options) {
     };
   }
 
-  // Enforce decision authority for advanced states (WO-V4-05AF Section 7)
+  // Enforce decision authority and bootstrap authority for advanced states (WO-V4-05AF Section 7, WO-V4-05AG-R2 Details 7-9)
   if (
     state === AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED ||
     state === AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFYING ||
     state === AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFIED ||
     state === AUDITOR_BOOTSTRAP_STATES.REGISTRY_BINDING
   ) {
+    if (active.authority_version !== 1) {
+      throw new AuditorLifecycleError(
+        LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+        `Cannot recover bind-capable bootstrap with authority_version ${active.authority_version}: legacy recovery record lacks bootstrap authority and cannot resume or bind. Explicit retirement required.`
+      );
+    }
+
     if (
       !active.turn_id ||
       typeof active.turn_id !== 'string' ||
@@ -678,9 +818,12 @@ async function recoverAuditorBootstrap(options) {
       );
     }
 
+    // Drift validation before recovery thread/resume (Detail 8)
+    assertBootstrapAuthorityMatchesRegistry(active, project);
+
     let client = null;
     try {
-      client = await adapterFactory({ phase: 'resume_verify', cwd: project.project_root });
+      client = await adapterFactory({ phase: 'resume_verify', cwd: active.expected_project_root });
       if (typeof client.initialize === 'function' && !client.isInitialized) {
         await client.initialize();
       }
@@ -739,6 +882,9 @@ async function recoverAuditorBootstrap(options) {
       );
     }
 
+    // Drift validation before Registry bind (Detail 8)
+    assertBootstrapAuthorityMatchesRegistry(active, project);
+
     let bindResult;
     // If already bound to same thread: idempotent reconciliation
     if (project.auditor.thread_id === threadId && project.auditor.enabled === true) {
@@ -748,8 +894,8 @@ async function recoverAuditorBootstrap(options) {
         bindResult = await registryPort.bindAuditorThread({
           project_id: projectId,
           thread_id: threadId,
-          expected_project_root: project.project_root,
-          expected_model_policy: project.auditor.model_policy
+          expected_project_root: active.expected_project_root,
+          expected_model_policy: active.expected_auditor_model_policy
         });
       } catch (err) {
         throw new AuditorLifecycleError(
@@ -976,13 +1122,22 @@ async function resolveAuditorBootstrapUncertainty(options) {
     };
   }
 
+  // Drift validation before uncertainty provider read (Detail 8)
+  if (active.authority_version !== 1) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Cannot resolve uncertainty for bootstrap with authority_version ${active.authority_version}: requires authority_version === 1`
+    );
+  }
+  assertBootstrapAuthorityMatchesRegistry(active, project);
+
   // Spawn fresh inspection client (guaranteed close in finally block)
   let client = null;
   let readRes = null;
   try {
     client = await adapterFactory({
       phase: 'uncertainty_inspect',
-      cwd: project.project_root
+      cwd: active.expected_project_root
     });
     if (typeof client.initialize === 'function' && !client.isInitialized) {
       await client.initialize();
@@ -1133,13 +1288,113 @@ async function resolveAuditorBootstrapUncertainty(options) {
   };
 }
 
+/**
+ * Retire a legacy auditor bootstrap (authority_version === 0) whose authority cannot be proven.
+ *
+ * Sequence:
+ * 1. Verify active bootstrap exists and has authority_version === 0.
+ * 2. Verify fresh Registry state proves project exists and auditor is unbound.
+ * 3. Invoke recoveryStore.retireLegacyBootstrap transaction.
+ * 4. Return { ok: true, status: 'RETIRED_LEGACY_AUTHORITY_UNAVAILABLE', project_id, operation_id }.
+ *
+ * @param {Object} options
+ * @param {string} options.projectId
+ * @param {Object} options.registryPort
+ * @param {Object} options.recoveryStore
+ * @param {Object} [options.metadata]
+ * @returns {Promise<Object>}
+ */
+async function retireLegacyAuditorBootstrapWithoutAuthority(options) {
+  if (!options || typeof options !== 'object') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'retireLegacyAuditorBootstrapWithoutAuthority requires an options object'
+    );
+  }
+
+  const { projectId, registryPort, recoveryStore, metadata = null } = options;
+
+  if (typeof projectId !== 'string' || !projectId.trim()) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'projectId must be a non-empty string'
+    );
+  }
+
+  if (!registryPort || typeof registryPort.getProject !== 'function') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'registryPort must provide a getProject method'
+    );
+  }
+
+  if (!recoveryStore || typeof recoveryStore.getActiveBootstrap !== 'function' || typeof recoveryStore.retireLegacyBootstrap !== 'function') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'recoveryStore must provide getActiveBootstrap and retireLegacyBootstrap methods'
+    );
+  }
+
+  const active = recoveryStore.getActiveBootstrap(projectId);
+  if (!active) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `No active bootstrap found for project '${projectId}'`
+    );
+  }
+
+  if (active.authority_version !== 0) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Cannot retire legacy bootstrap for project '${projectId}': authority_version is ${active.authority_version}, expected 0`
+    );
+  }
+
+  let project;
+  try {
+    project = await registryPort.getProject(projectId);
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Failed to read project '${projectId}' from registry: ${err.message}`
+    );
+  }
+
+  if (!project) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' not found in registry`
+    );
+  }
+
+  if (project.auditor?.thread_id !== null || project.auditor?.enabled !== false) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Cannot retire legacy bootstrap: project '${projectId}' auditor is not unbound in registry (thread_id='${project.auditor?.thread_id}', enabled=${project.auditor?.enabled})`
+    );
+  }
+
+  const retireRes = recoveryStore.retireLegacyBootstrap(projectId, active.operation_id, metadata);
+
+  return {
+    ok: true,
+    status: 'RETIRED_LEGACY_AUTHORITY_UNAVAILABLE',
+    project_id: projectId,
+    operation_id: active.operation_id,
+    ...retireRes
+  };
+}
+
 module.exports = {
   LIFECYCLE_ERROR_CODES,
   AuditorLifecycleError,
   AUDITOR_BOOTSTRAP_STATES,
   MAX_UNCERTAINTY_DIAGNOSTIC_BYTES,
+  assertBootstrapAuthorityMatchesRegistry,
   bootstrapAuditorThread,
   recoverAuditorBootstrap,
   inspectAuditorBootstrap,
-  resolveAuditorBootstrapUncertainty
+  resolveAuditorBootstrapUncertainty,
+  retireLegacyAuditorBootstrapWithoutAuthority,
+  retireLegacyBootstrap: retireLegacyAuditorBootstrapWithoutAuthority
 };

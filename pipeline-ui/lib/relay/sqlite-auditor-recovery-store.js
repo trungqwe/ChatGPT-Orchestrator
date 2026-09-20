@@ -19,7 +19,7 @@ const {
 
 const DEFAULT_RECOVERY_DIR = path.join(os.homedir(), '.orchestrator');
 const DEFAULT_RECOVERY_DB_PATH = path.join(DEFAULT_RECOVERY_DIR, 'auditor-recovery.sqlite3');
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const AUDITOR_BOOTSTRAP_STATES = Object.freeze({
   PROVISIONAL_THREAD: 'PROVISIONAL_THREAD',
@@ -30,7 +30,8 @@ const AUDITOR_BOOTSTRAP_STATES = Object.freeze({
   RESUME_VERIFIED: 'RESUME_VERIFIED',
   REGISTRY_BINDING: 'REGISTRY_BINDING',
   AUDIT_UNCERTAIN: 'AUDIT_UNCERTAIN',
-  AUDIT_TERMINAL_NO_DECISION: 'AUDIT_TERMINAL_NO_DECISION'
+  AUDIT_TERMINAL_NO_DECISION: 'AUDIT_TERMINAL_NO_DECISION',
+  LEGACY_AUTHORITY_RETIRED: 'LEGACY_AUTHORITY_RETIRED'
 });
 
 const RECOVERY_ERROR_CODES = Object.freeze({
@@ -52,7 +53,8 @@ const ALLOWED_TRANSITIONS = Object.freeze({
   RESUME_VERIFIED: new Set(['REGISTRY_BINDING', 'AUDIT_UNCERTAIN']),
   REGISTRY_BINDING: new Set(['AUDIT_UNCERTAIN']),
   AUDIT_UNCERTAIN: new Set(['AUDIT_TERMINAL_NO_DECISION', 'DECISION_VALIDATED']),
-  AUDIT_TERMINAL_NO_DECISION: new Set()
+  AUDIT_TERMINAL_NO_DECISION: new Set(),
+  LEGACY_AUTHORITY_RETIRED: new Set()
 });
 
 const CONTROL_CHAR_REGEX = /[\x00-\x1f\x7f]/;
@@ -127,11 +129,10 @@ function validateNonEmptyString(val, fieldName, maxBytes = 512) {
 }
 
 /**
- * Validate schema columns, types, primary keys, and nullability.
+ * Validate schema columns, types, primary keys, and nullability for V1 database.
  * @param {DatabaseSync} db
  */
-function validateSchemaShape(db) {
-  // Check unexpected tables in database
+function validateSchemaShapeV1(db) {
   const masterTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
   const allowedTables = new Set(['auditor_bootstrap', 'auditor_bootstrap_history', 'sqlite_sequence']);
   for (const t of masterTables) {
@@ -143,7 +144,7 @@ function validateSchemaShape(db) {
     }
   }
 
-  // 1. auditor_bootstrap table
+  // 1. auditor_bootstrap table (11 columns in V1)
   const bootstrapInfo = db.prepare("PRAGMA table_info('auditor_bootstrap')").all();
   if (!bootstrapInfo || bootstrapInfo.length === 0) {
     throw createRecoveryError(
@@ -152,7 +153,7 @@ function validateSchemaShape(db) {
     );
   }
 
-  const expectedBootstrapCols = [
+  const expectedBootstrapColsV1 = [
     { name: 'project_id', type: ['TEXT'], pk: 1, notnull: 0 },
     { name: 'operation_id', type: ['TEXT'], pk: 0, notnull: 1 },
     { name: 'audit_subject_id', type: ['TEXT'], pk: 0, notnull: 1 },
@@ -166,15 +167,15 @@ function validateSchemaShape(db) {
     { name: 'updated_at', type: ['TEXT'], pk: 0, notnull: 1 }
   ];
 
-  if (bootstrapInfo.length !== expectedBootstrapCols.length) {
+  if (bootstrapInfo.length !== expectedBootstrapColsV1.length) {
     throw createRecoveryError(
       RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
-      `Table 'auditor_bootstrap' column count mismatch: expected ${expectedBootstrapCols.length}, found ${bootstrapInfo.length}`
+      `Table 'auditor_bootstrap' column count mismatch: expected ${expectedBootstrapColsV1.length}, found ${bootstrapInfo.length}`
     );
   }
 
   const bColMap = new Map(bootstrapInfo.map(c => [c.name, c]));
-  for (const exp of expectedBootstrapCols) {
+  for (const exp of expectedBootstrapColsV1) {
     const col = bColMap.get(exp.name);
     if (!col) {
       throw createRecoveryError(
@@ -223,6 +224,117 @@ function validateSchemaShape(db) {
   }
 
   // 2. auditor_bootstrap_history table
+  validateHistorySchemaShape(db);
+}
+
+/**
+ * Validate schema columns, types, primary keys, and nullability for V2 database.
+ * @param {DatabaseSync} db
+ */
+function validateSchemaShapeV2(db) {
+  const masterTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+  const allowedTables = new Set(['auditor_bootstrap', 'auditor_bootstrap_history', 'sqlite_sequence']);
+  for (const t of masterTables) {
+    if (!allowedTables.has(t.name)) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+        `Unexpected table '${t.name}' found in recovery database`
+      );
+    }
+  }
+
+  // 1. auditor_bootstrap table (15 columns in V2)
+  const bootstrapInfo = db.prepare("PRAGMA table_info('auditor_bootstrap')").all();
+  if (!bootstrapInfo || bootstrapInfo.length === 0) {
+    throw createRecoveryError(
+      RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+      "Required table 'auditor_bootstrap' is missing"
+    );
+  }
+
+  const expectedBootstrapColsV2 = [
+    { name: 'project_id', type: ['TEXT'], pk: 1, notnull: 0 },
+    { name: 'operation_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'audit_subject_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'thread_id', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'turn_id', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'workspace_state_observed', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'state', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'decision_json', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'decision_sha256', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'authority_version', type: ['INTEGER'], pk: 0, notnull: 1 },
+    { name: 'expected_project_root', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'expected_project_root_identity', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'expected_auditor_model_policy', type: ['TEXT'], pk: 0, notnull: 0 },
+    { name: 'created_at', type: ['TEXT'], pk: 0, notnull: 1 },
+    { name: 'updated_at', type: ['TEXT'], pk: 0, notnull: 1 }
+  ];
+
+  if (bootstrapInfo.length !== expectedBootstrapColsV2.length) {
+    throw createRecoveryError(
+      RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+      `Table 'auditor_bootstrap' column count mismatch: expected ${expectedBootstrapColsV2.length}, found ${bootstrapInfo.length}`
+    );
+  }
+
+  const bColMap = new Map(bootstrapInfo.map(c => [c.name, c]));
+  for (const exp of expectedBootstrapColsV2) {
+    const col = bColMap.get(exp.name);
+    if (!col) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+        `Column '${exp.name}' is missing in auditor_bootstrap`
+      );
+    }
+    const colType = (col.type || '').toUpperCase();
+    if (!exp.type.includes(colType)) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+        `Column '${exp.name}' has invalid declared type '${col.type}'`
+      );
+    }
+    if (col.pk !== exp.pk) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+        `Column '${exp.name}' has invalid primary-key position`
+      );
+    }
+    if (exp.notnull === 1 && col.notnull !== 1 && col.pk === 0) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+        `Column '${exp.name}' must be NOT NULL`
+      );
+    }
+  }
+
+  // Check unique constraint on operation_id
+  const idxList = db.prepare("PRAGMA index_list('auditor_bootstrap')").all();
+  let opIdUnique = false;
+  for (const idx of idxList) {
+    if (idx.unique === 1) {
+      const idxCols = db.prepare(`PRAGMA index_info('${idx.name}')`).all();
+      if (idxCols.length === 1 && idxCols[0].name === 'operation_id') {
+        opIdUnique = true;
+        break;
+      }
+    }
+  }
+  if (!opIdUnique) {
+    throw createRecoveryError(
+      RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+      "Required UNIQUE index on 'auditor_bootstrap.operation_id' is missing"
+    );
+  }
+
+  // 2. auditor_bootstrap_history table
+  validateHistorySchemaShape(db);
+}
+
+/**
+ * Validate history table schema and indexes (shared by V1 and V2).
+ * @param {DatabaseSync} db
+ */
+function validateHistorySchemaShape(db) {
   const historyInfo = db.prepare("PRAGMA table_info('auditor_bootstrap_history')").all();
   if (!historyInfo || historyInfo.length === 0) {
     throw createRecoveryError(
@@ -307,15 +419,24 @@ function validateSchemaShape(db) {
 }
 
 /**
- * Validate open-time semantic integrity of persisted rows.
+ * Validate open-time semantic integrity of persisted rows for V1 database.
  * @param {DatabaseSync} db
  */
-function validatePersistedSemantics(db) {
+function validatePersistedSemanticsV1(db) {
   const rows = db.prepare('SELECT * FROM auditor_bootstrap').all();
-  const knownStates = new Set(Object.values(AUDITOR_BOOTSTRAP_STATES));
+  const v1States = new Set([
+    AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD,
+    AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING,
+    AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+    AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+    AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFYING,
+    AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFIED,
+    AUDITOR_BOOTSTRAP_STATES.REGISTRY_BINDING,
+    AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+    AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION
+  ]);
 
   for (const row of rows) {
-    // 1. Revalidate ID bounds & characters
     try {
       validateNonEmptyString(row.project_id, 'project_id', 128);
       validateOperationId(row.operation_id);
@@ -332,100 +453,17 @@ function validatePersistedSemantics(db) {
       );
     }
 
-    if (!knownStates.has(row.state)) {
+    if (!v1States.has(row.state)) {
       throw createRecoveryError(
         RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
         `Corrupt database: bootstrap row for project '${row.project_id}' has unrecognized state '${row.state}'`
       );
     }
 
-    // 2. State-specific data coherence (Section 6)
-    const { state, turn_id, decision_json, decision_sha256 } = row;
-    switch (state) {
-      case AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD:
-      case AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING:
-        if (turn_id !== null || decision_json !== null || decision_sha256 !== null) {
-          throw createRecoveryError(
-            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-            `Corrupt database: project '${row.project_id}' in state '${state}' has unexpected turn_id or decision data`
-          );
-        }
-        break;
-      case AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT:
-        if (turn_id === null || decision_json !== null || decision_sha256 !== null) {
-          throw createRecoveryError(
-            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-            `Corrupt database: project '${row.project_id}' in state 'FIRST_TURN_IN_FLIGHT' requires turn_id != null and decision_json == null`
-          );
-        }
-        break;
-      case AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED:
-      case AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFYING:
-      case AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFIED:
-      case AUDITOR_BOOTSTRAP_STATES.REGISTRY_BINDING:
-        if (turn_id === null || decision_json === null || decision_sha256 === null) {
-          throw createRecoveryError(
-            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-            `Corrupt database: project '${row.project_id}' in state '${state}' requires turn_id and validated decision authority`
-          );
-        }
-        break;
-      case AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN:
-        if ((decision_json !== null && decision_sha256 === null) || (decision_json === null && decision_sha256 !== null)) {
-          throw createRecoveryError(
-            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-            `Corrupt database: project '${row.project_id}' in state 'AUDIT_UNCERTAIN' has mismatched decision fields`
-          );
-        }
-        break;
-      case AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION:
-        if (turn_id === null || decision_json !== null || decision_sha256 !== null) {
-          throw createRecoveryError(
-            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-            `Corrupt database: project '${row.project_id}' in state 'AUDIT_TERMINAL_NO_DECISION' requires turn_id != null and decision_json == null`
-          );
-        }
-        break;
-      default:
-        throw createRecoveryError(
-          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-          `Corrupt database: project '${row.project_id}' has unrecognized state '${state}'`
-        );
-    }
-
-    if (decision_json !== null && decision_json !== undefined) {
-      if (typeof decision_sha256 !== 'string' || decision_sha256.length !== 64) {
-        throw createRecoveryError(
-          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-          `Corrupt database: project '${row.project_id}' has decision_json but invalid decision_sha256`
-        );
-      }
-      const actualHash = crypto.createHash('sha256').update(decision_json, 'utf8').digest('hex');
-      if (actualHash.toLowerCase() !== decision_sha256.toLowerCase()) {
-        throw createRecoveryError(
-          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-          `Corrupt database: decision hash mismatch for project '${row.project_id}'`
-        );
-      }
-      try {
-        const parsed = parseStrictJson(decision_json);
-        const expectedContext = {
-          project_id: row.project_id,
-          audit_subject_id: row.audit_subject_id,
-          auditor_thread_id: row.thread_id,
-          workspace_state_observed: row.workspace_state_observed
-        };
-        validateAuditDecisionV1(parsed, expectedContext);
-      } catch (err) {
-        throw createRecoveryError(
-          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-          `Corrupt database: decision in project '${row.project_id}' failed revalidation: ${err.message}`
-        );
-      }
-    }
+    validateStateDataCoherence(row);
   }
 
-  // 3. Verify history rows and unbroken state transition chains (Section 8)
+  // Verify history rows and unbroken state transition chains (V1 rules)
   const historyRows = db.prepare('SELECT * FROM auditor_bootstrap_history ORDER BY history_seq ASC').all();
   const historyByOp = new Map();
   for (const h of historyRows) {
@@ -439,13 +477,13 @@ function validatePersistedSemantics(db) {
       );
     }
 
-    if (!knownStates.has(h.next_state)) {
+    if (!v1States.has(h.next_state)) {
       throw createRecoveryError(
         RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
         `Corrupt database: history seq '${h.history_seq}' has unrecognized next_state '${h.next_state}'`
       );
     }
-    if (h.previous_state !== null && !knownStates.has(h.previous_state)) {
+    if (h.previous_state !== null && !v1States.has(h.previous_state)) {
       throw createRecoveryError(
         RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
         `Corrupt database: history seq '${h.history_seq}' has unrecognized previous_state '${h.previous_state}'`
@@ -508,6 +546,291 @@ function validatePersistedSemantics(db) {
 }
 
 /**
+ * Validate open-time semantic integrity of persisted rows for V2 database.
+ * Enforces authority fields, authority_version, and legacy retirement history constraints.
+ * @param {DatabaseSync} db
+ */
+function validatePersistedSemanticsV2(db) {
+  const rows = db.prepare('SELECT * FROM auditor_bootstrap').all();
+  const knownActiveStates = new Set([
+    AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD,
+    AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING,
+    AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+    AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+    AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFYING,
+    AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFIED,
+    AUDITOR_BOOTSTRAP_STATES.REGISTRY_BINDING,
+    AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+    AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION
+  ]);
+
+  for (const row of rows) {
+    try {
+      validateNonEmptyString(row.project_id, 'project_id', 128);
+      validateOperationId(row.operation_id);
+      validateNonEmptyString(row.audit_subject_id, 'audit_subject_id', 512);
+      validateThreadId(row.thread_id);
+      validateNonEmptyString(row.workspace_state_observed, 'workspace_state_observed', 512);
+      if (row.turn_id !== null && row.turn_id !== undefined) {
+        validateNonEmptyString(row.turn_id, 'turn_id', 256);
+      }
+    } catch (err) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: invalid ID or bounds in project '${row.project_id}': ${err.message}`
+      );
+    }
+
+    if (row.state === AUDITOR_BOOTSTRAP_STATES.LEGACY_AUTHORITY_RETIRED) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: active bootstrap for project '${row.project_id}' cannot be in '${row.state}' state`
+      );
+    }
+
+    if (!knownActiveStates.has(row.state)) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: bootstrap row for project '${row.project_id}' has unrecognized state '${row.state}'`
+      );
+    }
+
+    // Authority version validation (Detail 2, 3, 4)
+    if (typeof row.authority_version !== 'number' || !Number.isInteger(row.authority_version) || (row.authority_version !== 0 && row.authority_version !== 1)) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: project '${row.project_id}' has invalid authority_version '${row.authority_version}'`
+      );
+    }
+
+    if (row.authority_version === 0) {
+      if (
+        row.expected_project_root !== null ||
+        row.expected_project_root_identity !== null ||
+        row.expected_auditor_model_policy !== null
+      ) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Corrupt database: authority_version 0 for project '${row.project_id}' must have null authority fields`
+        );
+      }
+    } else if (row.authority_version === 1) {
+      try {
+        validateNonEmptyString(row.expected_project_root, 'expected_project_root', 1024);
+        validateNonEmptyString(row.expected_project_root_identity, 'expected_project_root_identity', 512);
+        validateNonEmptyString(row.expected_auditor_model_policy, 'expected_auditor_model_policy', 128);
+      } catch (err) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Corrupt database: authority_version 1 for project '${row.project_id}' has invalid authority fields: ${err.message}`
+        );
+      }
+    }
+
+    validateStateDataCoherence(row);
+  }
+
+  // 3. Verify history rows and unbroken state transition chains (Section 8 + Detail 5)
+  const historyRows = db.prepare('SELECT * FROM auditor_bootstrap_history ORDER BY history_seq ASC').all();
+  const historyByOp = new Map();
+  const allKnownStates = new Set(Object.values(AUDITOR_BOOTSTRAP_STATES));
+
+  for (const h of historyRows) {
+    try {
+      validateNonEmptyString(h.project_id, 'history.project_id', 128);
+      validateOperationId(h.operation_id);
+    } catch (err) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: history row bounds invalid: ${err.message}`
+      );
+    }
+
+    if (!allKnownStates.has(h.next_state)) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: history seq '${h.history_seq}' has unrecognized next_state '${h.next_state}'`
+      );
+    }
+    if (h.previous_state !== null && !allKnownStates.has(h.previous_state)) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: history seq '${h.history_seq}' has unrecognized previous_state '${h.previous_state}'`
+      );
+    }
+    if (h.previous_state === AUDITOR_BOOTSTRAP_STATES.LEGACY_AUTHORITY_RETIRED) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: LEGACY_AUTHORITY_RETIRED cannot be a previous_state in history seq '${h.history_seq}'`
+      );
+    }
+    const opKey = `${h.project_id}::${h.operation_id}`;
+    if (!historyByOp.has(opKey)) {
+      historyByOp.set(opKey, []);
+    }
+    historyByOp.get(opKey).push(h);
+  }
+
+  for (const [opKey, hList] of historyByOp.entries()) {
+    for (let i = 0; i < hList.length; i++) {
+      const row = hList[i];
+      if (i === 0) {
+        if (row.previous_state !== null || row.next_state !== AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD) {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+            `Corrupt database: operation '${opKey}' history must start with null -> PROVISIONAL_THREAD`
+          );
+        }
+      } else {
+        const prevRow = hList[i - 1];
+        if (row.previous_state !== prevRow.next_state) {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+            `Corrupt database: history discontinuity in '${opKey}': row previous_state '${row.previous_state}' !== prior next_state '${prevRow.next_state}'`
+          );
+        }
+
+        // Handle LEGACY_AUTHORITY_RETIRED (Detail 5)
+        if (row.next_state === AUDITOR_BOOTSTRAP_STATES.LEGACY_AUTHORITY_RETIRED) {
+          if (i !== hList.length - 1) {
+            throw createRecoveryError(
+              RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+              `Corrupt database: LEGACY_AUTHORITY_RETIRED must be terminal history entry in '${opKey}'`
+            );
+          }
+          // Active row must NOT exist for a retired operation
+          const activeCheck = rows.find(r => r.operation_id === row.operation_id && r.project_id === row.project_id);
+          if (activeCheck) {
+            throw createRecoveryError(
+              RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+              `Corrupt database: active bootstrap exists for retired operation '${opKey}'`
+            );
+          }
+        } else {
+          const allowed = ALLOWED_TRANSITIONS[row.previous_state];
+          if (!allowed || !allowed.has(row.next_state)) {
+            throw createRecoveryError(
+              RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+              `Corrupt database: impossible transition in '${opKey}' from '${row.previous_state}' to '${row.next_state}'`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // Cross-check active bootstrap state matches latest history row for active projects
+  for (const row of rows) {
+    const opKey = `${row.project_id}::${row.operation_id}`;
+    const hList = historyByOp.get(opKey);
+    if (!hList || hList.length === 0) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: active bootstrap for project '${row.project_id}' has no history`
+      );
+    }
+    const latest = hList[hList.length - 1];
+    if (latest.next_state !== row.state) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: active bootstrap state '${row.state}' disagrees with latest history '${latest.next_state}'`
+      );
+    }
+  }
+}
+
+/**
+ * Validate state-specific data coherence (turn_id, decision_json, decision_sha256).
+ * Shared helper between V1 and V2 semantic validators.
+ * @param {Object} row
+ */
+function validateStateDataCoherence(row) {
+  const { state, turn_id, decision_json, decision_sha256 } = row;
+  switch (state) {
+    case AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD:
+    case AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING:
+      if (turn_id !== null || decision_json !== null || decision_sha256 !== null) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Corrupt database: project '${row.project_id}' in state '${state}' has unexpected turn_id or decision data`
+        );
+      }
+      break;
+    case AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT:
+      if (turn_id === null || decision_json !== null || decision_sha256 !== null) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Corrupt database: project '${row.project_id}' in state 'FIRST_TURN_IN_FLIGHT' requires turn_id != null and decision_json == null`
+        );
+      }
+      break;
+    case AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED:
+    case AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFYING:
+    case AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFIED:
+    case AUDITOR_BOOTSTRAP_STATES.REGISTRY_BINDING:
+      if (turn_id === null || decision_json === null || decision_sha256 === null) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Corrupt database: project '${row.project_id}' in state '${state}' requires turn_id and validated decision authority`
+        );
+      }
+      break;
+    case AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN:
+      if ((decision_json !== null && decision_sha256 === null) || (decision_json === null && decision_sha256 !== null)) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Corrupt database: project '${row.project_id}' in state 'AUDIT_UNCERTAIN' has mismatched decision fields`
+        );
+      }
+      break;
+    case AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION:
+      if (turn_id === null || decision_json !== null || decision_sha256 !== null) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Corrupt database: project '${row.project_id}' in state 'AUDIT_TERMINAL_NO_DECISION' requires turn_id != null and decision_json == null`
+        );
+      }
+      break;
+    default:
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: project '${row.project_id}' has unrecognized state '${state}'`
+      );
+  }
+
+  if (decision_json !== null && decision_json !== undefined) {
+    if (typeof decision_sha256 !== 'string' || decision_sha256.length !== 64) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: project '${row.project_id}' has decision_json but invalid decision_sha256`
+      );
+    }
+    const actualHash = crypto.createHash('sha256').update(decision_json, 'utf8').digest('hex');
+    if (actualHash.toLowerCase() !== decision_sha256.toLowerCase()) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: decision hash mismatch for project '${row.project_id}'`
+      );
+    }
+    try {
+      const parsed = parseStrictJson(decision_json);
+      const expectedContext = {
+        project_id: row.project_id,
+        audit_subject_id: row.audit_subject_id,
+        auditor_thread_id: row.thread_id,
+        workspace_state_observed: row.workspace_state_observed
+      };
+      validateAuditDecisionV1(parsed, expectedContext);
+    } catch (err) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Corrupt database: decision in project '${row.project_id}' failed revalidation: ${err.message}`
+      );
+    }
+  }
+}
+
+/**
  * Format active bootstrap database row into detached JS record.
  * Re-validates decision hash and WP04 semantics if decision_json is present.
  * @param {Object} row
@@ -546,6 +869,10 @@ function rowToBootstrapRecord(row) {
     decision_json: row.decision_json !== null ? row.decision_json : null,
     decision_sha256: row.decision_sha256 !== null ? row.decision_sha256 : null,
     validated_decision: validatedDecision,
+    authority_version: row.authority_version,
+    expected_project_root: row.expected_project_root !== null ? row.expected_project_root : null,
+    expected_project_root_identity: row.expected_project_root_identity !== null ? row.expected_project_root_identity : null,
+    expected_auditor_model_policy: row.expected_auditor_model_policy !== null ? row.expected_auditor_model_policy : null,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -631,7 +958,7 @@ function createSqliteAuditorRecoveryStore(options = {}) {
         );
       }
 
-      // Initialize schema version 1 transactionally (Section 10)
+      // Initialize schema version 2 transactionally
       db.exec('BEGIN IMMEDIATE;');
       try {
         db.exec(`
@@ -645,6 +972,10 @@ function createSqliteAuditorRecoveryStore(options = {}) {
             state TEXT NOT NULL,
             decision_json TEXT,
             decision_sha256 TEXT,
+            authority_version INTEGER NOT NULL,
+            expected_project_root TEXT,
+            expected_project_root_identity TEXT,
+            expected_auditor_model_policy TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
           );
@@ -669,6 +1000,35 @@ function createSqliteAuditorRecoveryStore(options = {}) {
         try { db.exec('ROLLBACK;'); } catch {}
         throw err;
       }
+    } else if (currentVersion === 1) {
+      // Detail 1: For PRAGMA user_version == 1, first run exact V1 physical integrity,
+      // exact V1 schema-shape validation, persisted semantic validation, and history-chain validation.
+      const v1CheckRow = db.prepare('PRAGMA integrity_check;').get();
+      if (!v1CheckRow || v1CheckRow.integrity_check !== 'ok') {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Physical integrity check failed on v1 database: ${v1CheckRow ? v1CheckRow.integrity_check : 'null'}`
+        );
+      }
+
+      validateSchemaShapeV1(db);
+      validatePersistedSemanticsV1(db);
+
+      // Only after all V1 validation passes may the migration transaction modify schema/data.
+      db.exec('BEGIN IMMEDIATE;');
+      try {
+        db.exec(`
+          ALTER TABLE auditor_bootstrap ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE auditor_bootstrap ADD COLUMN expected_project_root TEXT;
+          ALTER TABLE auditor_bootstrap ADD COLUMN expected_project_root_identity TEXT;
+          ALTER TABLE auditor_bootstrap ADD COLUMN expected_auditor_model_policy TEXT;
+          PRAGMA user_version = ${SCHEMA_VERSION};
+        `);
+        db.exec('COMMIT;');
+      } catch (err) {
+        try { db.exec('ROLLBACK;'); } catch {}
+        throw err;
+      }
     } else if (currentVersion !== SCHEMA_VERSION) {
       throw createRecoveryError(
         RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
@@ -676,7 +1036,7 @@ function createSqliteAuditorRecoveryStore(options = {}) {
       );
     }
 
-    // Both fresh and reopen paths reach the exact same validation gate (Sections 10 & 11)
+    // Both fresh and reopen/migrated paths reach the exact same validation gate
     const checkRow = db.prepare('PRAGMA integrity_check;').get();
     if (!checkRow || checkRow.integrity_check !== 'ok') {
       throw createRecoveryError(
@@ -685,8 +1045,8 @@ function createSqliteAuditorRecoveryStore(options = {}) {
       );
     }
 
-    validateSchemaShape(db);
-    validatePersistedSemantics(db);
+    validateSchemaShapeV2(db);
+    validatePersistedSemanticsV2(db);
 
     // Enable WAL only after successful schema and integrity validation
     db.exec('PRAGMA journal_mode = WAL;');
@@ -710,9 +1070,11 @@ function createSqliteAuditorRecoveryStore(options = {}) {
     INSERT INTO auditor_bootstrap (
       project_id, operation_id, audit_subject_id, thread_id, turn_id,
       workspace_state_observed, state, decision_json, decision_sha256,
+      authority_version, expected_project_root, expected_project_root_identity, expected_auditor_model_policy,
       created_at, updated_at
     ) VALUES (
       ?, ?, ?, ?, ?,
+      ?, ?, ?, ?,
       ?, ?, ?, ?,
       ?, ?
     )
@@ -753,7 +1115,7 @@ function createSqliteAuditorRecoveryStore(options = {}) {
   /**
    * Begin an auditor bootstrap session.
    * Enforces at most 1 active bootstrap per project.
-   * Commits PROVISIONAL_THREAD state.
+   * Commits PROVISIONAL_THREAD state with bootstrap authority.
    */
   function beginBootstrap(params = {}) {
     assertOpen();
@@ -763,7 +1125,11 @@ function createSqliteAuditorRecoveryStore(options = {}) {
       operation_id,
       audit_subject_id,
       thread_id,
-      workspace_state_observed
+      workspace_state_observed,
+      authority_version,
+      expected_project_root,
+      expected_project_root_identity,
+      expected_auditor_model_policy
     } = params;
 
     validateNonEmptyString(project_id, 'project_id', 128);
@@ -771,6 +1137,16 @@ function createSqliteAuditorRecoveryStore(options = {}) {
     validateNonEmptyString(audit_subject_id, 'audit_subject_id', 512);
     validateThreadId(thread_id);
     validateNonEmptyString(workspace_state_observed, 'workspace_state_observed', 512);
+
+    if (authority_version !== 1) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+        `beginBootstrap requires authority_version === 1, got '${authority_version}'`
+      );
+    }
+    validateNonEmptyString(expected_project_root, 'expected_project_root', 1024);
+    validateNonEmptyString(expected_project_root_identity, 'expected_project_root_identity', 512);
+    validateNonEmptyString(expected_auditor_model_policy, 'expected_auditor_model_policy', 128);
 
     // Enforce single active bootstrap per project
     const existing = stmtGetActive.get(project_id);
@@ -797,6 +1173,10 @@ function createSqliteAuditorRecoveryStore(options = {}) {
         initialState,
         null,
         null,
+        1,
+        expected_project_root,
+        expected_project_root_identity,
+        expected_auditor_model_policy,
         nowIso,
         nowIso
       );
@@ -868,6 +1248,13 @@ function createSqliteAuditorRecoveryStore(options = {}) {
       throw createRecoveryError(
         RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
         `Unrecognized next_state '${next_state}'`
+      );
+    }
+
+    if (next_state === AUDITOR_BOOTSTRAP_STATES.LEGACY_AUTHORITY_RETIRED) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_TRANSITION,
+        'transitionState cannot transition to LEGACY_AUTHORITY_RETIRED; use retireLegacyBootstrap'
       );
     }
 
@@ -1110,6 +1497,89 @@ function createSqliteAuditorRecoveryStore(options = {}) {
   }
 
   /**
+   * Retire a legacy bootstrap (authority_version === 0) in one atomic SQLite transaction.
+   * Enforces exact active project/operation, authority_version == 0,
+   * appends current_state -> LEGACY_AUTHORITY_RETIRED history, and deletes exact active row.
+   */
+  function retireLegacyBootstrap(arg1, arg2, arg3) {
+    assertOpen();
+
+    let project_id;
+    let operation_id;
+    let metadata = null;
+
+    if (typeof arg1 === 'string') {
+      project_id = arg1;
+      operation_id = arg2;
+      metadata = arg3 || null;
+    } else if (arg1 && typeof arg1 === 'object' && !Array.isArray(arg1)) {
+      project_id = arg1.project_id;
+      operation_id = arg1.operation_id;
+      metadata = arg1.metadata || null;
+    } else {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+        'retireLegacyBootstrap requires (projectId, operationId, [metadata]) or an options object'
+      );
+    }
+
+    validateNonEmptyString(project_id, 'project_id', 128);
+    validateOperationId(operation_id);
+
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      const active = stmtGetActive.get(project_id);
+      if (!active) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_NOT_FOUND,
+          `No active bootstrap found for project '${project_id}'`
+        );
+      }
+
+      if (active.operation_id !== operation_id) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT,
+          `operation_id mismatch on legacy retirement: active is '${active.operation_id}', requested '${operation_id}'`
+        );
+      }
+
+      if (active.authority_version !== 0) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+          `Cannot retire bootstrap with authority_version ${active.authority_version}; legacy retirement is only valid for authority_version == 0`
+        );
+      }
+
+      const nowIso = clock.iso();
+      const nowMs = clock.now();
+      const metaStr = metadata ? JSON.stringify(metadata) : null;
+
+      stmtInsertHistory.run(
+        project_id,
+        operation_id,
+        active.state,
+        AUDITOR_BOOTSTRAP_STATES.LEGACY_AUTHORITY_RETIRED,
+        nowMs,
+        nowIso,
+        metaStr
+      );
+
+      stmtDeleteBootstrap.run(project_id, operation_id);
+      db.exec('COMMIT;');
+
+      return {
+        ok: true,
+        status: 'RETIRED_LEGACY_AUTHORITY_UNAVAILABLE',
+        project_id,
+        operation_id
+      };
+    } catch (err) {
+      try { db.exec('ROLLBACK;'); } catch {}
+      throw err;
+    }
+  }
+
+  /**
    * Delete active bootstrap row upon successful Registry bind or cleanup.
    * History rows remain intact.
    */
@@ -1174,6 +1644,7 @@ function createSqliteAuditorRecoveryStore(options = {}) {
     beginBootstrap,
     transitionState,
     transitionBootstrap: transitionState,
+    retireLegacyBootstrap,
     getActiveBootstrap,
     listActiveBootstraps,
     deleteActiveBootstrap,

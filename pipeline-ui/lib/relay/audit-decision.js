@@ -1316,7 +1316,7 @@ async function awaitAuditDecisionV1(adapter, params = {}) {
   }
 
   // AD-AUTH-02: Bounded trusted metadata only, never attach completion or turn objects
-  if (!completion || completion.status !== 'completed' || !completion.turn) {
+  if (!completion || completion.status !== 'completed') {
     throw createAuditDecisionError(
       ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED,
       'Turn did not complete successfully; non-completed turns provide zero decision authority',
@@ -1327,7 +1327,83 @@ async function awaitAuditDecisionV1(adapter, params = {}) {
     );
   }
 
-  return extractAuditDecisionV1FromTurn(completion.turn, expectedContext);
+  // Fast path: completion already contains completed turn with full items view (zero readThread calls)
+  const directTurn = completion.turn;
+  if (directTurn && directTurn.status === 'completed' && directTurn.itemsView === 'full') {
+    return extractAuditDecisionV1FromTurn(directTurn, expectedContext);
+  }
+
+  // Hydration path: completion status is completed, but turn is missing or itemsView != 'full'
+  if (typeof adapter.readThread !== 'function') {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_ITEMS_INCOMPLETE,
+      'Turn completion lacks full items and adapter does not provide readThread for hydration',
+      { turnId: String(turnId).slice(0, 64) }
+    );
+  }
+
+  let readRes;
+  try {
+    readRes = await adapter.readThread({
+      threadId,
+      includeTurns: true
+    });
+  } catch (err) {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_ITEMS_INCOMPLETE,
+      `Failed to hydrate thread '${threadId}' for completed turn: ${err.message}`,
+      { threadId: String(threadId).slice(0, 64), turnId: String(turnId).slice(0, 64) }
+    );
+  }
+
+  const returnedThreadId = readRes?.thread?.id || readRes?.threadId || readRes?.id;
+  if (returnedThreadId !== threadId) {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH,
+      `Hydrated threadId mismatch: expected '${threadId}', got '${returnedThreadId}'`,
+      { field: 'auditor_thread_id' }
+    );
+  }
+
+  const turns = readRes?.thread && Array.isArray(readRes.thread.turns)
+    ? readRes.thread.turns
+    : (Array.isArray(readRes?.turns) ? readRes.turns : []);
+
+  // Locate exactly one turn whose id === turnId (do not select first/latest/last turn)
+  const matchingTurns = turns.filter(t => t && t.id === turnId);
+  if (matchingTurns.length === 0) {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED,
+      `Hydration failed: turn '${turnId}' not found in thread '${threadId}'`,
+      { turnId: String(turnId).slice(0, 64) }
+    );
+  }
+  if (matchingTurns.length > 1) {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_OUTPUT_AMBIGUOUS,
+      `Hydration failed: multiple turns with id '${turnId}' found in thread '${threadId}'`,
+      { turnId: String(turnId).slice(0, 64) }
+    );
+  }
+
+  const hydratedTurn = matchingTurns[0];
+  if (hydratedTurn.status !== 'completed') {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED,
+      `Hydrated turn '${turnId}' has status '${hydratedTurn.status}'; only status=completed provides decision authority`,
+      { status: hydratedTurn.status ? String(hydratedTurn.status).slice(0, 32) : 'unknown', turnId: String(turnId).slice(0, 64) }
+    );
+  }
+
+  if (hydratedTurn.itemsView !== 'full') {
+    throw createAuditDecisionError(
+      ERROR_CODES.AUDIT_DECISION_ITEMS_INCOMPLETE,
+      `Hydrated turn '${turnId}' itemsView is '${hydratedTurn.itemsView}'; requires itemsView=full for decision authority`,
+      { itemsView: hydratedTurn.itemsView ? String(hydratedTurn.itemsView).slice(0, 32) : 'unknown', turnId: String(turnId).slice(0, 64) }
+    );
+  }
+
+  return extractAuditDecisionV1FromTurn(hydratedTurn, expectedContext);
 }
 
 module.exports = {

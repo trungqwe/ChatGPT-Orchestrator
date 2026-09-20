@@ -1,10 +1,10 @@
 'use strict';
 
 /**
- * Auditor Recovery Store Test Suite (ARS-001 .. ARS-051)
+ * Auditor Recovery Store Test Suite (ARS-001 .. ARS-078)
  * Verifies SQLite recovery store authority, single active bootstrap,
  * transition matrix, append-only history, decision hash & schema verification,
- * reopen semantics, and fail-closed corruption detection.
+ * reopen semantics, schema v2 immutable authority, and legacy retirement.
  */
 
 const assert = require('assert');
@@ -16,8 +16,27 @@ const crypto = require('crypto');
 const {
   AUDITOR_BOOTSTRAP_STATES,
   RECOVERY_ERROR_CODES,
-  createSqliteAuditorRecoveryStore
+  createSqliteAuditorRecoveryStore: createSqliteAuditorRecoveryStoreRaw
 } = require('../../lib/relay/sqlite-auditor-recovery-store');
+
+function createSqliteAuditorRecoveryStore(options) {
+  const store = createSqliteAuditorRecoveryStoreRaw(options);
+  const rawBeginBootstrap = store.beginBootstrap.bind(store);
+  store.beginBootstrap = function (bootstrapOptions) {
+    if (!bootstrapOptions || typeof bootstrapOptions !== 'object') {
+      return rawBeginBootstrap(bootstrapOptions);
+    }
+    const defaulted = {
+      authority_version: 1,
+      expected_project_root: 'd:/TU_CODE/Orchestrator',
+      expected_project_root_identity: 'd:/tu_code/orchestrator',
+      expected_auditor_model_policy: 'strict-read-only',
+      ...bootstrapOptions
+    };
+    return rawBeginBootstrap(defaulted);
+  };
+  return store;
+}
 
 const {
   AUDIT_DECISIONS,
@@ -2000,8 +2019,570 @@ async function runTests() {
     }
   }
 
+  // =========================================================================
+  // CATEGORY 15: SCHEMA V2 IMMUTABLE BOOTSTRAP AUTHORITY & LEGACY RETIREMENT (ARS-062 .. ARS-078)
+  // =========================================================================
+
+  // ARS-062: Fresh DB created directly as schema v2 with 4 new columns and user_version = 2
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      store.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      const userVersion = rawDb.prepare('PRAGMA user_version;').get().user_version;
+      assert.strictEqual(userVersion, 2);
+
+      const cols = rawDb.prepare("PRAGMA table_info('auditor_bootstrap');").all().map(c => c.name);
+      assert.ok(cols.includes('authority_version'));
+      assert.ok(cols.includes('expected_project_root'));
+      assert.ok(cols.includes('expected_project_root_identity'));
+      assert.ok(cols.includes('expected_auditor_model_policy'));
+      rawDb.close();
+
+      console.log('PASS: ARS-062 — Fresh DB created directly as schema v2 with 4 new columns and user_version = 2');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // Helper to create a genuine V1 database with pre-migration data
+  function createGenuineV1Database(dbPath, { withRow = true, state = 'DECISION_VALIDATED', corrupt = null } = {}) {
+    const { DatabaseSync } = require('node:sqlite');
+    const rawDb = new DatabaseSync(dbPath);
+    rawDb.exec(`
+      CREATE TABLE auditor_bootstrap (
+        project_id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL UNIQUE,
+        audit_subject_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT,
+        workspace_state_observed TEXT NOT NULL,
+        state TEXT NOT NULL,
+        decision_json TEXT,
+        decision_sha256 TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE auditor_bootstrap_history (
+        history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        previous_state TEXT,
+        next_state TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        iso TEXT NOT NULL,
+        metadata TEXT
+      );
+      CREATE UNIQUE INDEX idx_auditor_bootstrap_op
+        ON auditor_bootstrap(operation_id);
+      CREATE INDEX idx_auditor_history_project
+        ON auditor_bootstrap_history(project_id);
+      CREATE INDEX idx_auditor_history_op
+        ON auditor_bootstrap_history(operation_id);
+      PRAGMA user_version = 1;
+    `);
+
+    if (corrupt === 'rogue_col') {
+      rawDb.exec('ALTER TABLE auditor_bootstrap ADD COLUMN rogue TEXT;');
+    }
+
+    if (withRow) {
+      const ctx = {
+        project_id: 'proj-legacy-01',
+        audit_subject_id: 'subj-legacy-01',
+        auditor_thread_id: 'thr-legacy-01',
+        workspace_state_observed: 'ws-legacy-01'
+      };
+      const d = makeValidDecision(ctx);
+      const dJson = JSON.stringify(d);
+      const dHash = crypto.createHash('sha256').update(dJson, 'utf8').digest('hex');
+      const nowIso = new Date().toISOString();
+
+      rawDb.prepare(`
+        INSERT INTO auditor_bootstrap (
+          project_id, operation_id, audit_subject_id, thread_id, turn_id,
+          workspace_state_observed, state, decision_json, decision_sha256,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'proj-legacy-01', 'op-legacy-01', 'subj-legacy-01', 'thr-legacy-01', 'turn-legacy-01',
+        'ws-legacy-01', state, dJson, dHash,
+        nowIso, nowIso
+      );
+
+      rawDb.prepare(`
+        INSERT INTO auditor_bootstrap_history (
+          project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run('proj-legacy-01', 'op-legacy-01', null, 'PROVISIONAL_THREAD', 1700000000000, nowIso, null);
+
+      if (corrupt === 'broken_history') {
+        rawDb.prepare(`
+          INSERT INTO auditor_bootstrap_history (
+            project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run('proj-legacy-01', 'op-legacy-01', 'RESUME_VERIFIED', state, 1700000001000, nowIso, null);
+      } else {
+        rawDb.prepare(`
+          INSERT INTO auditor_bootstrap_history (
+            project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run('proj-legacy-01', 'op-legacy-01', 'PROVISIONAL_THREAD', 'FIRST_TURN_STARTING', 1700000000100, nowIso, null);
+
+        rawDb.prepare(`
+          INSERT INTO auditor_bootstrap_history (
+            project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run('proj-legacy-01', 'op-legacy-01', 'FIRST_TURN_STARTING', 'FIRST_TURN_IN_FLIGHT', 1700000000200, nowIso, null);
+
+        rawDb.prepare(`
+          INSERT INTO auditor_bootstrap_history (
+            project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run('proj-legacy-01', 'op-legacy-01', 'FIRST_TURN_IN_FLIGHT', state, 1700000001000, nowIso, null);
+      }
+    }
+    rawDb.close();
+  }
+
+  // ARS-063: Valid v1 DB migrates transactionally to v2 on store open
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      assert.ok(store);
+      store.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 2);
+      rawDb.close();
+
+      console.log('PASS: ARS-063 — Valid v1 DB migrates transactionally to v2 on store open');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-064: Migrated v1 active rows have authority_version = 0 and authority fields null
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      const active = store.getActiveBootstrap('proj-legacy-01');
+      assert.strictEqual(active.authority_version, 0);
+      assert.strictEqual(active.expected_project_root, null);
+      assert.strictEqual(active.expected_project_root_identity, null);
+      assert.strictEqual(active.expected_auditor_model_policy, null);
+      store.close();
+
+      console.log('PASS: ARS-064 — Migrated v1 active rows have authority_version = 0 and null authority fields');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-065: Decision JSON, hash, state, and history preserved byte-semantically across migration
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      const active = store.getActiveBootstrap('proj-legacy-01');
+      assert.strictEqual(active.state, 'DECISION_VALIDATED');
+      assert.strictEqual(active.turn_id, 'turn-legacy-01');
+      assert.ok(active.decision_json.includes('Decision verified cleanly for worker dispatch.'));
+      assert.strictEqual(active.decision_sha256, crypto.createHash('sha256').update(active.decision_json, 'utf8').digest('hex'));
+
+      const hist = store.getHistory('proj-legacy-01', 'op-legacy-01');
+      assert.strictEqual(hist.length, 4);
+      assert.strictEqual(hist[3].next_state, 'DECISION_VALIDATED');
+      store.close();
+
+      console.log('PASS: ARS-065 — Decision JSON, hash, state, and history preserved byte-semantically across migration');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-066: Pre-migration validation: corrupt v1 schema fails closed before migration (user_version remains 1)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath, { corrupt: 'rogue_col' });
+      assert.throws(
+        () => createSqliteAuditorRecoveryStoreRaw({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID }
+      );
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 1);
+      rawDb.close();
+
+      console.log('PASS: ARS-066 — Corrupt v1 schema fails closed before migration; user_version remains 1');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-067: Pre-migration validation: broken v1 history chain fails closed before migration
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath, { corrupt: 'broken_history' });
+      assert.throws(
+        () => createSqliteAuditorRecoveryStoreRaw({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 1);
+      rawDb.close();
+
+      console.log('PASS: ARS-067 — Broken v1 history chain fails closed before migration');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-068: New beginBootstrap requires authority_version = 1 and non-empty authority fields
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      const row = store.beginBootstrap({
+        project_id: 'p-v2',
+        operation_id: 'op-v2',
+        audit_subject_id: 'sub-v2',
+        thread_id: 'thr-v2',
+        workspace_state_observed: 'ws-v2',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+      assert.strictEqual(row.authority_version, 1);
+      assert.strictEqual(row.expected_project_root, 'd:/TU_CODE/Orchestrator');
+      assert.strictEqual(row.expected_project_root_identity, 'd:/tu_code/orchestrator');
+      assert.strictEqual(row.expected_auditor_model_policy, 'strict-read-only');
+      store.close();
+
+      console.log('PASS: ARS-068 — New beginBootstrap requires authority_version = 1 and persists authority fields');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-069: Reopen validates authority_version = 1 and non-empty authority fields
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      store1.beginBootstrap({
+        project_id: 'p-v2',
+        operation_id: 'op-v2',
+        audit_subject_id: 'sub-v2',
+        thread_id: 'thr-v2',
+        workspace_state_observed: 'ws-v2',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+      store1.close();
+
+      const store2 = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      const active = store2.getActiveBootstrap('p-v2');
+      assert.strictEqual(active.authority_version, 1);
+      assert.strictEqual(active.expected_project_root, 'd:/TU_CODE/Orchestrator');
+      store2.close();
+
+      console.log('PASS: ARS-069 — Reopen validates authority_version = 1 and non-empty authority fields');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-070: Reject authority_version = 1 with null/empty root / identity / policy
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      // Missing expected_project_root
+      assert.throws(
+        () => store.beginBootstrap({
+          project_id: 'p-v2',
+          operation_id: 'op-v2',
+          audit_subject_id: 'sub-v2',
+          thread_id: 'thr-v2',
+          workspace_state_observed: 'ws-v2',
+          authority_version: 1,
+          expected_project_root: '',
+          expected_project_root_identity: 'd:/tu_code/orchestrator',
+          expected_auditor_model_policy: 'strict-read-only'
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      // Missing expected_project_root_identity
+      assert.throws(
+        () => store.beginBootstrap({
+          project_id: 'p-v2',
+          operation_id: 'op-v2',
+          audit_subject_id: 'sub-v2',
+          thread_id: 'thr-v2',
+          workspace_state_observed: 'ws-v2',
+          authority_version: 1,
+          expected_project_root: 'd:/TU_CODE/Orchestrator',
+          expected_project_root_identity: null,
+          expected_auditor_model_policy: 'strict-read-only'
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-070 — Reject authority_version = 1 with null/empty authority fields');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-071: Reject authority_version = 0 for new beginBootstrap
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      assert.throws(
+        () => store.beginBootstrap({
+          project_id: 'p-v2',
+          operation_id: 'op-v2',
+          audit_subject_id: 'sub-v2',
+          thread_id: 'thr-v2',
+          workspace_state_observed: 'ws-v2',
+          authority_version: 0,
+          expected_project_root: null,
+          expected_project_root_identity: null,
+          expected_auditor_model_policy: null
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-071 — Reject authority_version = 0 for new beginBootstrap');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-072: Reject invalid authority_version (< 0 or > 1)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      for (const badVer of [-1, 2, 99, '1', null, undefined]) {
+        assert.throws(
+          () => store.beginBootstrap({
+            project_id: 'p-v2',
+            operation_id: 'op-v2',
+            audit_subject_id: 'sub-v2',
+            thread_id: 'thr-v2',
+            workspace_state_observed: 'ws-v2',
+            authority_version: badVer,
+            expected_project_root: 'd:/TU_CODE/Orchestrator',
+            expected_project_root_identity: 'd:/tu_code/orchestrator',
+            expected_auditor_model_policy: 'strict-read-only'
+          }),
+          { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+        );
+      }
+      store.close();
+      console.log('PASS: ARS-072 — Reject invalid authority_version (< 0 or > 1 or non-integer)');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-073: Immutable authority fields cannot be patched by transitionState
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      store.beginBootstrap({
+        project_id: 'p-v2',
+        operation_id: 'op-v2',
+        audit_subject_id: 'sub-v2',
+        thread_id: 'thr-v2',
+        workspace_state_observed: 'ws-v2',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'p-v2',
+          operation_id: 'op-v2',
+          next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING,
+          patch: { expected_project_root: '/new/root' }
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'p-v2',
+          operation_id: 'op-v2',
+          next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING,
+          patch: { authority_version: 2 }
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-073 — Immutable authority fields cannot be patched by transitionState');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-074: retireLegacyBootstrap succeeds for authority_version = 0 and performs atomic history insert + active row deletion
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      const res = store.retireLegacyBootstrap('proj-legacy-01', 'op-legacy-01', { reason: 'test_retire' });
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.status, 'RETIRED_LEGACY_AUTHORITY_UNAVAILABLE');
+
+      assert.strictEqual(store.getActiveBootstrap('proj-legacy-01'), null);
+
+      const hist = store.getHistory('proj-legacy-01', 'op-legacy-01');
+      const lastHist = hist[hist.length - 1];
+      assert.strictEqual(lastHist.previous_state, 'DECISION_VALIDATED');
+      assert.strictEqual(lastHist.next_state, 'LEGACY_AUTHORITY_RETIRED');
+      store.close();
+
+      console.log('PASS: ARS-074 — retireLegacyBootstrap succeeds for authority_version = 0');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-075: retireLegacyBootstrap rejects authority_version = 1
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      store.beginBootstrap({
+        project_id: 'p-v2',
+        operation_id: 'op-v2',
+        audit_subject_id: 'sub-v2',
+        thread_id: 'thr-v2',
+        workspace_state_observed: 'ws-v2',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+
+      assert.throws(
+        () => store.retireLegacyBootstrap('p-v2', 'op-v2'),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      assert.ok(store.getActiveBootstrap('p-v2') !== null);
+      store.close();
+      console.log('PASS: ARS-075 — retireLegacyBootstrap rejects authority_version = 1');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-076: Generic transitionState cannot transition to LEGACY_AUTHORITY_RETIRED
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      store.beginBootstrap({
+        project_id: 'p-v2',
+        operation_id: 'op-v2',
+        audit_subject_id: 'sub-v2',
+        thread_id: 'thr-v2',
+        workspace_state_observed: 'ws-v2',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'p-v2',
+          operation_id: 'op-v2',
+          next_state: 'LEGACY_AUTHORITY_RETIRED'
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_TRANSITION }
+      );
+      store.close();
+      console.log('PASS: ARS-076 — Generic transitionState cannot transition to LEGACY_AUTHORITY_RETIRED');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-077: LEGACY_AUTHORITY_RETIRED cannot be followed by any subsequent transition
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      store.retireLegacyBootstrap('proj-legacy-01', 'op-legacy-01');
+      store.close();
+
+      // Corrupt history with an illegal transition after LEGACY_AUTHORITY_RETIRED
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.prepare(`
+        INSERT INTO auditor_bootstrap_history (
+          project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run('proj-legacy-01', 'op-legacy-01', 'LEGACY_AUTHORITY_RETIRED', 'PROVISIONAL_THREAD', 1700000002000, new Date().toISOString(), null);
+      rawDb.close();
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStoreRaw({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+      console.log('PASS: ARS-077 — LEGACY_AUTHORITY_RETIRED cannot be followed by subsequent transitions');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-078: retireLegacyBootstrap with operation_id mismatch fails closed and rolls back
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      assert.throws(
+        () => store.retireLegacyBootstrap('proj-legacy-01', 'wrong-op'),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT }
+      );
+      // Active row must still be present
+      assert.ok(store.getActiveBootstrap('proj-legacy-01') !== null);
+      store.close();
+      console.log('PASS: ARS-078 — retireLegacyBootstrap with operation_id mismatch fails closed');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-061: 61/61 PASS)');
+  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-078: 78/78 PASS)');
   console.log('======================================================================\n');
 }
 

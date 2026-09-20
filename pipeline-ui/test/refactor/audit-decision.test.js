@@ -1,9 +1,10 @@
 'use strict';
 
 /**
- * AuditDecisionV1 Test Suite (AD-001 .. AD-110)
+ * AuditDecisionV1 Test Suite (AD-001 .. AD-122)
  * Verifies strict schema validation, duplicate key detection, exact context binding,
- * branch semantics, terminal turn snapshot extraction, and fake adapter integration.
+ * branch semantics, terminal turn snapshot extraction, completed-turn full-view hydration,
+ * and fake adapter integration.
  */
 
 const assert = require('assert');
@@ -1856,8 +1857,348 @@ async function runTests() {
     console.log('PASS: AD-110 — Getter on expectedContext authority field rejected without invocation');
   }
 
+  // AD-111: Completed turn already with itemsView === 'full' uses fast path and calls zero readThread
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const fullTurn = {
+      id: 'turn-fast-01',
+      status: 'completed',
+      itemsView: 'full',
+      items: [
+        { type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(d) }
+      ]
+    };
+    let readThreadCalled = 0;
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({ status: 'completed', turn: fullTurn }),
+      readThread: async () => { readThreadCalled++; return { thread: { id: ctx.auditor_thread_id, turns: [fullTurn] } }; }
+    };
+    const res = await awaitAuditDecisionV1(fakeAdapter, {
+      threadId: ctx.auditor_thread_id,
+      turnId: 'turn-fast-01',
+      expectedContext: ctx
+    });
+    assert.strictEqual(res.decision, AUDIT_DECISIONS.DISPATCH_WORKER);
+    assert.strictEqual(readThreadCalled, 0, 'Fast path must perform zero readThread calls');
+    console.log('PASS: AD-111 — Completed turn already full uses fast path with zero readThread calls');
+  }
+
+  // AD-112: Incomplete completed notification (itemsView != full) hydrates via readThread
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const fullTurn = {
+      id: 'turn-hyd-01',
+      status: 'completed',
+      itemsView: 'full',
+      items: [
+        { type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(d) }
+      ]
+    };
+    let readThreadCalls = 0;
+    let readParams = null;
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-01', status: 'completed', itemsView: 'incomplete' }
+      }),
+      readThread: async (params) => {
+        readThreadCalls++;
+        readParams = params;
+        return { thread: { id: ctx.auditor_thread_id, turns: [fullTurn] } };
+      }
+    };
+    const res = await awaitAuditDecisionV1(fakeAdapter, {
+      threadId: ctx.auditor_thread_id,
+      turnId: 'turn-hyd-01',
+      expectedContext: ctx
+    });
+    assert.strictEqual(res.decision, AUDIT_DECISIONS.DISPATCH_WORKER);
+    assert.strictEqual(readThreadCalls, 1, 'Hydration must perform exactly one readThread call');
+    assert.deepStrictEqual(readParams, { threadId: ctx.auditor_thread_id, includeTurns: true });
+    console.log('PASS: AD-112 — Incomplete completed notification hydrates via single readThread');
+  }
+
+  // AD-113: Incomplete completed notification when adapter lacks readThread throws AUDIT_DECISION_ITEMS_INCOMPLETE
+  {
+    const ctx = makeContext();
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-02', status: 'completed', itemsView: 'incomplete' }
+      })
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-hyd-02',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_ITEMS_INCOMPLETE }
+    );
+    console.log('PASS: AD-113 — Incomplete turn without adapter.readThread rejected with AUDIT_DECISION_ITEMS_INCOMPLETE');
+  }
+
+  // AD-114: Hydration failure in readThread throws AUDIT_DECISION_ITEMS_INCOMPLETE
+  {
+    const ctx = makeContext();
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-03', status: 'completed', itemsView: 'incomplete' }
+      }),
+      readThread: async () => {
+        throw new Error('Network timeout reading thread');
+      }
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-hyd-03',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_ITEMS_INCOMPLETE }
+    );
+    console.log('PASS: AD-114 — Hydration readThread failure throws AUDIT_DECISION_ITEMS_INCOMPLETE');
+  }
+
+  // AD-115: Hydrated threadId mismatch throws AUDIT_DECISION_CONTEXT_MISMATCH
+  {
+    const ctx = makeContext();
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-04', status: 'completed', itemsView: 'incomplete' }
+      }),
+      readThread: async () => ({
+        thread: { id: 'wrong-thread-id', turns: [] }
+      })
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-hyd-04',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_CONTEXT_MISMATCH }
+    );
+    console.log('PASS: AD-115 — Hydrated threadId mismatch throws AUDIT_DECISION_CONTEXT_MISMATCH');
+  }
+
+  // AD-116: Hydration when matching turnId is not found throws AUDIT_DECISION_TURN_NOT_COMPLETED
+  {
+    const ctx = makeContext();
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-05', status: 'completed', itemsView: 'incomplete' }
+      }),
+      readThread: async () => ({
+        thread: { id: ctx.auditor_thread_id, turns: [{ id: 'other-turn-id', status: 'completed', itemsView: 'full' }] }
+      })
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-hyd-05',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED }
+    );
+    console.log('PASS: AD-116 — Turn ID not found in hydrated thread throws AUDIT_DECISION_TURN_NOT_COMPLETED');
+  }
+
+  // AD-117: Hydration when multiple turns match turnId throws AUDIT_DECISION_OUTPUT_AMBIGUOUS
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const t = { id: 'turn-hyd-06', status: 'completed', itemsView: 'full', items: [{ type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(d) }] };
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-06', status: 'completed', itemsView: 'incomplete' }
+      }),
+      readThread: async () => ({
+        thread: { id: ctx.auditor_thread_id, turns: [t, t] }
+      })
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-hyd-06',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_OUTPUT_AMBIGUOUS }
+    );
+    console.log('PASS: AD-117 — Multiple turns matching turnId throws AUDIT_DECISION_OUTPUT_AMBIGUOUS');
+  }
+
+  // AD-118: Hydrated turn with status !== 'completed' throws AUDIT_DECISION_TURN_NOT_COMPLETED
+  {
+    const ctx = makeContext();
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-07', status: 'completed', itemsView: 'incomplete' }
+      }),
+      readThread: async () => ({
+        thread: {
+          id: ctx.auditor_thread_id,
+          turns: [{ id: 'turn-hyd-07', status: 'in_progress', itemsView: 'full' }]
+        }
+      })
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-hyd-07',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED }
+    );
+    console.log('PASS: AD-118 — Hydrated turn with status != completed throws AUDIT_DECISION_TURN_NOT_COMPLETED');
+  }
+
+  // AD-119: Hydrated turn with itemsView !== 'full' throws AUDIT_DECISION_ITEMS_INCOMPLETE
+  {
+    const ctx = makeContext();
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-hyd-08', status: 'completed', itemsView: 'incomplete' }
+      }),
+      readThread: async () => ({
+        thread: {
+          id: ctx.auditor_thread_id,
+          turns: [{ id: 'turn-hyd-08', status: 'completed', itemsView: 'shallow' }]
+        }
+      })
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-hyd-08',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_ITEMS_INCOMPLETE }
+    );
+    console.log('PASS: AD-119 — Hydrated turn with itemsView != full throws AUDIT_DECISION_ITEMS_INCOMPLETE');
+  }
+
+  // AD-120: Interrupted and failed turn completions never hydrate and retain zero decision authority
+  {
+    const ctx = makeContext();
+    let readThreadCount = 0;
+    const fakeInterruptedAdapter = {
+      waitForTurnCompletion: async () => ({ status: 'interrupted', turn: null }),
+      readThread: async () => { readThreadCount++; return {}; }
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeInterruptedAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-int-01',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED }
+    );
+    assert.strictEqual(readThreadCount, 0, 'Interrupted turn must perform zero readThread calls');
+
+    const fakeFailedAdapter = {
+      waitForTurnCompletion: async () => {
+        const err = new Error('Turn execution failed');
+        err.code = 'TURN_FAILED';
+        throw err;
+      },
+      readThread: async () => { readThreadCount++; return {}; }
+    };
+    await assert.rejects(
+      async () => awaitAuditDecisionV1(fakeFailedAdapter, {
+        threadId: ctx.auditor_thread_id,
+        turnId: 'turn-fail-01',
+        expectedContext: ctx
+      }),
+      { code: ERROR_CODES.AUDIT_DECISION_TURN_NOT_COMPLETED }
+    );
+    assert.strictEqual(readThreadCount, 0, 'Failed turn must perform zero readThread calls');
+    console.log('PASS: AD-120 — Interrupted and failed turns never hydrate; retain zero decision authority');
+  }
+
+  // AD-121: Hydration is strictly read-only and consumes zero model turns
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const fullTurn = {
+      id: 'turn-ro-01',
+      status: 'completed',
+      itemsView: 'full',
+      items: [
+        { type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(d) }
+      ]
+    };
+    const calls = { startThread: 0, startTurn: 0, interruptTurn: 0, startReview: 0, readThread: 0 };
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-ro-01', status: 'completed', itemsView: 'shallow' }
+      }),
+      startThread: async () => { calls.startThread++; },
+      startTurn: async () => { calls.startTurn++; },
+      interruptTurn: async () => { calls.interruptTurn++; },
+      startReview: async () => { calls.startReview++; },
+      readThread: async () => {
+        calls.readThread++;
+        return { thread: { id: ctx.auditor_thread_id, turns: [fullTurn] } };
+      }
+    };
+    const res = await awaitAuditDecisionV1(fakeAdapter, {
+      threadId: ctx.auditor_thread_id,
+      turnId: 'turn-ro-01',
+      expectedContext: ctx
+    });
+    assert.strictEqual(res.decision, AUDIT_DECISIONS.DISPATCH_WORKER);
+    assert.strictEqual(calls.startThread, 0);
+    assert.strictEqual(calls.startTurn, 0);
+    assert.strictEqual(calls.interruptTurn, 0);
+    assert.strictEqual(calls.startReview, 0);
+    assert.strictEqual(calls.readThread, 1);
+    console.log('PASS: AD-121 — Hydration is strictly read-only and consumes zero model turns');
+  }
+
+  // AD-122: Historical turns allowed in hydrated thread; exact target turn located
+  {
+    const ctx = makeContext();
+    const d = makeValidDecision();
+    const historicalTurn1 = { id: 'hist-01', status: 'completed', itemsView: 'full', items: [] };
+    const targetTurn = {
+      id: 'turn-target-99',
+      status: 'completed',
+      itemsView: 'full',
+      items: [
+        { type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(d) }
+      ]
+    };
+    const historicalTurn2 = { id: 'hist-02', status: 'completed', itemsView: 'full', items: [] };
+    const fakeAdapter = {
+      waitForTurnCompletion: async () => ({
+        status: 'completed',
+        turn: { id: 'turn-target-99', status: 'completed', itemsView: 'shallow' }
+      }),
+      readThread: async () => ({
+        thread: { id: ctx.auditor_thread_id, turns: [historicalTurn1, targetTurn, historicalTurn2] }
+      })
+    };
+    const res = await awaitAuditDecisionV1(fakeAdapter, {
+      threadId: ctx.auditor_thread_id,
+      turnId: 'turn-target-99',
+      expectedContext: ctx
+    });
+    assert.strictEqual(res.decision, AUDIT_DECISIONS.DISPATCH_WORKER);
+    console.log('PASS: AD-122 — Historical turns allowed in hydrated thread; exact target turn located');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITDECISION TESTS PASSED (AD-001 .. AD-110: 110/110 PASS)');
+  console.log('ALL AUDITDECISION TESTS PASSED (AD-001 .. AD-122: 122/122 PASS)');
   console.log('======================================================================\n');
 }
 
