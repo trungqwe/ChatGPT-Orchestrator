@@ -24,6 +24,12 @@ const THREAD_SANDBOX_MODES = Object.freeze({
 
 const MAX_INPUT_TEXT_BYTES = 1024 * 1024; // 1 MiB
 const MAX_OUTPUT_SCHEMA_BYTES = 512 * 1024; // 512 KiB
+const CONTROL_CHAR_REGEX = /[\x00-\x1f\x7f]/;
+const MAX_MODEL_LIST_PAGES = 50;
+const MAX_MODEL_CATALOG_ENTRIES = 1000;
+const MAX_CURSOR_BYTES = 512;
+const MAX_MODEL_IDENTIFIER_BYTES = 256;
+const MAX_EFFORT_BYTES = 64;
 
 /**
  * Deep detach helper to prevent mutation of internal state or provider objects.
@@ -145,27 +151,123 @@ class CodexAuditorAdapter {
   }
 
   /**
-   * List available models from App Server.
-   * Does NOT perform model tier resolution (reserved for WP-V4-06).
+   * List available models from App Server with pagination support (WP-V4-06A).
+   * Consumes complete visible catalog with bounded pages and entry limits.
+   * @param {Object} [options]
+   * @param {boolean} [options.includeHidden=false]
+   * @param {number} [options.limit=100]
    * @returns {Promise<Object[]>}
    */
-  async listModels() {
-    const result = await this._client.sendRequest('model/list', {}, {
-      isSideEffecting: false
-    });
+  async listModels(options = {}) {
+    const includeHidden = options.includeHidden === true;
+    const pageLimit = (typeof options.limit === 'number' && options.limit > 0 && options.limit <= 100)
+      ? options.limit
+      : 100;
 
-    if (!result || typeof result !== 'object') {
+    const allModels = [];
+    const seenCursors = new Set();
+    let currentCursor = null;
+    let pageCount = 0;
+
+    while (pageCount < MAX_MODEL_LIST_PAGES) {
+      pageCount++;
+      const requestParams = {
+        includeHidden,
+        limit: pageLimit
+      };
+      if (currentCursor !== null) {
+        requestParams.cursor = currentCursor;
+      }
+
+      const result = await this._client.sendRequest('model/list', requestParams, {
+        isSideEffecting: false
+      });
+
+      if (!result || typeof result !== 'object') {
+        throw createError(
+          'CODEX_APP_SERVER_INVALID_RESPONSE',
+          'model/list response must be a JSON object'
+        );
+      }
+
+      let pageModels;
+      let hasNextCursorField = false;
+      let nextCursor = null;
+
+      if (Array.isArray(result.data)) {
+        pageModels = result.data;
+        if ('nextCursor' in result) {
+          hasNextCursorField = true;
+          nextCursor = result.nextCursor;
+        }
+      } else if (Array.isArray(result.models)) {
+        pageModels = result.models;
+        if ('nextCursor' in result) {
+          hasNextCursorField = true;
+          nextCursor = result.nextCursor;
+        }
+      } else {
+        throw createError(
+          'CODEX_APP_SERVER_INVALID_RESPONSE',
+          'model/list response missing array catalog property (data or models)'
+        );
+      }
+
+      for (const item of pageModels) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          throw createError(
+            'CODEX_APP_SERVER_INVALID_RESPONSE',
+            'model/list catalog entry must be an object'
+          );
+        }
+        allModels.push(item);
+        if (allModels.length > MAX_MODEL_CATALOG_ENTRIES) {
+          throw createError(
+            'CODEX_APP_SERVER_INVALID_RESPONSE',
+            `model/list catalog exceeded maximum bound (${MAX_MODEL_CATALOG_ENTRIES} entries)`
+          );
+        }
+      }
+
+      // Check nextCursor validity
+      if (!hasNextCursorField || nextCursor === null || nextCursor === undefined) {
+        // Single page or terminal page reached
+        break;
+      }
+
+      if (typeof nextCursor !== 'string' || nextCursor.trim().length === 0) {
+        throw createError(
+          'CODEX_APP_SERVER_INVALID_RESPONSE',
+          'model/list nextCursor must be a non-empty string or null'
+        );
+      }
+
+      if (Buffer.byteLength(nextCursor, 'utf8') > MAX_CURSOR_BYTES) {
+        throw createError(
+          'CODEX_APP_SERVER_INVALID_RESPONSE',
+          `model/list nextCursor exceeded maximum bound (${MAX_CURSOR_BYTES} bytes)`
+        );
+      }
+
+      if (seenCursors.has(nextCursor)) {
+        throw createError(
+          'CODEX_APP_SERVER_INVALID_RESPONSE',
+          `model/list detected repeated cursor or pagination cycle: '${nextCursor}'`
+        );
+      }
+
+      seenCursors.add(nextCursor);
+      currentCursor = nextCursor;
+    }
+
+    if (pageCount >= MAX_MODEL_LIST_PAGES && currentCursor !== null) {
       throw createError(
         'CODEX_APP_SERVER_INVALID_RESPONSE',
-        'model/list response must be a JSON object'
+        `model/list exceeded maximum page limit (${MAX_MODEL_LIST_PAGES} pages)`
       );
     }
 
-    const models = Array.isArray(result.models)
-      ? result.models
-      : (Array.isArray(result.data) ? result.data : []);
-
-    return deepDetach(models);
+    return deepDetach(allModels);
   }
 
   /**
@@ -319,11 +421,14 @@ class CodexAuditorAdapter {
   /**
    * Start turn on an existing thread.
    * Input is restricted to bounded text. Forward outputSchema if supplied.
+   * Optionally accepts model and effort pinning (WP-V4-06A).
    * Records local turn ownership (Section 12).
    * @param {Object} params
    * @param {string} params.threadId
    * @param {Array<{ type: string, text: string }>} params.input
    * @param {Object} [params.outputSchema]
+   * @param {string} [params.model]
+   * @param {string} [params.effort]
    * @returns {Promise<{ turnId: string, status: string, raw: Object }>}
    */
   async startTurn(params = {}) {
@@ -334,7 +439,7 @@ class CodexAuditorAdapter {
       );
     }
 
-    const { threadId, input, outputSchema } = params;
+    const { threadId, input, outputSchema, model, effort } = params;
 
     if (!Array.isArray(input) || input.length === 0) {
       throw createError(
@@ -364,6 +469,38 @@ class CodexAuditorAdapter {
       threadId,
       input
     };
+
+    if (model !== undefined) {
+      if (
+        typeof model !== 'string' ||
+        model.trim().length === 0 ||
+        model.trim() !== model ||
+        Buffer.byteLength(model, 'utf8') > MAX_MODEL_IDENTIFIER_BYTES ||
+        CONTROL_CHAR_REGEX.test(model)
+      ) {
+        throw createError(
+          'INVALID_ARGUMENT',
+          'model must be a bounded non-empty string without surrounding whitespace or control characters'
+        );
+      }
+      requestParams.model = model;
+    }
+
+    if (effort !== undefined) {
+      if (
+        typeof effort !== 'string' ||
+        effort.trim().length === 0 ||
+        effort.trim() !== effort ||
+        Buffer.byteLength(effort, 'utf8') > MAX_EFFORT_BYTES ||
+        CONTROL_CHAR_REGEX.test(effort)
+      ) {
+        throw createError(
+          'INVALID_ARGUMENT',
+          'effort must be a bounded non-empty string without surrounding whitespace or control characters'
+        );
+      }
+      requestParams.effort = effort;
+    }
 
     if (outputSchema !== undefined) {
       if (!outputSchema || typeof outputSchema !== 'object' || Array.isArray(outputSchema)) {

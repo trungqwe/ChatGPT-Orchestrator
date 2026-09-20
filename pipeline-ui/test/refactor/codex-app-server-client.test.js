@@ -1761,8 +1761,204 @@ async function runTests() {
     }
   }
 
+  // CAS-085: model/list data response accepted with complete structure
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const models = await adapter.listModels();
+      assert.strictEqual(Array.isArray(models), true);
+      assert.strictEqual(models.length >= 3, true);
+      assert.strictEqual(typeof models[0].model, 'string');
+      assert.strictEqual(Array.isArray(models[0].supportedReasoningEfforts), true);
+      console.log('PASS: CAS-085 — model/list data response accepted with complete structure');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-086 & CAS-087: pagination across 2+ pages and exact cursor forwarding
+  {
+    const adapter = createTestAdapter({
+      fixtureArgs: ['--scenario=model_list_pagination']
+    });
+    try {
+      await adapter.initialize();
+      const models = await adapter.listModels();
+      assert.strictEqual(Array.isArray(models), true);
+      assert.strictEqual(models.length, 2);
+      assert.strictEqual(models[0].id, 'mock-model-p1');
+      assert.strictEqual(models[1].id, 'mock-model-p2');
+      console.log('PASS: CAS-086 & CAS-087 — pagination across 2+ pages with exact cursor forwarding');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-088: repeated cursor rejected fail-closed
+  {
+    const adapter = createTestAdapter({
+      fixtureArgs: ['--scenario=model_list_repeated_cursor']
+    });
+    try {
+      await adapter.initialize();
+      let caught = null;
+      try {
+        await adapter.listModels();
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_INVALID_RESPONSE');
+      assert.strictEqual(caught.message.includes('repeated cursor or pagination cycle'), true);
+      console.log('PASS: CAS-088 — repeated cursor rejected fail-closed');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-089: malformed cursor rejected fail-closed
+  {
+    const adapter = createTestAdapter({
+      fixtureArgs: ['--scenario=model_list_malformed_cursor']
+    });
+    try {
+      await adapter.initialize();
+      let caught = null;
+      try {
+        await adapter.listModels();
+      } catch (err) {
+        caught = err;
+      }
+      assert.notStrictEqual(caught, null);
+      assert.strictEqual(caught.code, 'CODEX_APP_SERVER_INVALID_RESPONSE');
+      assert.strictEqual(caught.message.includes('nextCursor must be a non-empty string'), true);
+      console.log('PASS: CAS-089 — malformed cursor rejected fail-closed');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-090: catalog size bound enforced fail-closed
+  {
+    const mockClient = {
+      on: () => {},
+      sendRequest: async () => ({
+        data: new Array(1001).fill({
+          id: 'm',
+          model: 'm',
+          hidden: false,
+          isDefault: false,
+          defaultReasoningEffort: 'low',
+          supportedReasoningEfforts: []
+        })
+      })
+    };
+    const adapter = new CodexAuditorAdapter({ client: mockClient });
+    let caught = null;
+    try {
+      await adapter.listModels();
+    } catch (err) {
+      caught = err;
+    }
+    assert.notStrictEqual(caught, null);
+    assert.strictEqual(caught.code, 'CODEX_APP_SERVER_INVALID_RESPONSE');
+    assert.strictEqual(caught.message.includes('catalog exceeded maximum bound'), true);
+    console.log('PASS: CAS-090 — catalog size bound enforced fail-closed');
+  }
+
+  // CAS-091: startTurn forwards exact model
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const thread = await adapter.startThread({ cwd: 'D:\\test\\workspace' });
+      const turn = await adapter.startTurn({
+        threadId: thread.threadId,
+        input: [{ type: 'text', text: 'audit prompt' }],
+        model: 'mock-model-standard'
+      });
+      assert.strictEqual(turn.raw.turn.model, 'mock-model-standard');
+      console.log('PASS: CAS-091 — startTurn forwards exact model');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-092: startTurn forwards exact effort
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const thread = await adapter.startThread({ cwd: 'D:\\test\\workspace' });
+      const turn = await adapter.startTurn({
+        threadId: thread.threadId,
+        input: [{ type: 'text', text: 'audit prompt' }],
+        model: 'mock-model-standard',
+        effort: 'high'
+      });
+      assert.strictEqual(turn.raw.turn.model, 'mock-model-standard');
+      assert.strictEqual(turn.raw.turn.effort, 'high');
+      console.log('PASS: CAS-092 — startTurn forwards exact effort');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-093: invalid model rejected locally before transport
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const invalidModels = ['', '   ', 'model\nname', ' leading', 'trailing '];
+      for (const badModel of invalidModels) {
+        let caught = null;
+        try {
+          await adapter.startTurn({
+            threadId: 'thr_test',
+            input: [{ type: 'text', text: 'audit prompt' }],
+            model: badModel
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.notStrictEqual(caught, null);
+        assert.strictEqual(caught.code, 'INVALID_ARGUMENT');
+      }
+      console.log('PASS: CAS-093 — invalid model rejected locally before transport');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-094: invalid effort rejected locally before transport
+  {
+    const adapter = createTestAdapter();
+    try {
+      await adapter.initialize();
+      const invalidEfforts = ['', '   ', 'effort\x00name', ' low', 'medium '];
+      for (const badEffort of invalidEfforts) {
+        let caught = null;
+        try {
+          await adapter.startTurn({
+            threadId: 'thr_test',
+            input: [{ type: 'text', text: 'audit prompt' }],
+            effort: badEffort
+          });
+        } catch (err) {
+          caught = err;
+        }
+        assert.notStrictEqual(caught, null);
+        assert.strictEqual(caught.code, 'INVALID_ARGUMENT');
+      }
+      console.log('PASS: CAS-094 — invalid effort rejected locally before transport');
+    } finally {
+      await adapter.close();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-084: 84/84 PASS)');
+  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-094: 94/94 PASS)');
   console.log('======================================================================');
 }
 

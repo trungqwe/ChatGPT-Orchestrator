@@ -155,3 +155,20 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 116. **ATL-REC-03** (Corrupt Decision Authority Recovery): Phục hồi từ `DECISION_VALIDATED` nhưng thiếu turn_id/decision ném `AUDITOR_RECOVERY_CORRUPT` (ATL-058..ATL-060).
 117. **RG-BIND-06** (Mandatory expected_project_root & Runtime Drift): Thiếu expected root hoặc root bị thay đổi canonical identity trên filesystem bị từ chối với `AUDITOR_BINDING_PRECONDITION_FAILED` (RG-050..RG-054).
 
+## Model Policy Resolution & Catalog Authority Negative Matrix (WP-V4-06A: MPR-001..MPR-021, CAS-085..CAS-094, ATL-123..ATL-129)
+
+118. **MPR-POL-01** (Worker Policy Out of Scope Rejection): Truyền `worker_economy` hoặc `worker_standard` vào resolver ném lỗi `MODEL_POLICY_INVALID_REQUEST` fail-closed (MPR-009).
+119. **MPR-POL-02** (Unsupported Policy Rejection): Truyền policy không thuộc danh sách cho phép (`auditor_fast`, `auditor_standard`, `auditor_deep`, `architecture_deep`) ném `MODEL_POLICY_INVALID_REQUEST` (MPR-008).
+120. **MPR-CAT-01** (Catalog Entry Validation): Catalog không phải array, model entry không phải object, thiếu `id` hoặc `model`, hoặc `supportedReasoningEfforts` không phải array hợp lệ ném `MODEL_POLICY_CATALOG_INVALID` (MPR-012, MPR-013, MPR-014, MPR-015).
+121. **MPR-CAT-02** (Multiple Default Models Rejected): Nhiều hơn 1 model trong catalog có `isDefault === true` ném `MODEL_POLICY_CATALOG_INVALID` fail-closed do catalog không xác định rõ ràng model mặc định (MPR-004).
+122. **MPR-CAT-03** (Duplicate Model Selectors Rejected): Catalog có hai model trùng lặp trường `model` ném `MODEL_POLICY_CATALOG_INVALID` fail-closed thay vì phụ thuộc vào thứ tự duyệt (MPR-017).
+123. **MPR-UNAVAIL-01** (Empty Catalog or All Hidden): Catalog rỗng hoặc toàn bộ model đều có `hidden: true` ném `MODEL_POLICY_UNAVAILABLE` (MPR-010, MPR-011).
+124. **MPR-UNAVAIL-02** (Default Effort Not Advertised / Unsupported Effort): Default effort của model mặc định không nằm trong `supportedReasoningEfforts`, hoặc không có model nào hỗ trợ reasoning effort mong muốn ném `MODEL_POLICY_UNAVAILABLE` (MPR-016, MPR-018).
+125. **CAS-PAG-01** (Catalog Pagination Cycle & Repeated Cursor): Cursor lặp lại trong quá trình phân trang bị từ chối fail-closed với `CODEX_APP_SERVER_PROTOCOL_ERROR` (CAS-088).
+126. **CAS-PAG-02** (Malformed Cursor Rejection): `nextCursor` không phải string hoặc là chuỗi rỗng / chứa control characters ném `CODEX_APP_SERVER_PROTOCOL_ERROR` (CAS-089).
+127. **CAS-PAG-03** (Catalog Safety Bounds Enforcement): Số trang phân trang hoặc số lượng model vượt quá ngưỡng an toàn (`MAX_MODEL_LIST_PAGES`, `MAX_MODEL_CATALOG_ENTRIES`) bị ngắt với `CODEX_APP_SERVER_PROTOCOL_LIMIT` (CAS-090).
+128. **CAS-TURN-01** (Local Validation for Turn Model and Effort): `startTurn()` nhận model hoặc effort không phải non-empty string hoặc chứa control characters ném `CODEX_APP_SERVER_INVALID_REQUEST` tại client mà không gửi request sang server (CAS-093, CAS-094).
+129. **ATL-FAIL-01** (Catalog Failure Leaves Provisional State & 0 Turns): `model/list` thất bại trong bootstrap ném lỗi, không gọi `startTurn`, không ghi `FIRST_TURN_STARTING`, giữ trạng thái recovery ở `PROVISIONAL_THREAD`, và đóng client 1 (ATL-125).
+130. **ATL-FAIL-02** (Model Policy Unavailable Leaves Provisional State & 0 Turns): Resolver ném `MODEL_POLICY_UNAVAILABLE` giữ nguyên trạng thái recovery ở `PROVISIONAL_THREAD`, 0 turns, và Registry unbound (ATL-126).
+131. **ATL-ORDER-01** (Resolution Sequence Invariants): `model/list` bắt buộc xảy ra sau fresh Registry read (R3 gate) và trước khi chuyển sang `FIRST_TURN_STARTING` (ATL-123, ATL-124).
+132. **ATL-REC-04** (Zero Catalog Resolution During Recovery): `recoverAuditorBootstrap` và `resolveAuditorBootstrapUncertainty` tuyệt đối không gọi `model/list` (ATL-129).

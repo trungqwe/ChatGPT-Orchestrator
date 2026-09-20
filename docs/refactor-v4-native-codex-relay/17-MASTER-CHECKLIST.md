@@ -14,6 +14,6 @@
 - [x] Thread persistence & durable cross-process recovery core complete & sealed (WP-V4-05A / WO-V4-05AF: SQLite recovery store authority seal, strict patch envelope, history chain revalidation, physical integrity_check, exact schema validation, real workspacePort contract, mandatory auditPrompt/Subject, Registry root canonical revalidation, 51 ARS + 55 RG + 60 ATL tests pass).
 - [x] Explicit AUDIT_UNCERTAIN terminal-turn resolution, authority self-verification, and pre-turn Registry freshness gate complete (WP-V4-05AG / WO-V4-05AG-R1 / R2 / R3 / R3-R1: 82 ARS + 122 ATL tests pass).
 - [x] Real first audit acceptance complete (WP-V4-05B: WO-V4-05B-R9 real lifecycle acceptance, 1 real model turn, hydration, DURABLE_BOUND, cross-process resume verified; WP-V4-05 COMPLETE).
-- [ ] Model resolver complete (WP-V4-06).
+- [ ] Model resolver & token usage complete (WP-V4-06 IN_PROGRESS: WO-V4-06A resolved policy authority and first-turn pinning complete; WO-V4-06B token usage observability pending).
 - [ ] One-shot và shadow proven.
 - [ ] Legacy production path removed.

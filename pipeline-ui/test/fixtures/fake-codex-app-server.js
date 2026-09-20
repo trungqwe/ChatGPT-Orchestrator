@@ -252,14 +252,156 @@ rl.on('line', (line) => {
     }
 
     case 'model/list': {
+      if (scenario === 'model_list_pagination') {
+        if (!params.cursor) {
+          writeLine({
+            id,
+            result: {
+              data: [
+                {
+                  id: 'mock-model-p1',
+                  model: 'mock-model-p1',
+                  displayName: 'Mock Model P1',
+                  description: 'Page 1 mock model',
+                  hidden: false,
+                  isDefault: false,
+                  defaultReasoningEffort: 'low',
+                  supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Low' }]
+                }
+              ],
+              nextCursor: 'page_2_token'
+            }
+          });
+        } else if (params.cursor === 'page_2_token') {
+          writeLine({
+            id,
+            result: {
+              data: [
+                {
+                  id: 'mock-model-p2',
+                  model: 'mock-model-p2',
+                  displayName: 'Mock Model P2',
+                  description: 'Page 2 mock model',
+                  hidden: false,
+                  isDefault: true,
+                  defaultReasoningEffort: 'medium',
+                  supportedReasoningEfforts: [{ reasoningEffort: 'medium', description: 'Medium' }]
+                }
+              ],
+              nextCursor: null
+            }
+          });
+        } else {
+          writeLine({
+            id,
+            error: {
+              code: -32602,
+              message: `Unknown cursor: ${params.cursor}`
+            }
+          });
+        }
+        break;
+      }
+
+      if (scenario === 'model_list_repeated_cursor') {
+        writeLine({
+          id,
+          result: {
+            data: [
+              {
+                id: 'mock-model-loop',
+                model: 'mock-model-loop',
+                displayName: 'Mock Model Loop',
+                description: 'Loop mock model',
+                hidden: false,
+                isDefault: true,
+                defaultReasoningEffort: 'low',
+                supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Low' }]
+              }
+            ],
+            nextCursor: 'same_repeated_cursor'
+          }
+        });
+        break;
+      }
+
+      if (scenario === 'model_list_malformed_cursor') {
+        writeLine({
+          id,
+          result: {
+            data: [
+              {
+                id: 'mock-model-bad-cursor',
+                model: 'mock-model-bad-cursor',
+                displayName: 'Mock Model Bad Cursor',
+                description: 'Bad cursor mock model',
+                hidden: false,
+                isDefault: true,
+                defaultReasoningEffort: 'low',
+                supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Low' }]
+              }
+            ],
+            nextCursor: '   '
+          }
+        });
+        break;
+      }
+
+      const defaultModels = [
+        {
+          id: 'mock-model-fast',
+          model: 'mock-model-fast',
+          name: 'Mock Model Fast',
+          displayName: 'Mock Model Fast',
+          description: 'Fast mock model',
+          hidden: false,
+          isDefault: false,
+          defaultReasoningEffort: 'low',
+          supportedReasoningEfforts: [
+            { reasoningEffort: 'none', description: 'No reasoning' },
+            { reasoningEffort: 'minimal', description: 'Minimal reasoning' },
+            { reasoningEffort: 'low', description: 'Low reasoning' },
+            { reasoningEffort: 'medium', description: 'Medium reasoning' }
+          ]
+        },
+        {
+          id: 'mock-model-standard',
+          model: 'mock-model-standard',
+          name: 'Mock Model Standard',
+          displayName: 'Mock Model Standard',
+          description: 'Standard mock model',
+          hidden: false,
+          isDefault: true,
+          defaultReasoningEffort: 'medium',
+          supportedReasoningEfforts: [
+            { reasoningEffort: 'low', description: 'Low reasoning' },
+            { reasoningEffort: 'medium', description: 'Medium reasoning' },
+            { reasoningEffort: 'high', description: 'High reasoning' }
+          ]
+        },
+        {
+          id: 'mock-model-deep',
+          model: 'mock-model-deep',
+          name: 'Mock Model Deep',
+          displayName: 'Mock Model Deep',
+          description: 'Deep mock model',
+          hidden: false,
+          isDefault: false,
+          defaultReasoningEffort: 'high',
+          supportedReasoningEfforts: [
+            { reasoningEffort: 'medium', description: 'Medium reasoning' },
+            { reasoningEffort: 'high', description: 'High reasoning' },
+            { reasoningEffort: 'ultra', description: 'Ultra reasoning' }
+          ]
+        }
+      ];
+
       writeLine({
         id,
         result: {
-          models: [
-            { id: 'mock-model-fast', name: 'Mock Model Fast' },
-            { id: 'mock-model-standard', name: 'Mock Model Standard' },
-            { id: 'mock-model-deep', name: 'Mock Model Deep' }
-          ]
+          data: defaultModels,
+          models: defaultModels,
+          nextCursor: null
         }
       });
       break;
@@ -419,7 +561,9 @@ rl.on('line', (line) => {
         result: {
           turn: {
             id: turnId,
-            status: 'inProgress'
+            status: 'inProgress',
+            model: params.model,
+            effort: params.effort
           }
         }
       });

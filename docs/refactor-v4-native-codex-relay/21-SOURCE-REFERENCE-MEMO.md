@@ -53,6 +53,13 @@ OpenAI Codex App Server protocol (qua stdio JSONL: `initialize` / `initialized`,
    - **Strict Completed Turn Validation**: Transition to `DECISION_VALIDATED` from `AUDIT_UNCERTAIN` requires `itemsView == 'full'`, exactly 1 turn matching `turn_id`, and full valid `AuditDecisionV1` extraction. Any failure leaves `AUDIT_UNCERTAIN` unchanged.
    - **Clean Separation of Resolution and Cleanup**: Resolver persists `AUDIT_TERMINAL_NO_DECISION` and leaves the active row in SQLite. Only subsequent `recoverAuditorBootstrap()` cleans the active row while retaining history.
 
+5. **Model Policy Resolution Authority & First-Turn Pinning (WP-V4-06A)**:
+   - **Zero Hard-Coded Model Authority**: Không có bất kỳ tên model cụ thể nào trong mã nguồn production. Mọi mapping từ logical policy sang wire model selector đều dựa vào catalog động qua `model/list`.
+   - **Semantic Reasoning Effort Preferences**: Lựa chọn theo semantic reasoning effort strings (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`). Model mặc định hoặc thứ tự catalog của provider là tie-breaker duy nhất.
+   - **First-Turn Pinning Boundary**: Việc resolve catalog chỉ xảy ra ở fresh bootstrap sau khi vượt qua R3 Registry freshness gate và ngay trước `FIRST_TURN_STARTING`. Cặp `model` và `effort` được truyền trực tiếp vào `startTurn`.
+   - **Fail-Closed on Resolution Failure**: Bất kỳ lỗi nào trong catalog fetch hoặc policy resolution đều dừng vòng đời, để active recovery record ở `PROVISIONAL_THREAD`, gọi `startTurn` 0 lần, và không gây chuyển trạng thái sang `AUDIT_UNCERTAIN`.
+   - **Zero Catalog Calls in Recovery**: Phục hồi operation cũ hoặc giải quyết bất định tuyệt đối không gọi `model/list`, đảm bảo tính bất biến của authority trong lịch sử.
+
 ---
 
 ## 3. Architecture Status
@@ -64,4 +71,4 @@ OpenAI Codex App Server protocol (qua stdio JSONL: `initialize` / `initialized`,
 - **WP-V4-05AG**: APPROVED / CLOSED (Explicit `AUDIT_UNCERTAIN` terminal-turn resolution, V1→V2 atomic migration rollback guarantee, and post-persistence pre-first-turn Registry freshness gate).
 - **WP-V4-05B**: APPROVED / CLOSED (R9 real durable lifecycle proven: V1→V2 migration, legacy retirement, single model turn, completed-turn hydration, and cross-process resume).
 - **WP-V4-05**: COMPLETE (Final external closure review passed; all production, lifecycle, and recovery contracts verified).
-- **WP-V4-06**: NOT STARTED (Model policy resolution `auditor_fast`, `auditor_standard`, `auditor_deep` via `model/list`).
+- **WP-V4-06**: IN_PROGRESS (WO-V4-06A complete: pure resolver `resolveAuditorModelPolicy`, pagination hardening in `listModels()`, first-turn model+effort pinning; WO-V4-06B token usage observability pending).

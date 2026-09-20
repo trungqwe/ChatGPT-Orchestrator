@@ -18,6 +18,9 @@ const {
   computeRootIdentityKey,
   canonicalizeProjectRoot
 } = require('../broker/registry');
+const {
+  resolveAuditorModelPolicy
+} = require('../auditor/model-policy-resolver');
 
 /**
  * Machine-readable Lifecycle Error Codes
@@ -583,6 +586,21 @@ async function bootstrapAuditorThread(options) {
     workspace_state_observed: workspaceStateObserved
   });
 
+  // 5.5 Resolve logical model policy against runtime catalog (WP-V4-06A)
+  let resolvedPolicy;
+  try {
+    const rawCatalog = await client1.listModels();
+    resolvedPolicy = resolveAuditorModelPolicy({
+      policy: persistedBootstrap.expected_auditor_model_policy,
+      models: rawCatalog
+    });
+  } catch (err) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw err;
+  }
+
   // 6. Precommit FIRST_TURN_STARTING before calling turn/start
   recoveryStore.transitionBootstrap({
     project_id: projectId,
@@ -599,7 +617,9 @@ async function bootstrapAuditorThread(options) {
     startTurnRes = await client1.startTurn({
       threadId,
       input: turnPrompt,
-      outputSchema
+      outputSchema,
+      model: resolvedPolicy.model,
+      effort: resolvedPolicy.reasoning_effort
     });
   } catch (err) {
     // Failure to start first turn leaves execution state uncertain

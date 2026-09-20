@@ -88,6 +88,17 @@ const FAKE_APP_SERVER_PATH = path.resolve(__dirname, '../fixtures/fake-codex-app
 
 const DEFAULT_AUDIT_PROMPT = Object.freeze([{ type: 'text', text: 'Perform audit evaluation.' }]);
 
+const DEFAULT_MOCK_MODELS = Object.freeze([
+  {
+    id: 'mock-model-standard',
+    model: 'mock-model-standard',
+    hidden: false,
+    isDefault: true,
+    defaultReasoningEffort: 'medium',
+    supportedReasoningEfforts: [{ reasoningEffort: 'medium' }]
+  }
+]);
+
 function createMockWorkspacePort(wsStateId = 'ws-fixed-001') {
   return {
     getWorkspaceState: async (project) => ({
@@ -3131,6 +3142,7 @@ async function runAllTests() {
           return threadResponse;
         },
         startThread: async () => { tracking.calls.startThread++; throw new Error('startThread forbidden'); },
+            listModels: async () => DEFAULT_MOCK_MODELS,
         startTurn: async () => { tracking.calls.startTurn++; throw new Error('startTurn forbidden'); },
         interruptTurn: async () => { tracking.calls.interruptTurn++; throw new Error('interruptTurn forbidden'); },
         startReview: async () => { tracking.calls.startReview++; throw new Error('startReview forbidden'); },
@@ -4819,6 +4831,7 @@ async function runAllTests() {
               capturedActiveDuringBootstrap = recoveryStore.getActiveBootstrap('proj-atl-91');
               return { turnId: 'turn-atl-91' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             close: async () => {}
           };
         }
@@ -4944,6 +4957,7 @@ async function runAllTests() {
           return {
             initialize: async () => {},
             startThread: async () => ({ threadId: 'thr-atl-93' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => ({ turnId: 'turn-atl-93' }),
             close: async () => {}
           };
@@ -5028,6 +5042,7 @@ async function runAllTests() {
           return {
             initialize: async () => {},
             startThread: async () => ({ threadId: 'thr-atl-94' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => ({ turnId: 'turn-atl-94' }),
             close: async () => {}
           };
@@ -5112,6 +5127,7 @@ async function runAllTests() {
           return {
             initialize: async () => {},
             startThread: async () => ({ threadId: 'thr-atl-95' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => ({ turnId: 'turn-atl-95' }),
             close: async () => {}
           };
@@ -5205,6 +5221,7 @@ async function runAllTests() {
           return {
             initialize: async () => {},
             startThread: async () => ({ threadId: 'thr-atl-96' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => ({ turnId: 'turn-atl-96' }),
             close: async () => {}
           };
@@ -5283,6 +5300,7 @@ async function runAllTests() {
           return {
             initialize: async () => {},
             startThread: async () => ({ threadId: 'thr-atl-97' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => ({ turnId: 'turn-atl-97' }),
             close: async () => {}
           };
@@ -6105,6 +6123,7 @@ async function runAllTests() {
           return {
             initialize: async () => {},
             startThread: async () => ({ threadId: 'thr-atl-110' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => ({ turnId: 'turn-atl-110' }),
             waitForTurnCompletion: async () => ({
               status: 'completed',
@@ -6554,6 +6573,7 @@ async function runAllTests() {
           return {
             initialize: async () => {},
             startThread: async () => ({ threadId: 'thr-atl-114' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => ({ turnId: 'turn-atl-114' }),
             close: async () => {}
           };
@@ -6662,6 +6682,7 @@ async function runAllTests() {
               startThreadCalls++;
               return { threadId: 'thr-atl-115' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => {
               startTurnCalls++;
               return { turnId: 'turn-atl-115' };
@@ -6757,6 +6778,7 @@ async function runAllTests() {
               startTurnCalls++;
               return { turnId: 'turn-atl-116' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             close: async () => {
               client1CloseCalls++;
             }
@@ -6848,6 +6870,7 @@ async function runAllTests() {
               startTurnCalls++;
               return { turnId: 'turn-atl-117' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             close: async () => {
               client1CloseCalls++;
             }
@@ -6934,6 +6957,7 @@ async function runAllTests() {
               startTurnCalls++;
               return { turnId: 'turn-atl-118' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             close: async () => {
               client1CloseCalls++;
             }
@@ -7019,6 +7043,7 @@ async function runAllTests() {
               startTurnCalls++;
               return { turnId: 'turn-atl-119' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             close: async () => {
               client1CloseCalls++;
             }
@@ -7096,6 +7121,7 @@ async function runAllTests() {
               startTurnCalls++;
               return { turnId: 'turn-atl-120' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             close: async () => {
               client1CloseCalls++;
             }
@@ -7173,6 +7199,7 @@ async function runAllTests() {
               startTurnCalls++;
               return { turnId: 'turn-atl-121' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             close: async () => {
               client1CloseCalls++;
             }
@@ -7261,6 +7288,7 @@ async function runAllTests() {
               eventSequence.push('startThread');
               return { threadId: 'thr-atl-122' };
             },
+            listModels: async () => DEFAULT_MOCK_MODELS,
             startTurn: async () => {
               eventSequence.push('startTurn');
               freshReadObservedInStartTurn = (getProjectCount >= 2);
@@ -7349,7 +7377,659 @@ async function runAllTests() {
   }
 
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-122: 122/122 PASS)');
+    // ATL-123: model/list occurs after fresh R3 Registry gate
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-123');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const realRegistry = createProjectRegistry({ registryFilePath: regFile });
+      await realRegistry.putProject(makeValidProject('proj-atl-123', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      const eventSequence = [];
+      let getProjectCount = 0;
+      const registryPort = {
+        getProject: async (pid) => {
+          getProjectCount++;
+          eventSequence.push('getProject_' + getProjectCount);
+          return realRegistry.getProject(pid);
+        },
+        bindAuditorThread: (...args) => realRegistry.bindAuditorThread(...args),
+        putProject: async (p) => realRegistry.putProject(p)
+      };
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => {
+              eventSequence.push('startThread');
+              return { threadId: 'thr-atl-123' };
+            },
+            listModels: async () => {
+              eventSequence.push('listModels');
+              return DEFAULT_MOCK_MODELS;
+            },
+            startTurn: async () => {
+              eventSequence.push('startTurn');
+              return { turnId: 'turn-atl-123' };
+            },
+            close: async () => {}
+          };
+        }
+        if (phase === 'resume_verify') {
+          return {
+            initialize: async () => {},
+            resumeThread: async () => ({ threadId: 'thr-atl-123' }),
+            close: async () => {}
+          };
+        }
+      };
+
+      const result = await bootstrapAuditorThread({
+        projectId: 'proj-atl-123',
+        registryPort,
+        recoveryStore,
+        adapterFactory,
+        awaitAuditDecision: async () => ({
+          schema_version: 1,
+          decision: 'APPROVE_WORK_PACKAGE',
+          project_id: 'proj-atl-123',
+          audit_subject_id: 'sub-123',
+          auditor_thread_id: 'thr-atl-123',
+          workspace_state_observed: 'ws-123',
+          summary: 'Decision valid',
+          independent_verification: [{ kind: 'SOURCE_INSPECTION', result: 'PASS', evidence: 'OK' }],
+          work_order: null,
+          requested_evidence: [],
+          blocker: null
+        }),
+        workspacePort: createMockWorkspacePort('ws-123'),
+        auditSubjectId: 'sub-123',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
+      });
+
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.status, 'DURABLE_BOUND');
+
+      const idxP2 = eventSequence.indexOf('getProject_2');
+      const idxLM = eventSequence.indexOf('listModels');
+      assert.ok(idxP2 !== -1, 'fresh pre-turn getProject must occur');
+      assert.ok(idxLM !== -1, 'listModels must occur');
+      assert.ok(idxP2 < idxLM, 'model/list must occur after fresh R3 Registry gate');
+
+      console.log('PASS: ATL-123 — model/list occurs after fresh R3 Registry gate');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-124: model/list occurs before FIRST_TURN_STARTING
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-124');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-124', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      const eventSequence = [];
+      let stateDuringListModels = null;
+
+      const origTransition = recoveryStore.transitionBootstrap;
+      recoveryStore.transitionBootstrap = function(record) {
+        eventSequence.push('transition_' + record.next_state);
+        return origTransition.call(recoveryStore, record);
+      };
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-124' }),
+            listModels: async () => {
+              eventSequence.push('listModels');
+              const active = recoveryStore.getActiveBootstrap('proj-atl-124');
+              stateDuringListModels = active ? active.state : null;
+              return DEFAULT_MOCK_MODELS;
+            },
+            startTurn: async () => {
+              eventSequence.push('startTurn');
+              return { turnId: 'turn-atl-124' };
+            },
+            close: async () => {}
+          };
+        }
+        if (phase === 'resume_verify') {
+          return {
+            initialize: async () => {},
+            resumeThread: async () => ({ threadId: 'thr-atl-124' }),
+            close: async () => {}
+          };
+        }
+      };
+
+      const result = await bootstrapAuditorThread({
+        projectId: 'proj-atl-124',
+        registryPort,
+        recoveryStore,
+        adapterFactory,
+        awaitAuditDecision: async () => ({
+          schema_version: 1,
+          decision: 'APPROVE_WORK_PACKAGE',
+          project_id: 'proj-atl-124',
+          audit_subject_id: 'sub-124',
+          auditor_thread_id: 'thr-atl-124',
+          workspace_state_observed: 'ws-124',
+          summary: 'Decision valid',
+          independent_verification: [{ kind: 'SOURCE_INSPECTION', result: 'PASS', evidence: 'OK' }],
+          work_order: null,
+          requested_evidence: [],
+          blocker: null
+        }),
+        workspacePort: createMockWorkspacePort('ws-124'),
+        auditSubjectId: 'sub-124',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
+      });
+
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.status, 'DURABLE_BOUND');
+
+      assert.strictEqual(stateDuringListModels, AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD,
+        'state during listModels must remain PROVISIONAL_THREAD before first turn transition');
+
+      const idxLM = eventSequence.indexOf('listModels');
+      const idxTrFTS = eventSequence.indexOf('transition_FIRST_TURN_STARTING');
+      assert.ok(idxLM !== -1 && idxTrFTS !== -1);
+      assert.ok(idxLM < idxTrFTS, 'listModels must occur before transition to FIRST_TURN_STARTING');
+
+      console.log('PASS: ATL-124 — model/list occurs before FIRST_TURN_STARTING');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-125: catalog failure => PROVISIONAL_THREAD, startTurn 0
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-125');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-125', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      let startTurnCalls = 0;
+      let client1CloseCalls = 0;
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-125' }),
+            listModels: async () => {
+              throw new Error('Catalog network timeout');
+            },
+            startTurn: async () => {
+              startTurnCalls++;
+              return { turnId: 'turn-atl-125' };
+            },
+            close: async () => {
+              client1CloseCalls++;
+            }
+          };
+        }
+      };
+
+      await assert.rejects(
+        async () => {
+          await bootstrapAuditorThread({
+            projectId: 'proj-atl-125',
+            registryPort,
+            recoveryStore,
+            adapterFactory,
+            awaitAuditDecision: async () => {},
+            workspacePort: createMockWorkspacePort('ws-125'),
+            auditSubjectId: 'sub-125',
+            auditPrompt: DEFAULT_AUDIT_PROMPT
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Catalog network timeout/);
+          return true;
+        }
+      );
+
+      assert.strictEqual(startTurnCalls, 0, 'startTurn must be 0 on catalog failure');
+      assert.strictEqual(client1CloseCalls, 1, 'client1 must be closed on catalog failure');
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-125');
+      assert.ok(active, 'active recovery record must be preserved');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD,
+        'state must remain PROVISIONAL_THREAD (never transitioned to FIRST_TURN_STARTING or AUDIT_UNCERTAIN)');
+      assert.strictEqual(active.turn_id, null);
+
+      const proj = await registryPort.getProject('proj-atl-125');
+      assert.strictEqual(proj.auditor.thread_id, null, 'Registry must remain unbound');
+      assert.strictEqual(proj.auditor.enabled, false);
+
+      console.log('PASS: ATL-125 — catalog failure => PROVISIONAL_THREAD, startTurn 0');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-126: MODEL_POLICY_UNAVAILABLE => PROVISIONAL_THREAD, startTurn 0
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-126');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-126', projDir, {
+        auditor: {
+          enabled: false,
+          thread_id: null,
+          model_policy: 'auditor_deep',
+          cwd: projDir
+        }
+      }));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      let startTurnCalls = 0;
+      let client1CloseCalls = 0;
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-126' }),
+            listModels: async () => [
+              {
+                id: 'mock-model-unknown-effort',
+                model: 'mock-model-unknown-effort',
+                hidden: false,
+                isDefault: true,
+                defaultReasoningEffort: 'custom-effort',
+                supportedReasoningEfforts: [{ reasoningEffort: 'custom-effort' }]
+              }
+            ],
+            startTurn: async () => {
+              startTurnCalls++;
+              return { turnId: 'turn-atl-126' };
+            },
+            close: async () => {
+              client1CloseCalls++;
+            }
+          };
+        }
+      };
+
+      await assert.rejects(
+        async () => {
+          await bootstrapAuditorThread({
+            projectId: 'proj-atl-126',
+            registryPort,
+            recoveryStore,
+            adapterFactory,
+            awaitAuditDecision: async () => {},
+            workspacePort: createMockWorkspacePort('ws-126'),
+            auditSubjectId: 'sub-126',
+            auditPrompt: DEFAULT_AUDIT_PROMPT
+          });
+        },
+        (err) => {
+          assert.strictEqual(err.code, 'MODEL_POLICY_UNAVAILABLE');
+          return true;
+        }
+      );
+
+      assert.strictEqual(startTurnCalls, 0, 'startTurn must be 0 on MODEL_POLICY_UNAVAILABLE');
+      assert.strictEqual(client1CloseCalls, 1, 'client1 must be closed');
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-126');
+      assert.ok(active, 'active recovery record must be preserved');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD,
+        'state must remain PROVISIONAL_THREAD');
+      assert.strictEqual(active.turn_id, null);
+
+      const proj = await registryPort.getProject('proj-atl-126');
+      assert.strictEqual(proj.auditor.thread_id, null, 'Registry must remain unbound');
+
+      console.log('PASS: ATL-126 — MODEL_POLICY_UNAVAILABLE => PROVISIONAL_THREAD, startTurn 0');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-127: success forwards exact resolved model+effort to startTurn
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-127');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-127', projDir, {
+        auditor: {
+          enabled: false,
+          thread_id: null,
+          model_policy: 'auditor_fast',
+          cwd: projDir
+        }
+      }));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      let capturedStartTurnParams = null;
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-127' }),
+            listModels: async () => [
+              {
+                id: 'cat-model-std',
+                model: 'mock-model-standard-wire',
+                hidden: false,
+                isDefault: true,
+                defaultReasoningEffort: 'high',
+                supportedReasoningEfforts: [{ reasoningEffort: 'high' }]
+              },
+              {
+                id: 'cat-model-fast',
+                model: 'mock-model-fast-wire',
+                hidden: false,
+                isDefault: false,
+                defaultReasoningEffort: 'low',
+                supportedReasoningEfforts: [{ reasoningEffort: 'low' }]
+              }
+            ],
+            startTurn: async (params) => {
+              capturedStartTurnParams = params;
+              return { turnId: 'turn-atl-127' };
+            },
+            close: async () => {}
+          };
+        }
+        if (phase === 'resume_verify') {
+          return {
+            initialize: async () => {},
+            resumeThread: async () => ({ threadId: 'thr-atl-127' }),
+            close: async () => {}
+          };
+        }
+      };
+
+      const result = await bootstrapAuditorThread({
+        projectId: 'proj-atl-127',
+        registryPort,
+        recoveryStore,
+        adapterFactory,
+        awaitAuditDecision: async () => ({
+          schema_version: 1,
+          decision: 'APPROVE_WORK_PACKAGE',
+          project_id: 'proj-atl-127',
+          audit_subject_id: 'sub-127',
+          auditor_thread_id: 'thr-atl-127',
+          workspace_state_observed: 'ws-127',
+          summary: 'Decision valid',
+          independent_verification: [{ kind: 'SOURCE_INSPECTION', result: 'PASS', evidence: 'OK' }],
+          work_order: null,
+          requested_evidence: [],
+          blocker: null
+        }),
+        workspacePort: createMockWorkspacePort('ws-127'),
+        auditSubjectId: 'sub-127',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
+      });
+
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.status, 'DURABLE_BOUND');
+
+      assert.ok(capturedStartTurnParams, 'startTurn must have received params');
+      assert.strictEqual(capturedStartTurnParams.model, 'mock-model-fast-wire',
+        'fast policy must select the model supporting highest fast preference (low vs high)');
+      assert.strictEqual(capturedStartTurnParams.effort, 'low',
+        'fast policy must forward the exact selected effort');
+
+      console.log('PASS: ATL-127 — success forwards exact resolved model+effort to startTurn');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-128: Registry model-policy drift is rejected by R3 gate before catalog resolution
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-128');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-128', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      let listModelsCalled = false;
+      let startTurnCalls = 0;
+
+      // Intercept beginBootstrap: mutate Registry model_policy to 'auditor_deep'
+      const origBegin = recoveryStore.beginBootstrap;
+      recoveryStore.beginBootstrap = function(record) {
+        const res = origBegin.call(recoveryStore, record);
+        const proj = registryPort.getProjectSync('proj-atl-128');
+        proj.auditor.model_policy = 'auditor_deep';
+        registryPort.putProjectSync(proj);
+        return res;
+      };
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-128' }),
+            listModels: async () => {
+              listModelsCalled = true;
+              return DEFAULT_MOCK_MODELS;
+            },
+            startTurn: async () => {
+              startTurnCalls++;
+              return { turnId: 'turn-atl-128' };
+            },
+            close: async () => {}
+          };
+        }
+      };
+
+      await assert.rejects(
+        async () => {
+          await bootstrapAuditorThread({
+            projectId: 'proj-atl-128',
+            registryPort,
+            recoveryStore,
+            adapterFactory,
+            awaitAuditDecision: async () => {},
+            workspacePort: createMockWorkspacePort('ws-128'),
+            auditSubjectId: 'sub-128',
+            auditPrompt: DEFAULT_AUDIT_PROMPT
+          });
+        },
+        (err) => {
+          assert.strictEqual(err.code, LIFECYCLE_ERROR_CODES.AUDITOR_BOOTSTRAP_AUTHORITY_DRIFT);
+          return true;
+        }
+      );
+
+      assert.strictEqual(listModelsCalled, false,
+        'listModels must NOT be called when R3 fresh Registry gate rejects model_policy drift');
+      assert.strictEqual(startTurnCalls, 0, 'startTurn must not be called');
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-128');
+      assert.ok(active);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD);
+
+      console.log('PASS: ATL-128 — Registry model-policy drift is rejected by R3 gate before catalog resolution');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-129: resume/recovery path performs zero model/list calls
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-129');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-129', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      advanceToState(recoveryStore, {
+        projectId: 'proj-atl-129',
+        operationId: 'op-atl-129',
+        targetState: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+        threadId: 'thr-atl-129',
+        subjectId: 'sub-129',
+        wsState: 'ws-129'
+      });
+
+      let listModelsCalls = 0;
+
+      const trackingFactory = async ({ phase, cwd }) => {
+        return {
+          initialize: async () => {},
+          listModels: async () => {
+            listModelsCalls++;
+            throw new Error('listModels forbidden during resume/recovery');
+          },
+          resumeThread: async () => ({ threadId: 'thr-atl-129' }),
+          close: async () => {}
+        };
+      };
+
+      const recResult = await recoverAuditorBootstrap({
+        projectId: 'proj-atl-129',
+        registryPort,
+        recoveryStore,
+        adapterFactory: trackingFactory
+      });
+
+      assert.strictEqual(recResult.status, 'DURABLE_BOUND');
+      assert.strictEqual(listModelsCalls, 0, 'recoverAuditorBootstrap must perform zero listModels calls');
+
+      // Also verify resolveAuditorBootstrapUncertainty performs zero listModels calls
+      const projDirUnc = path.join(sandbox.dir, 'proj-atl-129-unc');
+      fs.mkdirSync(projDirUnc, { recursive: true });
+      await registryPort.putProject(makeValidProject('proj-atl-129-unc', projDirUnc));
+
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-129-unc',
+        operation_id: 'op-atl-129-unc',
+        audit_subject_id: 'sub-129-unc',
+        thread_id: 'thr-atl-129-unc',
+        workspace_state_observed: 'ws-129-unc'
+      });
+      recoveryStore.transitionBootstrap({
+        project_id: 'proj-atl-129-unc',
+        operation_id: 'op-atl-129-unc',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING
+      });
+      recoveryStore.transitionBootstrap({
+        project_id: 'proj-atl-129-unc',
+        operation_id: 'op-atl-129-unc',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+        patch: { turn_id: 'turn-test-01' }
+      });
+      recoveryStore.transitionBootstrap({
+        project_id: 'proj-atl-129-unc',
+        operation_id: 'op-atl-129-unc',
+        next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN
+      });
+
+      let uncListModelsCalls = 0;
+      const uncFactory = async ({ phase, cwd }) => {
+        return {
+          initialize: async () => {},
+          listModels: async () => {
+            uncListModelsCalls++;
+            throw new Error('listModels forbidden during uncertainty resolution');
+          },
+          readThread: async () => ({
+            thread: {
+              id: 'thr-atl-129-unc',
+              turns: [
+                {
+                  id: 'turn-test-01',
+                  status: 'failed',
+                  error: { message: 'interrupted' }
+                }
+              ]
+            }
+          }),
+          close: async () => {}
+        };
+      };
+
+      const uncResult = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-129-unc',
+        registryPort,
+        recoveryStore,
+        adapterFactory: uncFactory
+      });
+
+      assert.strictEqual(uncResult.status, 'AUDIT_TERMINAL_NO_DECISION');
+      assert.strictEqual(uncListModelsCalls, 0,
+        'resolveAuditorBootstrapUncertainty must perform zero listModels calls');
+
+      console.log('PASS: ATL-129 — resume/recovery path performs zero model/list calls');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-129: 129/129 PASS)');
   console.log('======================================================================\n');
 }
 
