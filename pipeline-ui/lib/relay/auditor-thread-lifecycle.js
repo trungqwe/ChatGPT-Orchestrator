@@ -536,6 +536,37 @@ async function recoverAuditorBootstrap(options) {
 
   // Case 1b: AUDIT_TERMINAL_NO_DECISION
   if (state === AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION) {
+    if (!registryPort || typeof registryPort.getProject !== 'function') {
+      throw new AuditorLifecycleError(
+        LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+        'registryPort with getProject is required for terminal no-decision recovery'
+      );
+    }
+
+    let project;
+    try {
+      project = await registryPort.getProject(projectId);
+    } catch (err) {
+      throw new AuditorLifecycleError(
+        LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+        `Failed to read project '${projectId}' from registry: ${err.message}`
+      );
+    }
+
+    if (!project) {
+      throw new AuditorLifecycleError(
+        LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+        `Project '${projectId}' not found in registry`
+      );
+    }
+
+    if (!project.auditor || project.auditor.thread_id !== null || project.auditor.enabled !== false) {
+      throw new AuditorLifecycleError(
+        LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+        `Cannot clear terminal no-decision recovery: project '${projectId}' auditor is not unbound in registry (thread_id='${project.auditor ? project.auditor.thread_id : 'missing'}', enabled=${project.auditor ? project.auditor.enabled : 'missing'})`
+      );
+    }
+
     recoveryStore.deleteActiveBootstrap(projectId, operationId);
     return {
       ok: true,
@@ -803,6 +834,32 @@ async function inspectAuditorBootstrap(options) {
   };
 }
 
+const MAX_UNCERTAINTY_DIAGNOSTIC_BYTES = 1024;
+
+/**
+ * Truncates a string to at most maxBytes in UTF-8 representation without splitting multibyte code points.
+ *
+ * @param {string} str
+ * @param {number} [maxBytes=MAX_UNCERTAINTY_DIAGNOSTIC_BYTES]
+ * @returns {string}
+ */
+function truncateUtf8Safe(str, maxBytes = MAX_UNCERTAINTY_DIAGNOSTIC_BYTES) {
+  if (typeof str !== 'string') {
+    str = String(str || '');
+  }
+  let currentBytes = 0;
+  let result = '';
+  for (const ch of str) {
+    const chBytes = Buffer.byteLength(ch, 'utf8');
+    if (currentBytes + chBytes > maxBytes) {
+      return result;
+    }
+    result += ch;
+    currentBytes += chBytes;
+  }
+  return result;
+}
+
 /**
  * Explicit operator resolution for AUDIT_UNCERTAIN bootstrap states.
  *
@@ -915,7 +972,7 @@ async function resolveAuditorBootstrapUncertainty(options) {
       project_id: projectId,
       thread_id: active.thread_id,
       turn_id: null,
-      reason: 'Active bootstrap lacks persisted turn_id'
+      reason: truncateUtf8Safe('TURN_HISTORY_INVALID: Active bootstrap lacks persisted turn_id')
     };
   }
 
@@ -935,13 +992,14 @@ async function resolveAuditorBootstrapUncertainty(options) {
       includeTurns: true
     });
   } catch (err) {
+    const rawMsg = (err && err.message) ? String(err.message) : 'Provider inspection failed';
     return {
       ok: false,
       status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
       project_id: projectId,
       thread_id: active.thread_id,
       turn_id: active.turn_id,
-      reason: `Provider inspection failed: ${err.message}`
+      reason: truncateUtf8Safe(`PROVIDER_INSPECTION_FAILED: ${rawMsg}`)
     };
   } finally {
     if (client && typeof client.close === 'function') {
@@ -959,7 +1017,7 @@ async function resolveAuditorBootstrapUncertainty(options) {
       project_id: projectId,
       thread_id: active.thread_id,
       turn_id: active.turn_id,
-      reason: `Provider thread ID mismatch: expected '${active.thread_id}', got '${returnedThreadId}'`
+      reason: truncateUtf8Safe(`THREAD_ID_MISMATCH: expected '${active.thread_id}', got '${returnedThreadId}'`)
     };
   }
 
@@ -972,7 +1030,7 @@ async function resolveAuditorBootstrapUncertainty(options) {
       project_id: projectId,
       thread_id: active.thread_id,
       turn_id: active.turn_id,
-      reason: `Turn history shape invalid: expected exactly 1 turn with id '${active.turn_id}', found ${turns.length} turns`
+      reason: truncateUtf8Safe(`TURN_HISTORY_INVALID: expected exactly 1 turn with id '${active.turn_id}', found ${turns.length} turns`)
     };
   }
 
@@ -1010,7 +1068,7 @@ async function resolveAuditorBootstrapUncertainty(options) {
         project_id: projectId,
         thread_id: active.thread_id,
         turn_id: active.turn_id,
-        reason: `Completed turn itemsView is '${targetTurn.itemsView}', requires 'full'`
+        reason: truncateUtf8Safe(`TURN_ITEMS_INCOMPLETE: Completed turn itemsView is '${targetTurn.itemsView}', requires 'full'`)
       };
     }
 
@@ -1025,13 +1083,14 @@ async function resolveAuditorBootstrapUncertainty(options) {
     try {
       validatedDecision = extractAuditDecisionV1FromTurn(targetTurn, expectedContext);
     } catch (err) {
+      const rawMsg = (err && err.message) ? String(err.message) : 'Invalid decision schema';
       return {
         ok: false,
         status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
         project_id: projectId,
         thread_id: active.thread_id,
         turn_id: active.turn_id,
-        reason: `Completed turn decision validation failed: ${err.message}`
+        reason: truncateUtf8Safe(`DECISION_VALIDATION_FAILED: ${rawMsg}`)
       };
     }
 
@@ -1070,7 +1129,7 @@ async function resolveAuditorBootstrapUncertainty(options) {
     thread_id: active.thread_id,
     turn_id: active.turn_id,
     turn_status: turnStatus || 'unknown',
-    reason: `Turn is in non-terminal or unrecognized status '${turnStatus}'`
+    reason: truncateUtf8Safe(`TURN_NONTERMINAL: Turn is in non-terminal or unrecognized status '${turnStatus}'`)
   };
 }
 
@@ -1078,6 +1137,7 @@ module.exports = {
   LIFECYCLE_ERROR_CODES,
   AuditorLifecycleError,
   AUDITOR_BOOTSTRAP_STATES,
+  MAX_UNCERTAINTY_DIAGNOSTIC_BYTES,
   bootstrapAuditorThread,
   recoverAuditorBootstrap,
   inspectAuditorBootstrap,

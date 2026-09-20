@@ -36,6 +36,7 @@ const {
   recoverAuditorBootstrap,
   inspectAuditorBootstrap,
   resolveAuditorBootstrapUncertainty,
+  MAX_UNCERTAINTY_DIAGNOSTIC_BYTES,
   LIFECYCLE_ERROR_CODES
 } = require('../../lib/relay/auditor-thread-lifecycle');
 
@@ -217,7 +218,7 @@ function advanceToState(recoveryStore, { projectId, operationId, targetState, th
 }
 
 async function runAllTests() {
-  console.log('Starting Auditor Thread Lifecycle test suite (ATL-001 .. ATL-083)...');
+  console.log('Starting Auditor Thread Lifecycle test suite (ATL-001 .. ATL-090)...');
 
   // ATL-001: Complete happy-path bootstrap sequence end-to-end
   {
@@ -4279,8 +4280,370 @@ async function runAllTests() {
     }
   }
 
+  // ATL-084: AUDIT_TERMINAL_NO_DECISION + fresh Registry UNBOUND => cleanup succeeds
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-84');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-84', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-84',
+        operation_id: 'op-84',
+        audit_subject_id: 'sub-84',
+        thread_id: 'thr_84',
+        workspace_state_observed: 'ws-84'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-84', operation_id: 'op-84', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-84', operation_id: 'op-84', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_84' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-84', operation_id: 'op-84', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-84', operation_id: 'op-84', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+
+      const res = await recoverAuditorBootstrap({
+        projectId: 'proj-atl-84',
+        registryPort,
+        recoveryStore,
+        adapterFactory: createTrackingAdapterFactory({})
+      });
+
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.status, 'RECOVERED_TERMINAL_NO_DECISION_CLEARED');
+      assert.strictEqual(recoveryStore.getActiveBootstrap('proj-atl-84'), null);
+
+      const history = recoveryStore.getBootstrapHistory('proj-atl-84', 'op-84');
+      assert.strictEqual(history.length, 5);
+
+      const proj = await registryPort.getProject('proj-atl-84');
+      assert.strictEqual(proj.auditor.thread_id, null);
+      assert.strictEqual(proj.auditor.enabled, false);
+
+      console.log('PASS: ATL-084 — AUDIT_TERMINAL_NO_DECISION + fresh Registry UNBOUND => cleanup succeeds');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-085: Registry becomes bound to the same historical thread before cleanup => cleanup rejected => active row remains
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-85');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-85', projDir, {
+        auditor: { thread_id: 'thr_85', enabled: true }
+      }));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-85',
+        operation_id: 'op-85',
+        audit_subject_id: 'sub-85',
+        thread_id: 'thr_85',
+        workspace_state_observed: 'ws-85'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-85', operation_id: 'op-85', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-85', operation_id: 'op-85', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_85' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-85', operation_id: 'op-85', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-85', operation_id: 'op-85', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+
+      await assert.rejects(
+        () => recoverAuditorBootstrap({
+          projectId: 'proj-atl-85',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-85');
+      assert.notStrictEqual(active, null);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+
+      console.log('PASS: ATL-085 — Registry becomes bound to the same historical thread before cleanup => cleanup rejected => active terminal-no-decision row remains');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-086: Registry becomes bound to a different thread before cleanup => cleanup rejected => active row remains
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-86');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-86', projDir, {
+        auditor: { thread_id: 'thr_foreign_86', enabled: true }
+      }));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-86',
+        operation_id: 'op-86',
+        audit_subject_id: 'sub-86',
+        thread_id: 'thr_86',
+        workspace_state_observed: 'ws-86'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-86', operation_id: 'op-86', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-86', operation_id: 'op-86', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_86' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-86', operation_id: 'op-86', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-86', operation_id: 'op-86', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+
+      await assert.rejects(
+        () => recoverAuditorBootstrap({
+          projectId: 'proj-atl-86',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-86');
+      assert.notStrictEqual(active, null);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+
+      console.log('PASS: ATL-086 — Registry becomes bound to a different thread before cleanup => cleanup rejected => active row remains');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-087: Registry project missing at cleanup => cleanup rejected => active row remains
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-87',
+        operation_id: 'op-87',
+        audit_subject_id: 'sub-87',
+        thread_id: 'thr_87',
+        workspace_state_observed: 'ws-87'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-87', operation_id: 'op-87', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-87', operation_id: 'op-87', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_87' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-87', operation_id: 'op-87', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-87', operation_id: 'op-87', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+
+      await assert.rejects(
+        () => recoverAuditorBootstrap({
+          projectId: 'proj-atl-87',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-87');
+      assert.notStrictEqual(active, null);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+
+      console.log('PASS: ATL-087 — Registry project missing at cleanup => cleanup rejected => active row remains');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-088: Registry getProject failure at cleanup => cleanup rejected => active row remains
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+
+      const faultyRegistryPort = {
+        getProject: async () => {
+          throw new Error('Database disk I/O failure');
+        }
+      };
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-88',
+        operation_id: 'op-88',
+        audit_subject_id: 'sub-88',
+        thread_id: 'thr_88',
+        workspace_state_observed: 'ws-88'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-88', operation_id: 'op-88', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-88', operation_id: 'op-88', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_88' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-88', operation_id: 'op-88', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-88', operation_id: 'op-88', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+
+      await assert.rejects(
+        () => recoverAuditorBootstrap({
+          projectId: 'proj-atl-88',
+          registryPort: faultyRegistryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-88');
+      assert.notStrictEqual(active, null);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+
+      console.log('PASS: ATL-088 — Registry getProject failure at cleanup => cleanup rejected => active row remains');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-089: provider inspection throws an extremely large error message => result remains AUDIT_UNCERTAIN => diagnostic <= configured UTF-8 byte bound => active state unchanged
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-89');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-89', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-89',
+        operation_id: 'op-89',
+        audit_subject_id: 'sub-89',
+        thread_id: 'thr_89',
+        workspace_state_observed: 'ws-89'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-89', operation_id: 'op-89', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-89', operation_id: 'op-89', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_89' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-89', operation_id: 'op-89', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const hugeErrorMessage = 'PROVIDER_ERR_'.repeat(5000);
+      const adapterFactory = async () => ({
+        initialize: async () => {},
+        readThread: async () => {
+          throw new Error(hugeErrorMessage);
+        },
+        close: async () => {}
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-89',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+      assert.ok(typeof res.reason === 'string');
+      assert.ok(res.reason.startsWith('PROVIDER_INSPECTION_FAILED:'));
+      assert.ok(Buffer.byteLength(res.reason, 'utf8') <= MAX_UNCERTAINTY_DIAGNOSTIC_BYTES);
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-89');
+      assert.notStrictEqual(active, null);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-089 — provider inspection throws an extremely large error message => result remains AUDIT_UNCERTAIN => diagnostic <= configured UTF-8 byte bound => active state unchanged');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-090: provider/mismatch diagnostic containing multibyte Unicode => UTF-8 truncation remains valid => byte bound respected
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-90');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-90', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-90',
+        operation_id: 'op-90',
+        audit_subject_id: 'sub-90',
+        thread_id: 'thr_90',
+        workspace_state_observed: 'ws-90'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-90', operation_id: 'op-90', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-90', operation_id: 'op-90', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_90' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-90', operation_id: 'op-90', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      // Multi-byte Unicode payload: 4-byte rocket emoji + 3-byte Vietnamese chars + 2-byte greek letters
+      const unicodeString = '🚀 Tiếng Việt Kiểm Định Σ '.repeat(500);
+      const adapterFactory = async () => ({
+        initialize: async () => {},
+        readThread: async () => {
+          throw new Error(unicodeString);
+        },
+        close: async () => {}
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-90',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+      assert.ok(typeof res.reason === 'string');
+      const reasonByteLen = Buffer.byteLength(res.reason, 'utf8');
+      assert.ok(reasonByteLen <= MAX_UNCERTAINTY_DIAGNOSTIC_BYTES);
+
+      // Verify UTF-8 integrity: re-encoding to buffer and decoding back to string must not produce \uFFFD replacement characters
+      const roundtrip = Buffer.from(res.reason, 'utf8').toString('utf8');
+      assert.strictEqual(roundtrip, res.reason);
+      assert.strictEqual(res.reason.includes('\uFFFD'), false);
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-90');
+      assert.notStrictEqual(active, null);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-090 — provider/mismatch diagnostic containing multibyte Unicode => UTF-8 truncation remains valid => byte bound respected');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-083: 83/83 PASS)');
+  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-090: 90/90 PASS)');
   console.log('======================================================================\n');
 }
 

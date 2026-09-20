@@ -12,7 +12,7 @@
 - [x] Real Native Codex accepted (WP-V4-03B: real initialize, model/list, thread/start, same-process thread/read, clean close; WP-V4-03 COMPLETE).
 - [x] AuditDecision complete (WP-V4-04: AuditDecisionV1 pure semantic contract, duplicate key rejection, exact context binding, turn items authority, 78 AD tests).
 - [x] Thread persistence & durable cross-process recovery core complete & sealed (WP-V4-05A / WO-V4-05AF: SQLite recovery store authority seal, strict patch envelope, history chain revalidation, physical integrity_check, exact schema validation, real workspacePort contract, mandatory auditPrompt/Subject, Registry root canonical revalidation, 51 ARS + 55 RG + 60 ATL tests pass).
-- [x] Explicit AUDIT_UNCERTAIN terminal-turn resolution complete (WP-V4-05AG: resolveAuditorBootstrapUncertainty, non-mutating provider read, AUDIT_TERMINAL_NO_DECISION state, clean separation between resolution and recovery cleanup, schema-v1 compatibility, 61 ARS + 83 ATL tests pass).
+- [x] Explicit AUDIT_UNCERTAIN terminal-turn resolution complete (WP-V4-05AG / WO-V4-05AG-R1: resolveAuditorBootstrapUncertainty, non-mutating provider read, AUDIT_TERMINAL_NO_DECISION state, Registry UNBOUND revalidation before cleanup, bounded UTF-8 diagnostics, 61 ARS + 90 ATL tests pass).
 - [ ] Real first audit acceptance complete (WP-V4-05B).
 - [ ] Model resolver complete (WP-V4-06).
 - [ ] One-shot và shadow proven.
