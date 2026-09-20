@@ -61,6 +61,7 @@ OpenAI Codex App Server protocol (qua stdio JSONL: `initialize` / `initialized`,
 - **WP-V4-03**: APPROVED / CLOSED (Transport foundation & real App Server runtime acceptance).
 - **WP-V4-04**: APPROVED / CLOSED (`AuditDecisionV1` pure semantic contract & test suite).
 - **WP-V4-05A**: APPROVED / CLOSED (Durable thread lifecycle & recovery store).
-- **WP-V4-05AG**: IMPLEMENTED / READY FOR REVIEW (Explicit `AUDIT_UNCERTAIN` terminal-turn resolution).
-- **WP-V4-05B**: NOT YET CLOSED (Real runtime acceptance blocked on R7 uncertainty resolution).
+- **WP-V4-05AG**: APPROVED / CLOSED (Explicit `AUDIT_UNCERTAIN` terminal-turn resolution, V1→V2 atomic migration rollback guarantee, and post-persistence pre-first-turn Registry freshness gate).
+- **WP-V4-05B**: APPROVED / CLOSED (R9 real durable lifecycle proven: V1→V2 migration, legacy retirement, single model turn, completed-turn hydration, and cross-process resume).
+- **WP-V4-05**: COMPLETE (Final external closure review passed; all production, lifecycle, and recovery contracts verified).
 - **WP-V4-06**: NOT STARTED (Model policy resolution `auditor_fast`, `auditor_standard`, `auditor_deep` via `model/list`).

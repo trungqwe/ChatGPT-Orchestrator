@@ -155,6 +155,8 @@ Raw read-only inspection confirmed real runtime state in `~/.orchestrator/` is s
 
 ## 9. Status & Next Steps
 
-- **WP-V4-05AG-R3:** `READY_FOR_EXTERNAL_REVIEW`
-- **WP-V4-05:** `BLOCKED_PENDING_R3_EXTERNAL_REVIEW`
+- **WP-V4-05AG-R3:** `APPROVED_CLOSED`
+- **WP-V4-05AG:** `APPROVED_CLOSED`
+- **WP-V4-05B:** `COMPLETE`
+- **WP-V4-05:** `COMPLETE`
 - **WP-V4-06:** `NOT_STARTED`

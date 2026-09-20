@@ -55,3 +55,14 @@ Chạy quy trình khôi phục chính thức:
 1. **Không sửa tay SQLite**: Tuyệt đối không can thiệp bằng các công cụ SQLite bên ngoài để sửa đổi trường `state` hoặc xóa thủ công các bản ghi trong `auditor_recovery_v1` vì có thể phá vỡ tính toàn vẹn chữ ký hash của validated decision.
 2. **Không copy/touch file session Codex**: Quá trình rollout file hoàn toàn do App Server quản lý. Tuyệt đối không tạo file giả lập để ép `thread/resume` thành công.
 3. **Môi trường Test**: Trong các bài kiểm tra tự động và diễn tập phục hồi, bắt buộc dùng isolated temporary directory cho cả Registry file lẫn SQLite recovery file (`PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;`).
+
+### 4. Kiểm chứng Thẩm quyền Fresh Trước Lượt Audit Đầu Tiên (WO-V4-05AG-R3)
+Ngay sau khi `beginBootstrap()` ghi nhận thẩm quyền (`authority_version = 1`, `expected_project_root`, `expected_project_root_identity`, `expected_auditor_model_policy`) vào SQLite và đọc lại bản ghi persisted:
+- Hệ thống bắt buộc thực hiện fresh read Registry (`await registryPort.getProject(projectId)`).
+- Kiểm chứng auditor trong Registry vẫn đang ở trạng thái unbound nghiêm ngặt (`thread_id === null` và `enabled === false`).
+- Tự chứng thực thẩm quyền persisted (`assertBootstrapAuthorityMatchesRegistry`) đảm bảo:
+  1. `expected_project_root` tự canonicalize và khớp identity đã lưu.
+  2. Registry `project_root` fresh khớp canonical identity.
+  3. Registry `auditor.cwd` fresh khớp canonical identity.
+  4. Registry `auditor.model_policy` fresh khớp policy đã lưu.
+- Nếu có bất kỳ sai lệch nào (drift, read failure, auditor bound/enabled): fail-closed ngay lập tức, đóng client provisional, giữ nguyên trạng thái `PROVISIONAL_THREAD` trong SQLite recovery store, và tiêu thụ chính xác **0 lượt model turn**.

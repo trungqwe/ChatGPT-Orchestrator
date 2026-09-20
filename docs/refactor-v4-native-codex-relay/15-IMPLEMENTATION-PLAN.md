@@ -9,8 +9,8 @@
 | V4-03B | Real App Server acceptance | REAL_RUNTIME_ACCEPTED (Real binary initialize, model/list, thread/start, same-process thread/read, clean close; zero-turn resume reclassified per WO-V4-03BR) |
 | V4-04 | AuditDecisionV1 | COMPLETE / READY FOR REVIEW (78 AD tests pass, strict schema & local validation, duplicate-key rejection, turn authority, 11 deterministic suites pass) |
 | V4-05A | Durability / Recovery Core | COMPLETE / SEALED (51 ARS + 55 RG + 60 ATL tests pass; SQLite fail-closed store, atomic bindAuditorThread, lazy rollout fixture, cross-process resume gate, 13 deterministic suites pass) |
-| V4-05AG | Explicit AUDIT_UNCERTAIN Resolution | IMPLEMENTED / READY FOR REVIEW (WO-V4-05AG-R1: 61 ARS + 90 ATL tests pass; Registry UNBOUND revalidation before cleanup, bounded UTF-8 diagnostics, 13 deterministic suites pass) |
-| V4-05B | Real First Audit Acceptance | Real native Codex first audit turn, real rollout materialization, real cross-process resume acceptance (BLOCKED ON R7 UNCERTAINTY RESOLUTION) |
+| V4-05AG | Explicit Uncertainty Resolution & Registry Gate | APPROVED / CLOSED (WO-V4-05AG-R2 / R3 / R3-R1: 82 ARS + 122 ATL tests pass; V2 migration atomic rollback, bootstrap authority self-verification, post-persistence Registry freshness gate before first turn, 13 deterministic suites pass) |
+| V4-05B | Real First Audit Acceptance | COMPLETE / ACCEPTED (WO-V4-05B-R9: real V1→V2 migration, legacy retirement, 1 real model turn, hydration, DURABLE_BOUND, cross-process resume verified; substantive DISPATCH_WORKER finding closed by R3/R3-R1; WP-V4-05 COMPLETE) |
 | V4-06 | Model resolver | catalog/fallback tests |
 | V4-07 | Audit/recover CLI | integration tests |
 | V4-08 | Generic worker boundary | Antigravity regression |
