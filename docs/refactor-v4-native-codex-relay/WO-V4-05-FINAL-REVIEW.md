@@ -33,7 +33,7 @@ This external closure review evaluates the complete evidentiary record for **WP-
 - **additional real model turn required:** `NO`
 - **WP-V4-05AG:** `APPROVED_CLOSED`
 - **WP-V4-05B:** `COMPLETE`
-- **WP-V4-05:** `COMPLETE`
+- **WP-V4-05:** `BLOCKED_PENDING_FINAL_R1_EXTERNAL_REVIEW`
 - **WP-V4-06:** `NOT_STARTED`
 
 ---
@@ -159,40 +159,32 @@ Review of commit `d83cb33a8798998685049baf8128127e37dfa649` and live system stat
 
 ## 6. Deterministic Test Regression Results
 
-Full suite execution (`npm test` in `pipeline-ui`):
-
-```text
-> test
-> node --test test/refactor/*.test.js
-
-✔ test/refactor/agent-broker-cli.test.js (21.7225ms)
-✔ test/refactor/agent-broker-discovery.test.js (19.9922ms)
-✔ test/refactor/audit-decision.test.js (12.2858ms)
-✔ test/refactor/auditor-recovery-store.test.js (273.7144ms)
-✔ test/refactor/auditor-thread-lifecycle.test.js (58.3755ms)
-✔ test/refactor/codex-app-server-client.test.js (148.0691ms)
-✔ test/refactor/dashboard-server.test.js (64.2185ms)
-✔ test/refactor/log-reader.test.js (18.6657ms)
-✔ test/refactor/native-codex-turn-format.test.js (14.2862ms)
-✔ test/refactor/project-registry-sqlite.test.js (19.1235ms)
-✔ test/refactor/registry-contract.test.js (17.5878ms)
-✔ test/refactor/sqlite-connection.test.js (18.1565ms)
-✔ test/refactor/system-status.test.js (17.818ms)
-ℹ tests 476
-ℹ suites 0
-ℹ pass 476
-ℹ fail 0
-ℹ cancelled 0
-ℹ skipped 0
-ℹ todo 0
-ℹ duration_ms 870.3015
+Executed command:
+```bash
+cd pipeline-ui
+npm test
 ```
 
+Observed execution result:
+- **npm test exit code:** `0`
+- **13 deterministic test suites:** `PASS`
+  - `legacy-auditor-quarantine.test.js`: PASS
+  - `native-transition.test.js`: PASS
+  - `agent-broker-cli.test.js` (CLI-001 .. CLI-050): 50/50 PASS
+  - `sqlite-lifecycle-store.test.js` (SL-001 .. SL-047): 47/47 PASS
+  - `broker-core.test.js` (BC-001 .. BC-052): 52/52 PASS
+  - `worker-adapter.test.js` (WA-001 .. WA-055): 55/55 PASS
+  - `workspace-state.test.js` (WS-001 .. WS-051): 51/51 PASS
+  - `registry.test.js` (RG-001 .. RG-055): 55/55 PASS
+  - `registry-v2-migration.test.js` (RV2-001 .. RV2-020): 20/20 PASS
+  - `codex-app-server-client.test.js` (CAS-001 .. CAS-084): 84/84 PASS
+  - `audit-decision.test.js` (AD-001 .. AD-122): 122/122 PASS
+  - `auditor-recovery-store.test.js` (ARS-001 .. ARS-082): 82/82 PASS
+  - `auditor-thread-lifecycle.test.js` (ATL-001 .. ATL-122): 122/122 PASS
 - **Audit Decision (AD):** 122 / 122 PASS
 - **Auditor Recovery Store (ARS):** 82 / 82 PASS
 - **Auditor Thread Lifecycle (ATL):** 122 / 122 PASS
 - **Codex App Server (CAS):** 84 / 84 PASS
-- **Deterministic 13 Suites:** **PASS (exit code 0)**
 
 ---
 
@@ -200,21 +192,31 @@ Full suite execution (`npm test` in `pipeline-ui`):
 
 Inspection of local runtime files in `~/.orchestrator/`:
 
-```javascript
-// Database: ~/.orchestrator/auditor-recovery.sqlite3
-PRAGMA user_version; // 2
-SELECT COUNT(*) FROM auditor_bootstrap; // 0 (NONE)
-SELECT terminal_state FROM auditor_bootstrap_history WHERE operation_id = 'op-75aaae7e653019b7';
-// 'LEGACY_AUTHORITY_RETIRED'
+```sql
+-- Database: ~/.orchestrator/auditor-recovery.sqlite3
+PRAGMA user_version;
+-- Result: 2
 
+SELECT COUNT(*) FROM auditor_bootstrap;
+-- Result: 0 (NONE)
+
+SELECT previous_state, next_state
+FROM auditor_bootstrap_history
+WHERE operation_id = 'op-75aaae7e653019b7'
+ORDER BY history_seq DESC
+LIMIT 1;
+-- Result: DECISION_VALIDATED -> LEGACY_AUTHORITY_RETIRED
+```
+
+```javascript
 // Registry: ~/.orchestrator/projects.json
-projects['chatgpt-orchestrator'].auditor.thread_id; // '01a0be36-97bb-7831-8adb-02e1c1e70be0'
-projects['chatgpt-orchestrator'].auditor.enabled;   // true
+registry.projects['chatgpt-orchestrator'].auditor.thread_id; // '01a0be36-97bb-7831-8adb-02e1c1e70be0'
+registry.projects['chatgpt-orchestrator'].auditor.enabled;   // true
 ```
 
 - Real recovery schema: **2**
 - Real active recovery: **NONE**
-- Real R8 terminal history: **`LEGACY_AUTHORITY_RETIRED`**
+- Real R8 final transition: **`DECISION_VALIDATED -> LEGACY_AUTHORITY_RETIRED`**
 - Real R9 Registry auditor thread: **`01a0be36-97bb-7831-8adb-02e1c1e70be0`**
 - Real R9 Registry auditor enabled: **`true`**
 - Real Codex calls during review: **0**
@@ -225,13 +227,13 @@ projects['chatgpt-orchestrator'].auditor.enabled;   // true
 
 ## 8. Final Closure Verdict
 
-All source, test, R9 evidence, R3 correction, replay provenance, and real-state checks pass completely.
+All source, test, R9 evidence, R3 correction, replay provenance, and real-state checks pass completely. Closure of WP-V4-05 is pending external review of this evidence correction.
 
 ```text
 WP-V4-05AG: APPROVED_CLOSED
 WP-V4-05B:  COMPLETE
-WP-V4-05:   COMPLETE
+WP-V4-05:   BLOCKED_PENDING_FINAL_R1_EXTERNAL_REVIEW
 WP-V4-06:   NOT_STARTED
 
-Result: READY_FOR_WP_V4_06
+Result: READY_FOR_WP_V4_05_FINAL_R1_EXTERNAL_REVIEW
 ```

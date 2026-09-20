@@ -52,7 +52,7 @@ Chạy quy trình khôi phục chính thức:
 - **Nếu ở `REGISTRY_BINDING`**: Recovery tự động đối soát Registry v2. Nếu Registry đã gắn đúng ID, bản ghi bootstrap được xóa và hoàn tất `DURABLE_BOUND`. Nếu chưa gắn, lệnh `bindAuditorThread` được gọi lại với tính chất idempotent an toàn tuyệt đối.
 
 ### 3. Nguyên tắc vận hành an toàn (Fail-Closed Safety Rules)
-1. **Không sửa tay SQLite**: Tuyệt đối không can thiệp bằng các công cụ SQLite bên ngoài để sửa đổi trường `state` hoặc xóa thủ công các bản ghi trong `auditor_recovery_v1` vì có thể phá vỡ tính toàn vẹn chữ ký hash của validated decision.
+1. **Không sửa tay SQLite**: Tuyệt đối không can thiệp bằng các công cụ SQLite bên ngoài để sửa đổi trường `state` hoặc xóa thủ công các bản ghi active trong bảng `auditor_bootstrap`, và không sửa đổi hay ghi đè lịch sử trong bảng `auditor_bootstrap_history` vì có thể phá vỡ tính toàn vẹn chữ ký hash và chuỗi thẩm quyền của validated decision.
 2. **Không copy/touch file session Codex**: Quá trình rollout file hoàn toàn do App Server quản lý. Tuyệt đối không tạo file giả lập để ép `thread/resume` thành công.
 3. **Môi trường Test**: Trong các bài kiểm tra tự động và diễn tập phục hồi, bắt buộc dùng isolated temporary directory cho cả Registry file lẫn SQLite recovery file (`PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;`).
 
