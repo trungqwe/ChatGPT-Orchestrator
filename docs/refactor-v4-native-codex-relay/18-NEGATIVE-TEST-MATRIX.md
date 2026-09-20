@@ -137,3 +137,21 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 101. **RG-BIND-03** (Conflicting Thread ID Rejection): Dự án đã bind thread `th-existing` cố bind thread `th-different` ném lỗi `AUDITOR_BINDING_CONFLICT` mà không ghi đè Registry (RG-045).
 102. **RG-BIND-04** (Disabled-Bound State Preservation): Gọi `bindAuditorThread` với cùng thread ID trên project đang `enabled: false` giữ nguyên `enabled: false` (RG-047).
 103. **RG-BIND-05** (Atomic Rename Resilience & Write-Lock): `bindAuditorThread` chạy trong hàng đợi `serializeMutation()`, đảm bảo an toàn đồng thời tuyệt đối giữa các tiến trình/luồng (RG-049).
+
+## Auditor Durability Authority Final Seal Negative Matrix (WP-V4-05AF: ARS-039..051, ATL-048..060, RG-050..055)
+
+104. **ARS-PATCH-01** (Top-Level Key Reject): Truyền `turn_id` hoặc decision fields ở top-level của `transitionState` bị từ chối với `AUDITOR_RECOVERY_INVALID_REQUEST` (ARS-039, ARS-040).
+105. **ARS-PATCH-02** (Patch Key Allowlist): Truyền key không thuộc `{ turn_id, decision_json, decision_sha256 }` trong `patch` bị từ chối với `AUDITOR_RECOVERY_INVALID_REQUEST` (ARS-041).
+106. **ARS-PATCH-03** (State-Specific Patch Rules): `STARTING` không cho patch, `IN_FLIGHT` bắt buộc `turn_id`, `DECISION_VALIDATED` bắt buộc `decision_json` (ARS-042, ARS-043, ARS-044, ARS-045).
+107. **ARS-REOPEN-05** (Corrupt In-Flight Reopen): Reopen khi `FIRST_TURN_IN_FLIGHT` có `turn_id == null` ném `AUDITOR_RECOVERY_CORRUPT` (ARS-046).
+108. **ARS-REOPEN-06** (Corrupt Decision Reopen): Reopen khi `DECISION_VALIDATED` thiếu decision fields ném `AUDITOR_RECOVERY_CORRUPT` (ARS-047).
+109. **ARS-HIST-01** (Broken History Chain): Lịch sử chuyển trạng thái bị xáo trộn hoặc sai previous_state ném `AUDITOR_RECOVERY_CORRUPT` (ARS-048).
+110. **ARS-BOUNDS-01** (Persisted Control Character): Ký tự điều khiển trong ID đã lưu bị từ chối khi mở DB (ARS-049).
+111. **ARS-SCHEMA-04** (Schema Drift Rogue Column): Cột lạ trong bảng authority bị từ chối fail-closed (ARS-050).
+112. **ARS-INTEG-01** (Physical PRAGMA integrity_check Failure): DB hỏng vật lý ném `AUDITOR_RECOVERY_CORRUPT` (ARS-051).
+113. **ATL-WS-01** (Missing Workspace Port): Thiếu `workspacePort` bị từ chối trước khi gọi adapter (ATL-048).
+114. **ATL-WS-02** (Invalid Workspace Snapshot): Trả về string, null, sai projectId, sai projectRoot, hoặc rỗng workspace_state_id đều ném `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (ATL-049..ATL-053).
+115. **ATL-INP-01** (Missing First-Turn Input): Thiếu hoặc rỗng `auditSubjectId` / `auditPrompt` bị từ chối trước khi tạo thread (ATL-054..ATL-057).
+116. **ATL-REC-03** (Corrupt Decision Authority Recovery): Phục hồi từ `DECISION_VALIDATED` nhưng thiếu turn_id/decision ném `AUDITOR_RECOVERY_CORRUPT` (ATL-058..ATL-060).
+117. **RG-BIND-06** (Mandatory expected_project_root & Runtime Drift): Thiếu expected root hoặc root bị thay đổi canonical identity trên filesystem bị từ chối với `AUDITOR_BINDING_PRECONDITION_FAILED` (RG-050..RG-054).
+

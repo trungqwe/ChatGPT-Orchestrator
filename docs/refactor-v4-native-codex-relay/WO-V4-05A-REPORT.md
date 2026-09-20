@@ -296,6 +296,43 @@ TOTAL PASSING TESTS: 633+ tests, 0 failures, 100% pass rate.
 
 ### 16. Recommendation & Current Status
 
-Work Package **WO-V4-05A** is fully implemented, strictly tested, and verified against all functional, architectural, and security invariants.
+Work Package **WO-V4-05A** initial implementation was reviewed under external review WO-V4-05AF.
 
-**Status**: `READY_FOR_WP_V4_05A_EXTERNAL_REVIEW`
+**Status**: `SUPERSEDED BY EXTERNAL REVIEW / WO-V4-05AF`
+
+---
+
+### 17. Corrections & Superseded Claims (WO-V4-05AF)
+
+The following claims from the initial WO-V4-05A report were identified as deficient during external review and are formally superseded:
+
+1. **Transition Authority Persistence**:
+   - *Prior Claim*: Claimed `transitionBootstrap` persisted `turn_id`, `decision_json`, and `decision_sha256`.
+   - *Review Finding*: Lifecycle called `transitionBootstrap({ ..., turn_id })` and `transitionBootstrap({ ..., decision_json, decision_sha256 })` at the top level where the store silently ignored them.
+   - *Correction*: `SUPERSEDED BY EXTERNAL REVIEW / WO-V4-05AF`. Store API now enforces strict allowlists rejecting unknown top-level keys (`AUDITOR_RECOVERY_INVALID_REQUEST`), strict patch key allowlist, state-specific patch enforcement, and production lifecycle passes `patch: { turn_id }` and `patch: { decision_json, decision_sha256 }`.
+
+2. **Fresh DB Self-Validation**:
+   - *Prior Claim*: Claimed fresh DB creation performed complete validation.
+   - *Review Finding*: Fresh initialization was non-transactional and did not run schema/semantics/integrity gates before WAL activation.
+   - *Correction*: `SUPERSEDED BY EXTERNAL REVIEW / WO-V4-05AF`. Fresh database creation is wrapped in `BEGIN IMMEDIATE .. COMMIT`, runs `validateSchemaShape()`, `validatePersistedSemantics()`, and `PRAGMA integrity_check` before enabling WAL mode.
+
+3. **Integrity Check vs Quick Check**:
+   - *Prior Claim*: Claimed `PRAGMA integrity_check` was used.
+   - *Review Finding*: Implementation actually ran `PRAGMA quick_check`.
+   - *Correction*: `SUPERSEDED BY EXTERNAL REVIEW / WO-V4-05AF`. Authoritative contract locked to `PRAGMA integrity_check` requiring exact `'ok'`.
+
+4. **Exact Schema Validation**:
+   - *Prior Claim*: Claimed schema drift protection.
+   - *Review Finding*: Extra columns and loose index shapes were silently ignored.
+   - *Correction*: `SUPERSEDED BY EXTERNAL REVIEW / WO-V4-05AF`. `validateSchemaShape()` strictly checks exact column counts, names, types, nullability, uniqueness of `operation_id`, and index column targets (`idx_auditor_history_project` -> `project_id`, `idx_auditor_history_op` -> `operation_id`).
+
+5. **Registry projects.json Re-read**:
+   - *Prior Claim*: Claimed `bindAuditorThread` "directly re-reads projects.json inside the queue".
+   - *Review Finding*: Implementation used Registry in-memory authority serialized via `serializeMutation()`.
+   - *Correction*: `SUPERSEDED BY EXTERNAL REVIEW / WO-V4-05AF`. Corrected to: same-process serialized in-memory authority + runtime canonical filesystem revalidation (`canonicalizeProjectRoot`) + atomic persistence. No ad-hoc unsafe disk re-reads.
+
+6. **Number of Lifecycle States**:
+   - *Prior Claim*: Referenced "7-state lifecycle".
+   - *Review Finding*: Enum contains 8 persisted states (`PROVISIONAL_THREAD`, `FIRST_TURN_STARTING`, `FIRST_TURN_IN_FLIGHT`, `DECISION_VALIDATED`, `RESUME_VERIFYING`, `RESUME_VERIFIED`, `REGISTRY_BINDING`, `AUDIT_UNCERTAIN`).
+   - *Correction*: `SUPERSEDED BY EXTERNAL REVIEW / WO-V4-05AF`. All 8 states and their exact transition rules are strictly validated.
+

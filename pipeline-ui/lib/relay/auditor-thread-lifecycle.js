@@ -13,7 +13,8 @@ const {
 } = require('./audit-decision');
 const {
   REGISTRY_ERROR_CODES,
-  getAuditorBindingState
+  getAuditorBindingState,
+  computeRootIdentityKey
 } = require('../broker/registry');
 
 /**
@@ -28,7 +29,8 @@ const LIFECYCLE_ERROR_CODES = Object.freeze({
   AUDITOR_LIFECYCLE_DECISION_INVALID: 'AUDITOR_LIFECYCLE_DECISION_INVALID',
   AUDITOR_LIFECYCLE_RESUME_VERIFY_FAILED: 'AUDITOR_LIFECYCLE_RESUME_VERIFY_FAILED',
   AUDITOR_LIFECYCLE_REGISTRY_BIND_FAILED: 'AUDITOR_LIFECYCLE_REGISTRY_BIND_FAILED',
-  AUDITOR_LIFECYCLE_UNCERTAIN: 'AUDITOR_LIFECYCLE_UNCERTAIN'
+  AUDITOR_LIFECYCLE_UNCERTAIN: 'AUDITOR_LIFECYCLE_UNCERTAIN',
+  AUDITOR_RECOVERY_CORRUPT: 'AUDITOR_RECOVERY_CORRUPT'
 });
 
 /**
@@ -41,13 +43,6 @@ class AuditorLifecycleError extends Error {
     this.code = code;
     this.details = details;
   }
-}
-
-/**
- * Default workspace state probe: returns SHA-256 of project root and timestamp
- */
-async function defaultGetWorkspaceState(projectRoot) {
-  return crypto.createHash('sha256').update(projectRoot + ':' + Date.now()).digest('hex').slice(0, 16);
 }
 
 /**
@@ -103,7 +98,7 @@ async function bootstrapAuditorThread(options) {
     adapterFactory,
     awaitAuditDecision = awaitAuditDecisionV1,
     workspacePort,
-    auditSubjectId = `audit-bootstrap-${Date.now()}`,
+    auditSubjectId,
     auditPrompt,
     operationId = `op-${crypto.randomBytes(8).toString('hex')}`,
     turnTimeoutMs = 60000
@@ -131,6 +126,35 @@ async function bootstrapAuditorThread(options) {
     throw new AuditorLifecycleError(
       LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
       'adapterFactory must be a function'
+    );
+  }
+
+  // DURAUTH-03: Workspace port is required (Section 14)
+  if (!workspacePort || typeof workspacePort.getWorkspaceState !== 'function') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'workspacePort with getWorkspaceState method is required'
+    );
+  }
+
+  // DURAUTH-04: auditSubjectId is required (Section 18 & 32)
+  if (
+    typeof auditSubjectId !== 'string' ||
+    !auditSubjectId.trim() ||
+    Buffer.byteLength(auditSubjectId, 'utf8') > 512 ||
+    /[\x00-\x1f\x7f]/.test(auditSubjectId)
+  ) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'auditSubjectId is required and must be a non-empty string <= 512 bytes without control characters'
+    );
+  }
+
+  // DURAUTH-04: auditPrompt is required non-empty input array (Section 19 & 32)
+  if (!Array.isArray(auditPrompt) || auditPrompt.length === 0) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'auditPrompt is required and must be a non-empty adapter-compatible input array'
     );
   }
 
@@ -175,20 +199,48 @@ async function bootstrapAuditorThread(options) {
     );
   }
 
-  // 3. Capture workspace snapshot
-  let workspaceStateObserved;
-  if (workspacePort && typeof workspacePort.getWorkspaceState === 'function') {
-    workspaceStateObserved = await workspacePort.getWorkspaceState(project.project_root);
-  } else {
-    workspaceStateObserved = await defaultGetWorkspaceState(project.project_root);
-  }
-
-  if (typeof workspaceStateObserved !== 'string' || !workspaceStateObserved.trim()) {
+  // 3. Capture workspace snapshot using existing production interface (Sections 15 & 16)
+  let workspaceSnapshot;
+  try {
+    workspaceSnapshot = await workspacePort.getWorkspaceState(project);
+  } catch (err) {
     throw new AuditorLifecycleError(
       LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      'Failed to obtain non-empty workspace state snapshot'
+      `Failed to obtain workspace state: ${err.message}`
     );
   }
+
+  if (!workspaceSnapshot || typeof workspaceSnapshot !== 'object' || Array.isArray(workspaceSnapshot)) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      'workspacePort.getWorkspaceState must return a state object'
+    );
+  }
+
+  if (typeof workspaceSnapshot.workspace_state_id !== 'string' || !workspaceSnapshot.workspace_state_id.trim()) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      'workspace snapshot missing non-empty workspace_state_id'
+    );
+  }
+
+  if (workspaceSnapshot.project_id !== project.project_id) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `workspace snapshot project_id '${workspaceSnapshot.project_id}' does not match project '${project.project_id}'`
+    );
+  }
+
+  const snapshotIdentity = computeRootIdentityKey(workspaceSnapshot.project_root);
+  const projectIdentity = computeRootIdentityKey(project.project_root);
+  if (snapshotIdentity !== projectIdentity) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `workspace snapshot project_root does not match project canonical root`
+    );
+  }
+
+  const workspaceStateObserved = workspaceSnapshot.workspace_state_id;
 
   // 4. Spawn first App Server client in sandbox 'read-only'
   let client1 = null;
@@ -255,11 +307,9 @@ async function bootstrapAuditorThread(options) {
     next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING
   });
 
-  // 7. Call turn/start
+  // 7. Call turn/start (DURAUTH-04: first meaningful audit turn)
   const outputSchema = buildAuditDecisionV1OutputSchema(expectedContext);
-  const turnPrompt = auditPrompt || [
-    { type: 'text', text: `Execute initial auditor validation for project '${projectId}' at workspace state '${workspaceStateObserved}'.` }
-  ];
+  const turnPrompt = auditPrompt;
 
   let startTurnRes;
   try {
@@ -287,12 +337,14 @@ async function bootstrapAuditorThread(options) {
 
   const turnId = startTurnRes.turnId;
 
-  // 8. On turn accept -> commit FIRST_TURN_IN_FLIGHT with turn_id
+  // 8. On turn accept -> commit FIRST_TURN_IN_FLIGHT with turn_id in patch (Section 1 & 2)
   recoveryStore.transitionBootstrap({
     project_id: projectId,
     operation_id: operationId,
     next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
-    turn_id: turnId
+    patch: {
+      turn_id: turnId
+    }
   });
 
   // 9. Await turn completion and validate decision
@@ -324,13 +376,15 @@ async function bootstrapAuditorThread(options) {
   const decisionJson = JSON.stringify(validatedDecision);
   const decisionSha256 = crypto.createHash('sha256').update(decisionJson, 'utf8').digest('hex');
 
-  // Commit DECISION_VALIDATED
+  // Commit DECISION_VALIDATED with decision in patch (Section 1 & 2)
   recoveryStore.transitionBootstrap({
     project_id: projectId,
     operation_id: operationId,
     next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
-    decision_json: decisionJson,
-    decision_sha256: decisionSha256
+    patch: {
+      decision_json: decisionJson,
+      decision_sha256: decisionSha256
+    }
   });
 
   // 11. Close first App Server client
@@ -504,6 +558,53 @@ async function recoverAuditorBootstrap(options) {
     };
   }
 
+  // Enforce decision authority for advanced states (WO-V4-05AF Section 7)
+  if (
+    state === AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED ||
+    state === AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFYING ||
+    state === AUDITOR_BOOTSTRAP_STATES.RESUME_VERIFIED ||
+    state === AUDITOR_BOOTSTRAP_STATES.REGISTRY_BINDING
+  ) {
+    if (
+      !active.turn_id ||
+      typeof active.turn_id !== 'string' ||
+      !active.decision_json ||
+      typeof active.decision_json !== 'string' ||
+      !active.decision_sha256 ||
+      typeof active.decision_sha256 !== 'string' ||
+      !active.validated_decision ||
+      typeof active.validated_decision !== 'object'
+    ) {
+      throw new AuditorLifecycleError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Recovery in state '${state}' requires turn_id, decision_json, decision_sha256, and validated_decision`
+      );
+    }
+
+    const computedHash = crypto.createHash('sha256').update(active.decision_json, 'utf8').digest('hex');
+    if (computedHash !== active.decision_sha256) {
+      throw new AuditorLifecycleError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Decision hash mismatch in recovery state '${state}'`
+      );
+    }
+
+    try {
+      const expectedContext = {
+        project_id: active.project_id,
+        audit_subject_id: active.audit_subject_id,
+        auditor_thread_id: active.thread_id,
+        workspace_state_observed: active.workspace_state_observed
+      };
+      validateAuditDecisionV1(active.validated_decision, expectedContext);
+    } catch (err) {
+      throw new AuditorLifecycleError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+        `Validated decision corrupt in state '${state}': ${err.message}`
+      );
+    }
+  }
+
   // Case 3: DECISION_VALIDATED or RESUME_VERIFYING
   let currentState = state;
   if (currentState === AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED) {
@@ -622,6 +723,8 @@ async function recoverAuditorBootstrap(options) {
       project_id: projectId,
       thread_id: threadId,
       reconciled: true,
+      decision: active.validated_decision,
+      decision_sha256: active.decision_sha256,
       registry_binding_status: bindResult.status,
       project: bindResult.project
     };

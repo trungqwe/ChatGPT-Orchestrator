@@ -39,23 +39,37 @@ Kiến trúc phân định chặt chẽ ba trạng thái vòng đời của thre
 - Tuyệt đối không dùng `thread.path`, rollout path, hoặc session filename làm định danh authority. Định danh auditor duy nhất là opaque `thread.id`.
 - Nghiêm cấm Orchestrator can thiệp filesystem vào rollout: cấm tạo file rollout rỗng, cấm touch file, cấm copy/sửa file `.jsonl` hoặc quét thư mục `.codex/sessions` để ép resume thành công. Provider Codex toàn quyền sở hữu cơ chế persistence của nó.
 
-## Dedicated Atomic API: bindAuditorThread (WP-V4-05A)
+## Dedicated Atomic API: bindAuditorThread (WP-V4-05A / WO-V4-05AF)
 
 Registry v2 cung cấp API mutation chuyên dụng cho Auditor thread binding:
 
 ```js
-await registry.bindAuditorThread(projectId, threadId, options = {})
+await registry.bindAuditorThread({
+  project_id: projectId,
+  thread_id: threadId,
+  expected_project_root: expectedProjectRoot,
+  expected_model_policy: expectedModelPolicy // optional
+})
 ```
 
-### Ràng buộc và Ngữ nghĩa:
+### Ràng buộc và Ngữ nghĩa (Cập nhật sau WO-V4-05AF):
 1. **Atomic Mutation Queue**: Chạy hoàn toàn bên trong `serializeMutation()`. Không bao giờ sử dụng mẫu `getProject → mutate → putProject` từ bên ngoài để tránh race conditions.
-2. **Re-read trước Mutation**: Đọc lại và validate toàn bộ file Registry v2 ngay trước khi thực hiện binding.
+2. **Thẩm quyền In-Memory có tuần tự hóa & Revalidation Filesystem Runtime**:
+   - Sử dụng thẩm quyền in-memory của Registry được tuần tự hóa qua mutation queue (không thực hiện disk re-read không an toàn).
+   - Ngay trước khi ghi mutation:
+     1. Resolve `existingProject` hiện tại từ bộ nhớ.
+     2. Canonicalize và revalidate `existingProject.project_root` trên filesystem.
+     3. Chứng minh runtime canonical identity bằng đúng stored identity.
+     4. Chứng minh `auditor.cwd` có cùng canonical identity.
+     5. Yêu cầu và validate `expected_project_root` bắt buộc phải trùng khớp canonical identity đó.
+   - Bất kỳ bước nào không khớp ném `AUDITOR_BINDING_PRECONDITION_FAILED` và không ghi đĩa.
 3. **Input Validation**:
-   - `projectId`: Bắt buộc tồn tại trong registry; nếu không tồn tại ném `AUDITOR_BINDING_PRECONDITION_FAILED` (kèm cờ `details.notFound = true`).
-   - `threadId`: Bắt buộc là string, không rỗng, không chứa khoảng trắng thừa (`threadId.trim() === threadId`), độ dài UTF-8 $\le 512$ bytes, không chứa ký tự điều khiển (`/[\x00-\x1f\x7f]/`). Vi phạm ném `AUDITOR_BINDING_PRECONDITION_FAILED`.
+   - `projectId`: Bắt buộc tồn tại trong registry; nếu không tồn tại ném `AUDITOR_BINDING_PRECONDITION_FAILED` / `PROJECT_NOT_FOUND`.
+   - `threadId`: Bắt buộc là string, không rỗng, không chứa khoảng trắng thừa (`threadId.trim() === threadId`), độ dài UTF-8 $\le 512$ bytes, không chứa ký tự điều khiển (`/[\x00-\x1f\x7f]/`). Vi phạm ném `AUDITOR_BINDING_PRECONDITION_FAILED` hoặc `REGISTRY_SCHEMA_INVALID`.
+   - `expected_project_root`: Bắt buộc cung cấp. Thiếu hoặc rỗng ném `AUDITOR_BINDING_PRECONDITION_FAILED`.
 4. **Same-Thread Idempotency**: Nếu `project.auditor.thread_id === threadId`, coi là idempotent:
    - Trả về `{ changed: false, project }`.
-   - Không thay đổi trường `enabled` (bảo toàn trạng thái `AUDITOR_BOUND_DISABLED` nếu project đã bị disabled trước đó).
+   - Không thay đổi trường `enabled` (bảo toàn trạng thái `AUDITOR_BOUND_DISABLED` nếu project đã bị disabled trước đó; không bao giờ tự động enable).
 5. **Different-Thread Conflict**: Nếu `project.auditor.thread_id != null` và `!== threadId`:
    - Ném lỗi `AUDITOR_BINDING_CONFLICT` (`code: AUDITOR_BINDING_CONFLICT`).
    - Ngăn chặn việc ghi đè hoặc chiếm dụng thread ID của auditor đang gắn kết.
@@ -68,3 +82,4 @@ await registry.bindAuditorThread(projectId, threadId, options = {})
    - `thread_id == null` $\to$ `AUDITOR_REGISTRATION_REQUIRED`.
    - `thread_id != null && enabled === true` $\to$ `AUDITOR_BOUND_READY`.
    - `thread_id != null && enabled === false` $\to$ `AUDITOR_BOUND_DISABLED`.
+

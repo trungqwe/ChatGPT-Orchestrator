@@ -66,7 +66,7 @@ function makeValidProject(id, rootPath, overrides = {}) {
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('RUNNING REGISTRY TEST SUITE (RG-001 .. RG-049)');
+  console.log('RUNNING REGISTRY TEST SUITE (RG-001 .. RG-055)');
   console.log('======================================================================\n');
 
   // RG-001: Empty / nonexistent registry file
@@ -1477,12 +1477,14 @@ async function runAllTests() {
 
       await registry.bindAuditorThread({
         project_id: 'proj-replay',
-        thread_id: 'thread-replay-1'
+        thread_id: 'thread-replay-1',
+        expected_project_root: projDir
       });
 
       const replayRes = await registry.bindAuditorThread({
         project_id: 'proj-replay',
-        thread_id: 'thread-replay-1'
+        thread_id: 'thread-replay-1',
+        expected_project_root: projDir
       });
 
       assert.strictEqual(replayRes.ok, true);
@@ -1510,14 +1512,16 @@ async function runAllTests() {
 
       await registry.bindAuditorThread({
         project_id: 'proj-conflict',
-        thread_id: 'thread-first'
+        thread_id: 'thread-first',
+        expected_project_root: projDir
       });
 
       let caught = null;
       try {
         await registry.bindAuditorThread({
           project_id: 'proj-conflict',
-          thread_id: 'thread-second'
+          thread_id: 'thread-second',
+          expected_project_root: projDir
         });
       } catch (err) {
         caught = err;
@@ -1560,7 +1564,8 @@ async function runAllTests() {
       try {
         await registry.bindAuditorThread({
           project_id: 'proj-disabled',
-          thread_id: 'thread-disabled-99'
+          thread_id: 'thread-disabled-99',
+          expected_project_root: projDir
         });
       } catch (err) {
         caught = err;
@@ -1629,6 +1634,7 @@ async function runAllTests() {
         await registry.bindAuditorThread({
           project_id: 'proj-pol-pre',
           thread_id: 'thread-pol-1',
+          expected_project_root: projDir,
           expected_model_policy: 'auditor_deep'
         });
       } catch (err) {
@@ -1669,7 +1675,8 @@ async function runAllTests() {
         try {
           await registry.bindAuditorThread({
             project_id: 'proj-invalid-thread',
-            thread_id: badThread
+            thread_id: badThread,
+            expected_project_root: projDir
           });
         } catch (err) {
           caught = err;
@@ -1696,7 +1703,8 @@ async function runAllTests() {
       try {
         await registry.bindAuditorThread({
           project_id: 'nonexistent-proj',
-          thread_id: 'thread-123'
+          thread_id: 'thread-123',
+          expected_project_root: sandbox.dir
         });
       } catch (err) {
         caught = err;
@@ -1738,7 +1746,8 @@ async function runAllTests() {
       try {
         await registry.bindAuditorThread({
           project_id: 'proj-persist-fail',
-          thread_id: 'thread-fail-persist'
+          thread_id: 'thread-fail-persist',
+          expected_project_root: projDir
         });
       } catch (err) {
         caught = err;
@@ -1772,8 +1781,8 @@ async function runAllTests() {
       await registry.putProject(makeValidProject('proj-conc', projDir));
 
       // Call bind concurrently with same thread
-      const p1 = registry.bindAuditorThread({ project_id: 'proj-conc', thread_id: 'thread-conc-1' });
-      const p2 = registry.bindAuditorThread({ project_id: 'proj-conc', thread_id: 'thread-conc-1' });
+      const p1 = registry.bindAuditorThread({ project_id: 'proj-conc', thread_id: 'thread-conc-1', expected_project_root: projDir });
+      const p2 = registry.bindAuditorThread({ project_id: 'proj-conc', thread_id: 'thread-conc-1', expected_project_root: projDir });
 
       const [res1, res2] = await Promise.all([p1, p2]);
       assert.strictEqual(res1.ok, true);
@@ -1789,8 +1798,234 @@ async function runAllTests() {
     }
   }
 
+  // RG-050: Missing expected_project_root fails closed
+  {
+    console.log('[RG-050] Missing expected_project_root fails closed with AUDITOR_BINDING_PRECONDITION_FAILED...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-req-root');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-req-root', projDir));
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-req-root',
+          thread_id: 'thread-req-1'
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED);
+
+      // Verify remains unbound
+      const p = await registry.getProject('proj-req-root');
+      assert.strictEqual(p.auditor.thread_id, null);
+
+      console.log('✓ RG-050 PASSED: Missing expected_project_root rejected fail-closed.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-051: Empty expected_project_root fails closed
+  {
+    console.log('[RG-051] Empty or whitespace expected_project_root fails closed with AUDITOR_BINDING_PRECONDITION_FAILED...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-empty-root');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-empty-root', projDir));
+
+      for (const badRoot of ['', '   ', null, 123]) {
+        let caught = null;
+        try {
+          await registry.bindAuditorThread({
+            project_id: 'proj-empty-root',
+            thread_id: 'thread-empty-root',
+            expected_project_root: badRoot
+          });
+        } catch (err) {
+          caught = err;
+        }
+
+        assert.ok(caught);
+        assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED);
+      }
+
+      console.log('✓ RG-051 PASSED: Empty expected_project_root rejected fail-closed.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-052: Registered project_root deleted before bind fails closed
+  {
+    console.log('[RG-052] Registered path deleted after load fails closed on bind with AUDITOR_BINDING_PRECONDITION_FAILED...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-deleted-root');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-deleted-root', projDir));
+
+      // Delete the registered directory from disk
+      fs.rmSync(projDir, { recursive: true, force: true });
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-deleted-root',
+          thread_id: 'thread-deleted-root-1',
+          expected_project_root: projDir
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED);
+
+      console.log('✓ RG-052 PASSED: Registered path deleted before bind rejected fail-closed.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-053: Runtime canonical identity drift fails closed
+  {
+    console.log('[RG-053] Runtime canonical identity drift fails closed on bind...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-drift');
+      const otherDir = path.join(sandbox.dir, 'proj-drift-other');
+      fs.mkdirSync(projDir, { recursive: true });
+      fs.mkdirSync(otherDir, { recursive: true });
+
+      let simulateDrift = false;
+      const driftFs = {
+        ...fs,
+        realpathSync: (p, opts) => {
+          if (simulateDrift) {
+            return otherDir;
+          }
+          return fs.realpathSync(p, opts);
+        }
+      };
+      if (fs.realpathSync.native) {
+        driftFs.realpathSync.native = (p, opts) => {
+          if (simulateDrift) {
+            return otherDir;
+          }
+          return fs.realpathSync.native(p, opts);
+        };
+      }
+
+      const registry = createProjectRegistry({ registryFilePath: regFile, fs: driftFs });
+      await registry.putProject(makeValidProject('proj-drift', projDir));
+
+      simulateDrift = true;
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-drift',
+          thread_id: 'thread-drift-1',
+          expected_project_root: projDir
+        });
+      } catch (err) {
+        caught = err;
+      }
+      simulateDrift = false;
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED);
+
+      console.log('✓ RG-053 PASSED: Runtime canonical identity drift rejected fail-closed.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-054: Nonexistent expected_project_root fails closed
+  {
+    console.log('[RG-054] Nonexistent expected_project_root fails closed with AUDITOR_BINDING_PRECONDITION_FAILED...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-nonexistent-exp');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-nonexistent-exp', projDir));
+
+      const missingExpPath = path.join(sandbox.dir, 'never-created-dir');
+
+      let caught = null;
+      try {
+        await registry.bindAuditorThread({
+          project_id: 'proj-nonexistent-exp',
+          thread_id: 'thread-nonexistent-exp',
+          expected_project_root: missingExpPath
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED);
+
+      console.log('✓ RG-054 PASSED: Nonexistent expected_project_root rejected fail-closed.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // RG-055: Exact replay idempotency retains exact bound state
+  {
+    console.log('[RG-055] Exact replay idempotency retains exact bound state...');
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const projDir = path.join(sandbox.dir, 'proj-replay-idemp');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registry = createProjectRegistry({ registryFilePath: regFile });
+      await registry.putProject(makeValidProject('proj-replay-idemp', projDir));
+
+      const res1 = await registry.bindAuditorThread({
+        project_id: 'proj-replay-idemp',
+        thread_id: 'thread-replay-idemp-1',
+        expected_project_root: projDir
+      });
+      assert.strictEqual(res1.status, 'BOUND');
+
+      const res2 = await registry.bindAuditorThread({
+        project_id: 'proj-replay-idemp',
+        thread_id: 'thread-replay-idemp-1',
+        expected_project_root: projDir
+      });
+      assert.strictEqual(res2.status, 'ALREADY_BOUND_SAME_THREAD');
+      assert.deepStrictEqual(res1.project, res2.project);
+
+      console.log('✓ RG-055 PASSED: Replay idempotency preserves bound state identically.\n');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
   console.log('======================================================================');
-  console.log('ALL REGISTRY TESTS PASSED (RG-001 .. RG-049: 49/49 PASS)');
+  console.log('ALL REGISTRY TESTS PASSED (RG-001 .. RG-055: 55/55 PASS)');
   console.log('======================================================================\n');
 }
 

@@ -5,12 +5,17 @@ const path = require('path');
 const os = require('os');
 const assert = require('assert');
 const crypto = require('crypto');
+const { DatabaseSync } = require('node:sqlite');
 
+const child_process = require('child_process');
 const {
   createProjectRegistry,
   REGISTRY_ERROR_CODES,
   getAuditorBindingState
 } = require('../../lib/broker/registry');
+const {
+  createWorkspaceStatePort
+} = require('../../lib/broker/workspace-state');
 const {
   createSqliteAuditorRecoveryStore,
   AUDITOR_BOOTSTRAP_STATES,
@@ -34,6 +39,48 @@ const {
 } = require('../../lib/relay/auditor-thread-lifecycle');
 
 const FAKE_APP_SERVER_PATH = path.resolve(__dirname, '../fixtures/fake-codex-app-server.js');
+
+const DEFAULT_AUDIT_PROMPT = Object.freeze([{ type: 'text', text: 'Perform audit evaluation.' }]);
+
+function createMockWorkspacePort(wsStateId = 'ws-fixed-001') {
+  return {
+    getWorkspaceState: async (project) => ({
+      schema_version: 1,
+      workspace_state_id: wsStateId,
+      project_id: project.project_id,
+      project_root: project.project_root
+    })
+  };
+}
+
+function initGitRepo(repoDir) {
+  fs.mkdirSync(repoDir, { recursive: true });
+  const run = (args) => {
+    const res = child_process.spawnSync('git', args, { cwd: repoDir, shell: false, encoding: 'utf8' });
+    if (res.status !== 0) {
+      throw new Error(`Git command 'git ${args.join(' ')}' failed: ${res.stderr}`);
+    }
+    return res;
+  };
+  run(['init', '-b', 'main']);
+  run(['config', 'user.name', 'Test Auditor']);
+  run(['config', 'user.email', 'auditor@example.com']);
+  run(['config', 'commit.gpgsign', 'false']);
+}
+
+function commitFile(repoDir, relPath, content, msg = 'initial commit') {
+  const fullPath = path.join(repoDir, relPath);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  fs.writeFileSync(fullPath, content);
+  const run = (args) => {
+    const res = child_process.spawnSync('git', args, { cwd: repoDir, shell: false, encoding: 'utf8' });
+    if (res.status !== 0) {
+      throw new Error(`Git command 'git ${args.join(' ')}' failed: ${res.stderr}`);
+    }
+  };
+  run(['add', relPath]);
+  run(['commit', '-m', msg]);
+}
 
 function createTestSandbox() {
   const dir = path.join(os.tmpdir(), `test-atl-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`);
@@ -114,7 +161,9 @@ function advanceToState(recoveryStore, { projectId, operationId, targetState, th
     project_id: projectId,
     operation_id: operationId,
     next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
-    turn_id: 'turn-test-01'
+    patch: {
+      turn_id: 'turn-test-01'
+    }
   });
   if (targetState === AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT) return;
 
@@ -138,8 +187,10 @@ function advanceToState(recoveryStore, { projectId, operationId, targetState, th
     project_id: projectId,
     operation_id: operationId,
     next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
-    decision_json: decJson,
-    decision_sha256: decHash
+    patch: {
+      decision_json: decJson,
+      decision_sha256: decHash
+    }
   });
   if (targetState === AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED) return;
 
@@ -165,7 +216,7 @@ function advanceToState(recoveryStore, { projectId, operationId, targetState, th
 }
 
 async function runAllTests() {
-  console.log('Starting Auditor Thread Lifecycle test suite (ATL-001 .. ATL-045)...');
+  console.log('Starting Auditor Thread Lifecycle test suite (ATL-001 .. ATL-060)...');
 
   // ATL-001: Complete happy-path bootstrap sequence end-to-end
   {
@@ -193,9 +244,7 @@ async function runAllTests() {
         ]
       });
 
-      const workspacePort = {
-        getWorkspaceState: async () => 'ws-fixed-001'
-      };
+      const workspacePort = createMockWorkspacePort('ws-fixed-001');
 
       const result = await bootstrapAuditorThread({
         projectId: 'proj-001',
@@ -203,7 +252,8 @@ async function runAllTests() {
         recoveryStore,
         adapterFactory,
         workspacePort,
-        auditSubjectId: 'sub-001'
+        auditSubjectId: 'sub-001',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       assert.strictEqual(result.ok, true);
@@ -260,7 +310,10 @@ async function runAllTests() {
           projectId: 'nonexistent-proj',
           registryPort,
           recoveryStore,
-          adapterFactory: createAdapterFactory()
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort(),
+          auditSubjectId: 'sub-001',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -304,7 +357,10 @@ async function runAllTests() {
           projectId: 'proj-bound',
           registryPort,
           recoveryStore,
-          adapterFactory: createAdapterFactory()
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort(),
+          auditSubjectId: 'sub-001',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -348,7 +404,10 @@ async function runAllTests() {
           projectId: 'proj-disabled',
           registryPort,
           recoveryStore,
-          adapterFactory: createAdapterFactory()
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort(),
+          auditSubjectId: 'sub-001',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -391,7 +450,10 @@ async function runAllTests() {
           projectId: 'proj-active',
           registryPort,
           recoveryStore,
-          adapterFactory: createAdapterFactory()
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort(),
+          auditSubjectId: 'sub-001',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -452,7 +514,10 @@ async function runAllTests() {
           projectId: 'proj-fail-start',
           registryPort,
           recoveryStore,
-          adapterFactory: failingFactory
+          adapterFactory: failingFactory,
+          workspacePort: createMockWorkspacePort(),
+          auditSubjectId: 'sub-fail-start',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -505,7 +570,10 @@ async function runAllTests() {
           projectId: 'proj-fail-turn-start',
           registryPort,
           recoveryStore,
-          adapterFactory: failingAdapterFactory
+          adapterFactory: failingAdapterFactory,
+          workspacePort: createMockWorkspacePort(),
+          auditSubjectId: 'sub-fail-turn-start',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -550,7 +618,10 @@ async function runAllTests() {
           registryPort,
           recoveryStore,
           adapterFactory: failingFactory,
-          turnTimeoutMs: 3000
+          turnTimeoutMs: 3000,
+          workspacePort: createMockWorkspacePort(),
+          auditSubjectId: 'sub-fail-decision',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -622,8 +693,9 @@ async function runAllTests() {
           registryPort,
           recoveryStore,
           adapterFactory: splitFactory,
-          workspacePort: { getWorkspaceState: async () => 'ws-01' },
-          auditSubjectId: 'sub-01'
+          workspacePort: createMockWorkspacePort('ws-01'),
+          auditSubjectId: 'sub-01',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -696,8 +768,9 @@ async function runAllTests() {
           registryPort,
           recoveryStore,
           adapterFactory: splitFactory,
-          workspacePort: { getWorkspaceState: async () => 'ws-01' },
-          auditSubjectId: 'sub-01'
+          workspacePort: createMockWorkspacePort('ws-01'),
+          auditSubjectId: 'sub-01',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -756,8 +829,9 @@ async function runAllTests() {
           registryPort: conflictingRegistry,
           recoveryStore,
           adapterFactory: factory,
-          workspacePort: { getWorkspaceState: async () => 'ws-01' },
-          auditSubjectId: 'sub-01'
+          workspacePort: createMockWorkspacePort('ws-01'),
+          auditSubjectId: 'sub-01',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -892,14 +966,18 @@ async function runAllTests() {
         project_id: 'proj-iso',
         operation_id: 'op-iso',
         next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
-        turn_id: 'turn-iso'
+        patch: {
+          turn_id: 'turn-iso'
+        }
       });
       recoveryStore.transitionBootstrap({
         project_id: 'proj-iso',
         operation_id: 'op-iso',
         next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
-        decision_json: decJson,
-        decision_sha256: decHash
+        patch: {
+          decision_json: decJson,
+          decision_sha256: decHash
+        }
       });
 
       // Registry STILL has zero authority
@@ -1080,7 +1158,9 @@ async function runAllTests() {
         project_id: 'proj-rec-flight',
         operation_id: 'op-flight',
         next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
-        turn_id: 'turn-flight-1'
+        patch: {
+          turn_id: 'turn-flight-1'
+        }
       });
 
       const res = await recoverAuditorBootstrap({
@@ -1464,8 +1544,9 @@ async function runAllTests() {
             '--decision-workspace-state=ws-a'
           ]
         }),
-        workspacePort: { getWorkspaceState: async () => 'ws-a' },
-        auditSubjectId: 'sub-a'
+        workspacePort: createMockWorkspacePort('ws-a'),
+        auditSubjectId: 'sub-a',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       const resB = await bootstrapAuditorThread({
@@ -1480,8 +1561,9 @@ async function runAllTests() {
             '--decision-workspace-state=ws-b'
           ]
         }),
-        workspacePort: { getWorkspaceState: async () => 'ws-b' },
-        auditSubjectId: 'sub-b'
+        workspacePort: createMockWorkspacePort('ws-b'),
+        auditSubjectId: 'sub-b',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       assert.strictEqual(resA.ok, true);
@@ -1523,13 +1605,15 @@ async function runAllTests() {
         ]
       });
 
+      const wsPort = createMockWorkspacePort('ws-race');
       const p1 = bootstrapAuditorThread({
         projectId: 'proj-race',
         registryPort,
         recoveryStore,
         adapterFactory: factory,
-        workspacePort: { getWorkspaceState: async () => 'ws-race' },
-        auditSubjectId: 'sub-race'
+        workspacePort: wsPort,
+        auditSubjectId: 'sub-race',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       const p2 = bootstrapAuditorThread({
@@ -1537,8 +1621,9 @@ async function runAllTests() {
         registryPort,
         recoveryStore,
         adapterFactory: factory,
-        workspacePort: { getWorkspaceState: async () => 'ws-race' },
-        auditSubjectId: 'sub-race'
+        workspacePort: wsPort,
+        auditSubjectId: 'sub-race',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       const results = await Promise.allSettled([p1, p2]);
@@ -1584,8 +1669,9 @@ async function runAllTests() {
             '--decision-type=STOP'
           ]
         }),
-        workspacePort: { getWorkspaceState: async () => 'ws-stop' },
-        auditSubjectId: 'sub-stop'
+        workspacePort: createMockWorkspacePort('ws-stop'),
+        auditSubjectId: 'sub-stop',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       assert.strictEqual(result.ok, true);
@@ -1673,7 +1759,7 @@ async function runAllTests() {
         registryPort,
         recoveryStore,
         adapterFactory: trackingFactory,
-        workspacePort: { getWorkspaceState: async () => 'ws-pr' },
+        workspacePort: createMockWorkspacePort('ws-pr'),
         auditSubjectId: 'sub-pr',
         auditPrompt: customPrompt
       });
@@ -1709,6 +1795,9 @@ async function runAllTests() {
           registryPort,
           recoveryStore,
           adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort('ws-op'),
+          auditSubjectId: 'sub-op',
+          auditPrompt: DEFAULT_AUDIT_PROMPT,
           operationId: 'a'.repeat(129) // exceeds 128 bytes
         });
       } catch (err) {
@@ -1741,7 +1830,11 @@ async function runAllTests() {
       recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
 
       const failingWsPort = {
-        getWorkspaceState: async () => '' // empty string
+        getWorkspaceState: async () => ({
+          workspace_state_id: '',
+          project_id: 'proj-ws-fail',
+          project_root: projDir
+        })
       };
 
       let caught = null;
@@ -1751,7 +1844,9 @@ async function runAllTests() {
           registryPort,
           recoveryStore,
           adapterFactory: createAdapterFactory(),
-          workspacePort: failingWsPort
+          workspacePort: failingWsPort,
+          auditSubjectId: 'sub-ws-fail',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -1809,8 +1904,9 @@ async function runAllTests() {
         registryPort,
         recoveryStore,
         adapterFactory: closeFailingFactory,
-        workspacePort: { getWorkspaceState: async () => 'ws-cf' },
-        auditSubjectId: 'sub-cf'
+        workspacePort: createMockWorkspacePort('ws-cf'),
+        auditSubjectId: 'sub-cf',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       assert.strictEqual(result.ok, true);
@@ -1871,8 +1967,9 @@ async function runAllTests() {
           registryPort,
           recoveryStore,
           adapterFactory: interceptFactory,
-          workspacePort: { getWorkspaceState: async () => 'ws-dd' },
-          auditSubjectId: 'sub-dd'
+          workspacePort: createMockWorkspacePort('ws-dd'),
+          auditSubjectId: 'sub-dd',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
         });
       } catch (err) {
         caught = err;
@@ -1943,8 +2040,9 @@ async function runAllTests() {
             '--decision-workspace-state=ws-tr'
           ]
         }),
-        workspacePort: { getWorkspaceState: async () => 'ws-tr' },
-        auditSubjectId: 'sub-tr'
+        workspacePort: createMockWorkspacePort('ws-tr'),
+        auditSubjectId: 'sub-tr',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       const history = recoveryStore.getBootstrapHistory('proj-trace');
@@ -2039,8 +2137,9 @@ async function runAllTests() {
             '--decision-workspace-state=ws-mut'
           ]
         }),
-        workspacePort: { getWorkspaceState: async () => 'ws-mut' },
-        auditSubjectId: 'sub-mut'
+        workspacePort: createMockWorkspacePort('ws-mut'),
+        auditSubjectId: 'sub-mut',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
       });
 
       // Attempt mutating returned decision
@@ -2089,8 +2188,9 @@ async function runAllTests() {
           ]
         }),
         awaitAuditDecision: customAwait,
-        workspacePort: { getWorkspaceState: async () => 'ws-to' },
+        workspacePort: createMockWorkspacePort('ws-to'),
         auditSubjectId: 'sub-to',
+        auditPrompt: DEFAULT_AUDIT_PROMPT,
         turnTimeoutMs: 12345
       });
 
@@ -2242,8 +2342,704 @@ async function runAllTests() {
     }
   }
 
+  // ATL-046: Real createWorkspaceStatePort integration against isolated temporary Git repository (Section 17)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const gitRepoDir = path.join(sandbox.dir, 'git-repo-real');
+      fs.mkdirSync(gitRepoDir, { recursive: true });
+
+      initGitRepo(gitRepoDir);
+      commitFile(gitRepoDir, 'README.md', '# Real Git Repo for Auditor Durability\n');
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-real-git', gitRepoDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      const realWorkspacePort = createWorkspaceStatePort();
+      const projectRecord = await registryPort.getProject('proj-real-git');
+      const expectedWsSnapshot = await realWorkspacePort.getWorkspaceState(projectRecord);
+
+      assert.ok(expectedWsSnapshot.workspace_state_id);
+      assert.strictEqual(expectedWsSnapshot.project_id, 'proj-real-git');
+
+      const adapterFactory = createAdapterFactory({
+        scenario: 'audit_decision',
+        extraArgs: [
+          '--decision-project-id=proj-real-git',
+          '--decision-subject-id=sub-real-git',
+          `--decision-workspace-state=${expectedWsSnapshot.workspace_state_id}`
+        ]
+      });
+
+      const result = await bootstrapAuditorThread({
+        projectId: 'proj-real-git',
+        registryPort,
+        recoveryStore,
+        adapterFactory,
+        workspacePort: realWorkspacePort,
+        auditSubjectId: 'sub-real-git',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
+      });
+
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.status, 'DURABLE_BOUND');
+      assert.strictEqual(result.decision.workspace_state_observed, expectedWsSnapshot.workspace_state_id);
+
+      console.log('PASS: ATL-046 — Real createWorkspaceStatePort integration against isolated temporary Git repository');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-047: Crash recovery authority: lifecycle interrupted after DECISION_VALIDATED preserves authority and recovers (Section 26)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-crash-rec');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-crash-rec', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      const adapterFactory = createAdapterFactory({
+        scenario: 'audit_decision',
+        extraArgs: [
+          '--decision-project-id=proj-crash-rec',
+          '--decision-subject-id=sub-crash',
+          '--decision-workspace-state=ws-crash'
+        ]
+      });
+
+      const origTransition = recoveryStore.transitionBootstrap.bind(recoveryStore);
+      recoveryStore.transitionBootstrap = (params) => {
+        const ret = origTransition(params);
+        if (params.next_state === AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED) {
+          throw new Error('SIMULATED_CRASH_AFTER_DECISION_VALIDATED');
+        }
+        return ret;
+      };
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-crash-rec',
+          registryPort,
+          recoveryStore,
+          adapterFactory,
+          workspacePort: createMockWorkspacePort('ws-crash'),
+          auditSubjectId: 'sub-crash',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.message, 'SIMULATED_CRASH_AFTER_DECISION_VALIDATED');
+
+      // Close store and reopen from disk
+      recoveryStore.close();
+      recoveryStore = null;
+
+      const reopenedStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      const record = reopenedStore.getActiveBootstrap('proj-crash-rec');
+
+      // Verify exact authority fields persisted by production lifecycle calls
+      assert.strictEqual(record.state, AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED);
+      assert.ok(record.turn_id, 'turn_id must be non-null');
+      assert.ok(record.decision_json, 'decision_json must be non-null');
+      assert.ok(record.decision_sha256, 'decision_sha256 must be non-null');
+      assert.ok(record.validated_decision, 'validated_decision must be non-null');
+
+      const expectedSha256 = crypto.createHash('sha256').update(record.decision_json, 'utf8').digest('hex');
+      assert.strictEqual(record.decision_sha256, expectedSha256);
+
+      // Now recover through exact resume
+      const recoverResult = await recoverAuditorBootstrap({
+        projectId: 'proj-crash-rec',
+        registryPort,
+        recoveryStore: reopenedStore,
+        adapterFactory: createAdapterFactory({
+          scenario: 'default'
+        })
+      });
+
+      assert.strictEqual(recoverResult.ok, true);
+      assert.strictEqual(recoverResult.status, 'DURABLE_BOUND');
+      assert.strictEqual(recoverResult.thread_id, record.thread_id);
+      assert.strictEqual(recoverResult.decision.project_id, 'proj-crash-rec');
+
+      reopenedStore.close();
+      console.log('PASS: ATL-047 — Crash recovery authority: interrupted after DECISION_VALIDATED recovers authority');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-048: Missing workspacePort rejected before thread start (Section 31)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-ws-neg1');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-ws-neg1', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-ws-neg1',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          auditSubjectId: 'sub-ws-neg1',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST);
+
+      console.log('PASS: ATL-048 — Missing workspacePort rejected before thread start');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-049: workspacePort returning string rejected before thread start (Section 31)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-ws-neg2');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-ws-neg2', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-ws-neg2',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: { getWorkspaceState: async () => 'ws-legacy-string' },
+          auditSubjectId: 'sub-ws-neg2',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+
+      console.log('PASS: ATL-049 — workspacePort returning string rejected before thread start');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-050: workspacePort returning null rejected (Section 31)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-ws-neg3');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-ws-neg3', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-ws-neg3',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: { getWorkspaceState: async () => null },
+          auditSubjectId: 'sub-ws-neg3',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+
+      console.log('PASS: ATL-050 — workspacePort returning null rejected');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-051: workspacePort returning wrong project_id rejected (Section 31)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-ws-neg4');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-ws-neg4', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-ws-neg4',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: {
+            getWorkspaceState: async () => ({
+              workspace_state_id: 'ws-valid',
+              project_id: 'wrong-proj-id',
+              project_root: projDir
+            })
+          },
+          auditSubjectId: 'sub-ws-neg4',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+
+      console.log('PASS: ATL-051 — workspacePort returning wrong project_id rejected');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-052: workspacePort returning wrong project_root rejected (Section 31)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-ws-neg5');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-ws-neg5', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-ws-neg5',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: {
+            getWorkspaceState: async () => ({
+              workspace_state_id: 'ws-valid',
+              project_id: 'proj-ws-neg5',
+              project_root: path.join(sandbox.dir, 'completely-different-root')
+            })
+          },
+          auditSubjectId: 'sub-ws-neg5',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+
+      console.log('PASS: ATL-052 — workspacePort returning wrong project_root rejected');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-053: workspacePort returning missing or empty workspace_state_id rejected (Section 31)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-ws-neg6');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-ws-neg6', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-ws-neg6',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: {
+            getWorkspaceState: async () => ({
+              workspace_state_id: '   ',
+              project_id: 'proj-ws-neg6',
+              project_root: projDir
+            })
+          },
+          auditSubjectId: 'sub-ws-neg6',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+
+      console.log('PASS: ATL-053 — workspacePort returning whitespace workspace_state_id rejected');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-054: Missing auditSubjectId rejected before thread start (Section 32)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-inp-neg1');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-inp-neg1', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-inp-neg1',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort('ws-inp1'),
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST);
+
+      console.log('PASS: ATL-054 — Missing auditSubjectId rejected before thread start');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-055: Empty or whitespace auditSubjectId rejected before thread start (Section 32)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-inp-neg2');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-inp-neg2', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-inp-neg2',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort('ws-inp2'),
+          auditSubjectId: '   ',
+          auditPrompt: DEFAULT_AUDIT_PROMPT
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST);
+
+      console.log('PASS: ATL-055 — Empty auditSubjectId rejected before thread start');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-056: Missing auditPrompt rejected before thread start (Section 32)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-inp-neg3');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-inp-neg3', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-inp-neg3',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort('ws-inp3'),
+          auditSubjectId: 'sub-inp3'
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST);
+
+      console.log('PASS: ATL-056 — Missing auditPrompt rejected before thread start');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-057: Empty auditPrompt array rejected before thread start (Section 32)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-inp-neg4');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-inp-neg4', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      let caught = null;
+      try {
+        await bootstrapAuditorThread({
+          projectId: 'proj-inp-neg4',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createAdapterFactory(),
+          workspacePort: createMockWorkspacePort('ws-inp4'),
+          auditSubjectId: 'sub-inp4',
+          auditPrompt: []
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      assert.ok(caught);
+      assert.strictEqual(caught.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST);
+
+      console.log('PASS: ATL-057 — Empty auditPrompt array rejected before thread start');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-058: recoverAuditorBootstrap fails closed with AUDITOR_RECOVERY_CORRUPT if state is DECISION_VALIDATED but turn_id is NULL (Section 7, 28)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-rec-corrupt1');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-rec-corrupt1', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      advanceToState(recoveryStore, {
+        projectId: 'proj-rec-corrupt1',
+        operationId: 'op-rec-c1',
+        targetState: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+        subjectId: 'sub-c1',
+        wsState: 'ws-c1'
+      });
+
+      // Directly nullify turn_id in the database using raw SQLite connection
+      const rawDb = new DatabaseSync(dbFile);
+      rawDb.prepare("UPDATE auditor_bootstrap SET turn_id = NULL WHERE project_id = 'proj-rec-corrupt1'").run();
+      rawDb.close();
+
+      recoveryStore.close();
+      recoveryStore = null;
+
+      // Reopening directly triggers open-time semantic validation failure
+      assert.throws(() => {
+        createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      }, (err) => {
+        assert.strictEqual(err.code, 'AUDITOR_RECOVERY_CORRUPT');
+        return true;
+      });
+
+      console.log('PASS: ATL-058 — Recovery fails closed with AUDITOR_RECOVERY_CORRUPT if state is DECISION_VALIDATED but turn_id is NULL');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-059: recoverAuditorBootstrap fails closed with AUDITOR_RECOVERY_CORRUPT if state is DECISION_VALIDATED but decision_json is NULL (Section 7, 27)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-rec-corrupt2');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-rec-corrupt2', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      advanceToState(recoveryStore, {
+        projectId: 'proj-rec-corrupt2',
+        operationId: 'op-rec-c2',
+        targetState: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+        subjectId: 'sub-c2',
+        wsState: 'ws-c2'
+      });
+
+      // Directly nullify decision_json in the database using raw SQLite connection
+      const rawDb = new DatabaseSync(dbFile);
+      rawDb.prepare("UPDATE auditor_bootstrap SET decision_json = NULL, decision_sha256 = NULL WHERE project_id = 'proj-rec-corrupt2'").run();
+      rawDb.close();
+
+      recoveryStore.close();
+      recoveryStore = null;
+
+      // Reopening directly triggers open-time semantic validation failure
+      assert.throws(() => {
+        createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      }, (err) => {
+        assert.strictEqual(err.code, 'AUDITOR_RECOVERY_CORRUPT');
+        return true;
+      });
+
+      console.log('PASS: ATL-059 — Recovery fails closed with AUDITOR_RECOVERY_CORRUPT if state is DECISION_VALIDATED but decision_json is NULL');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-060: recoverAuditorBootstrap fails closed with AUDITOR_RECOVERY_CORRUPT if decision_sha256 is tampered (Section 7)
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-rec-corrupt3');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-rec-corrupt3', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      advanceToState(recoveryStore, {
+        projectId: 'proj-rec-corrupt3',
+        operationId: 'op-rec-c3',
+        targetState: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+        subjectId: 'sub-c3',
+        wsState: 'ws-c3'
+      });
+
+      // Tamper decision_sha256 in the database using raw SQLite connection
+      const rawDb = new DatabaseSync(dbFile);
+      rawDb.prepare("UPDATE auditor_bootstrap SET decision_sha256 = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' WHERE project_id = 'proj-rec-corrupt3'").run();
+      rawDb.close();
+
+      recoveryStore.close();
+      recoveryStore = null;
+
+      // Reopening directly triggers open-time semantic validation failure
+      assert.throws(() => {
+        createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      }, (err) => {
+        assert.strictEqual(err.code, 'AUDITOR_RECOVERY_CORRUPT');
+        return true;
+      });
+
+      console.log('PASS: ATL-060 — Recovery fails closed with AUDITOR_RECOVERY_CORRUPT if decision_sha256 is tampered');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-045: 45/45 PASS)');
+  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-060: 60/60 PASS)');
   console.log('======================================================================\n');
 }
 

@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Auditor Recovery Store Test Suite (ARS-001 .. ARS-038)
+ * Auditor Recovery Store Test Suite (ARS-001 .. ARS-051)
  * Verifies SQLite recovery store authority, single active bootstrap,
  * transition matrix, append-only history, decision hash & schema verification,
  * reopen semantics, and fail-closed corruption detection.
@@ -68,7 +68,7 @@ function makeValidDecision(ctx) {
 }
 
 async function runTests() {
-  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-038)...');
+  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-051)...');
 
   // ARS-001: Fresh DB creation and schema initialization
   {
@@ -1295,8 +1295,394 @@ async function runTests() {
     }
   }
 
+  // ARS-039: Top-level turn_id rejected (Section 25 / Section 3)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        audit_subject_id: 'sub-01',
+        thread_id: 'thr_1',
+        workspace_state_observed: 'ws_1'
+      });
+      store.transitionState({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING
+      });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+          turn_id: 'turn_1'
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-039 — Top-level turn_id rejected with AUDITOR_RECOVERY_INVALID_REQUEST');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-040: Top-level decision_json or decision_sha256 rejected (Section 25 / Section 3)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      const ctx = { project_id: 'proj-alpha', audit_subject_id: 'sub-01', auditor_thread_id: 'thr_1', workspace_state_observed: 'ws_1' };
+      store.beginBootstrap({ project_id: ctx.project_id, operation_id: 'op-001', audit_subject_id: ctx.audit_subject_id, thread_id: ctx.auditor_thread_id, workspace_state_observed: ctx.workspace_state_observed });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: ctx.project_id,
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+          decision_json: JSON.stringify(makeValidDecision(ctx))
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      assert.throws(
+        () => store.transitionState({
+          project_id: ctx.project_id,
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+          decision_sha256: 'a'.repeat(64)
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-040 — Top-level decision fields rejected with AUDITOR_RECOVERY_INVALID_REQUEST');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-041: Unknown patch keys rejected (Section 4)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+          patch: { turn_id: 'turn_1', rogue_field: 123 }
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-041 — Unknown patch keys rejected with AUDITOR_RECOVERY_INVALID_REQUEST');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-042: Non-empty patch on PROVISIONAL -> FIRST_TURN_STARTING rejected (Section 5)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING,
+          patch: { turn_id: 'turn_1' }
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-042 — Non-empty patch on PROVISIONAL -> FIRST_TURN_STARTING rejected');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-043: STARTING -> IN_FLIGHT without patch.turn_id rejected (Section 5)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-043 — STARTING -> IN_FLIGHT without turn_id rejected');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-044: STARTING -> IN_FLIGHT with decision fields forbidden (Section 5)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+          patch: { turn_id: 'turn_1', decision_json: '{}' }
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-044 — STARTING -> IN_FLIGHT with decision fields rejected');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-045: IN_FLIGHT -> DECISION_VALIDATED without decision_json rejected (Section 5)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+      store.close();
+      console.log('PASS: ARS-045 — IN_FLIGHT -> DECISION_VALIDATED without decision_json rejected');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-046: Corrupt in-flight reopen test: turn_id == null fails reopen (Section 28 / Section 6)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.beginBootstrap({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        audit_subject_id: 'sub-01',
+        thread_id: 'thr_1',
+        workspace_state_observed: 'ws_1'
+      });
+      store1.transitionState({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING
+      });
+      store1.transitionState({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+        patch: { turn_id: 'turn_1' }
+      });
+      store1.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec("UPDATE auditor_bootstrap SET turn_id = NULL WHERE project_id = 'proj-alpha'");
+      rawDb.close();
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStore({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+      console.log('PASS: ARS-046 — Corrupt in-flight reopen with turn_id=null fails closed');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-047: Corrupt DECISION_VALIDATED reopen test: decision_json = null, decision_sha256 = null (Section 27 / Section 6)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      const ctx = {
+        project_id: 'proj-alpha',
+        audit_subject_id: 'sub-01',
+        auditor_thread_id: 'thr_1',
+        workspace_state_observed: 'ws_1'
+      };
+      store1.beginBootstrap({
+        project_id: ctx.project_id,
+        operation_id: 'op-001',
+        audit_subject_id: ctx.audit_subject_id,
+        thread_id: ctx.auditor_thread_id,
+        workspace_state_observed: ctx.workspace_state_observed
+      });
+      store1.transitionState({
+        project_id: ctx.project_id,
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING
+      });
+      store1.transitionState({
+        project_id: ctx.project_id,
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT,
+        patch: { turn_id: 'turn_1' }
+      });
+      store1.transitionState({
+        project_id: ctx.project_id,
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+        patch: { decision_json: JSON.stringify(makeValidDecision(ctx)) }
+      });
+      store1.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec("UPDATE auditor_bootstrap SET decision_json = NULL, decision_sha256 = NULL WHERE project_id = 'proj-alpha'");
+      rawDb.close();
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStore({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+      console.log('PASS: ARS-047 — DECISION_VALIDATED with null decision fields fails reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-048: Broken history chain test: row.previous_state != prev.next_state (Section 29 / Section 8)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.beginBootstrap({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        audit_subject_id: 'sub-01',
+        thread_id: 'thr_1',
+        workspace_state_observed: 'ws_1'
+      });
+      store1.transitionState({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING
+      });
+      store1.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec("UPDATE auditor_bootstrap_history SET previous_state = 'CORRUPT_PREV' WHERE history_seq = 2");
+      rawDb.close();
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStore({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+      console.log('PASS: ARS-048 — Broken history transition chain fails reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-049: Persisted ID bounds revalidation on reopen (Section 9)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.beginBootstrap({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        audit_subject_id: 'sub-01',
+        thread_id: 'thr_1',
+        workspace_state_observed: 'ws_1'
+      });
+      store1.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.prepare("UPDATE auditor_bootstrap SET thread_id = ? WHERE project_id = ?").run('bad\x01thread', 'proj-alpha');
+      rawDb.close();
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStore({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+      console.log('PASS: ARS-049 — Control character in persisted thread_id fails reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-050: Schema drift with unexpected column fails reopen (Section 12)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec("ALTER TABLE auditor_bootstrap ADD COLUMN rogue_column TEXT");
+      rawDb.close();
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStore({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID }
+      );
+      console.log('PASS: ARS-050 — Schema drift with rogue column fails reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-051: Physical integrity check fails on corrupted database file (Section 11)
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.close();
+
+      // Corrupt database bytes directly
+      const buf = fs.readFileSync(dbPath);
+      buf.fill(0xff, 100, 200);
+      fs.writeFileSync(dbPath, buf);
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStore({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+      console.log('PASS: ARS-051 — Physical integrity check failure fails reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-038: 38/38 PASS)');
+  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-051: 51/51 PASS)');
   console.log('======================================================================\n');
 }
 

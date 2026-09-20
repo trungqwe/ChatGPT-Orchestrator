@@ -949,22 +949,73 @@ function createProjectRegistry(options = {}) {
         );
       }
 
-      // Optional expected_project_root verification
-      if (expected_project_root !== undefined && expected_project_root !== null) {
-        if (typeof expected_project_root !== 'string' || !expected_project_root.trim()) {
-          throw new RegistryError(
-            REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
-            'expected_project_root must be a non-empty string if provided'
-          );
-        }
-        const expectedIdentity = computeRootIdentityKey(expected_project_root);
-        const existingIdentity = computeRootIdentityKey(existingProject.project_root);
-        if (expectedIdentity !== existingIdentity) {
-          throw new RegistryError(
-            REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
-            `expected_project_root '${expected_project_root}' does not match registered root '${existingProject.project_root}'`
-          );
-        }
+      // Mandatory expected_project_root validation (WO-V4-05AF Section 21)
+      if (typeof expected_project_root !== 'string' || !expected_project_root.trim()) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+          'expected_project_root is mandatory and must be a non-empty string'
+        );
+      }
+
+      // Runtime canonical filesystem revalidation (WO-V4-05AF Section 20 / DURAUTH-05)
+      // 1. Resolve registered project (done above)
+      // 2. Canonicalize/revalidate existingProject.project_root against filesystem
+      let runtimeCanonicalRoot;
+      let runtimeIdentityKey;
+      try {
+        const rootRes = canonicalizeProjectRoot(existingProject.project_root, customFs);
+        runtimeCanonicalRoot = rootRes.canonicalRoot;
+        runtimeIdentityKey = rootRes.identityKey;
+      } catch (err) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+          `Registered project_root '${existingProject.project_root}' failed runtime filesystem validation: ${err.message}`
+        );
+      }
+
+      // 3. Prove runtime canonical identity still equals stored identity
+      const storedIdentity = computeRootIdentityKey(existingProject.project_root);
+      if (runtimeIdentityKey !== storedIdentity) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+          `Runtime canonical project_root identity '${runtimeIdentityKey}' does not match stored identity '${storedIdentity}'`
+        );
+      }
+
+      // 4. Prove auditor.cwd has same canonical identity
+      let cwdIdentity;
+      try {
+        const cwdRes = canonicalizeProjectRoot(existingProject.auditor.cwd, customFs);
+        cwdIdentity = cwdRes.identityKey;
+      } catch (err) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+          `auditor.cwd '${existingProject.auditor.cwd}' failed runtime filesystem validation: ${err.message}`
+        );
+      }
+      if (cwdIdentity !== runtimeIdentityKey) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+          `auditor.cwd identity '${cwdIdentity}' does not match canonical project_root identity '${runtimeIdentityKey}'`
+        );
+      }
+
+      // 5. Require and validate expected_project_root against that same identity
+      let expectedIdentity;
+      try {
+        const expRes = canonicalizeProjectRoot(expected_project_root, customFs);
+        expectedIdentity = expRes.identityKey;
+      } catch (err) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+          `expected_project_root '${expected_project_root}' failed runtime filesystem validation: ${err.message}`
+        );
+      }
+      if (expectedIdentity !== runtimeIdentityKey) {
+        throw new RegistryError(
+          REGISTRY_ERROR_CODES.AUDITOR_BINDING_PRECONDITION_FAILED,
+          `expected_project_root '${expected_project_root}' does not match registered root '${existingProject.project_root}'`
+        );
       }
 
       // Optional expected_model_policy verification
