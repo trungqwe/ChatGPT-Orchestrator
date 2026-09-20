@@ -68,7 +68,7 @@ function makeValidDecision(ctx) {
 }
 
 async function runTests() {
-  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-051)...');
+  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-061)...');
 
   // ARS-001: Fresh DB creation and schema initialization
   {
@@ -1681,8 +1681,327 @@ async function runTests() {
     }
   }
 
+  // ARS-052: AUDIT_UNCERTAIN -> AUDIT_TERMINAL_NO_DECISION accepted with empty patch
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      store.transitionState({
+        project_id: 'proj-alpha',
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION,
+        patch: {}
+      });
+
+      const active = store.getActiveBootstrap('proj-alpha');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+      assert.strictEqual(active.turn_id, 'turn_1');
+      assert.strictEqual(active.decision_json, null);
+      assert.strictEqual(active.decision_sha256, null);
+
+      store.close();
+      console.log('PASS: ARS-052 — AUDIT_UNCERTAIN -> AUDIT_TERMINAL_NO_DECISION accepted with empty patch');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-053: AUDIT_UNCERTAIN -> AUDIT_TERMINAL_NO_DECISION requires existing turn_id in active record
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      // Transition directly to AUDIT_UNCERTAIN without turn_id
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      store.close();
+      console.log('PASS: ARS-053 — AUDIT_UNCERTAIN -> AUDIT_TERMINAL_NO_DECISION requires existing turn_id in active record');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-054: Decision fields forbidden for AUDIT_TERMINAL_NO_DECISION
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION,
+          patch: { decision_json: '{}' }
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      store.close();
+      console.log('PASS: ARS-054 — Decision fields forbidden for AUDIT_TERMINAL_NO_DECISION');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-055: Transition to AUDIT_TERMINAL_NO_DECISION from non-AUDIT_UNCERTAIN state rejected
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      store.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+
+      assert.throws(
+        () => store.transitionState({
+          project_id: 'proj-alpha',
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_TRANSITION }
+      );
+
+      store.close();
+      console.log('PASS: ARS-055 — Transition to AUDIT_TERMINAL_NO_DECISION from non-AUDIT_UNCERTAIN rejected');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-056: AUDIT_TERMINAL_NO_DECISION persisted semantics accepted on reopen
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+      store1.close();
+
+      const store2 = createSqliteAuditorRecoveryStore({ dbPath });
+      const active = store2.getActiveBootstrap('proj-alpha');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+      assert.strictEqual(active.turn_id, 'turn_1');
+      assert.strictEqual(active.decision_json, null);
+      store2.close();
+
+      console.log('PASS: ARS-056 — AUDIT_TERMINAL_NO_DECISION persisted semantics accepted on reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-057: History chain with AUDIT_TERMINAL_NO_DECISION accepted on reopen
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+      store1.close();
+
+      const store2 = createSqliteAuditorRecoveryStore({ dbPath });
+      const history = store2.getBootstrapHistory('proj-alpha', 'op-001');
+      assert.strictEqual(history.length, 5);
+      assert.strictEqual(history[0].next_state, 'PROVISIONAL_THREAD');
+      assert.strictEqual(history[1].next_state, 'FIRST_TURN_STARTING');
+      assert.strictEqual(history[2].next_state, 'FIRST_TURN_IN_FLIGHT');
+      assert.strictEqual(history[3].next_state, 'AUDIT_UNCERTAIN');
+      assert.strictEqual(history[4].next_state, 'AUDIT_TERMINAL_NO_DECISION');
+      store2.close();
+
+      console.log('PASS: ARS-057 — History chain with AUDIT_TERMINAL_NO_DECISION accepted on reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-058: Invalid AUDIT_TERMINAL_NO_DECISION row fails reopen
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.beginBootstrap({ project_id: 'proj-alpha', operation_id: 'op-001', audit_subject_id: 'sub-01', thread_id: 'thr_1', workspace_state_observed: 'ws_1' });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      store1.transitionState({ project_id: 'proj-alpha', operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+      store1.close();
+
+      // Corrupt row by nulling turn_id
+      const { DatabaseSync } = require('node:sqlite');
+      const rawDb = new DatabaseSync(dbPath);
+      rawDb.exec("UPDATE auditor_bootstrap SET turn_id = NULL WHERE project_id = 'proj-alpha'");
+      rawDb.close();
+
+      assert.throws(
+        () => createSqliteAuditorRecoveryStore({ dbPath }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT }
+      );
+
+      console.log('PASS: ARS-058 — Invalid AUDIT_TERMINAL_NO_DECISION row fails reopen');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-059: AUDIT_UNCERTAIN -> DECISION_VALIDATED accepted only with valid stored turn_id and decision patch
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      const ctx = {
+        project_id: 'proj-alpha',
+        audit_subject_id: 'sub-01',
+        auditor_thread_id: 'thr_1',
+        workspace_state_observed: 'ws_1'
+      };
+      store.beginBootstrap({
+        project_id: ctx.project_id,
+        operation_id: 'op-001',
+        audit_subject_id: ctx.audit_subject_id,
+        thread_id: ctx.auditor_thread_id,
+        workspace_state_observed: ctx.workspace_state_observed
+      });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const decObj = makeValidDecision(ctx);
+      const decJson = JSON.stringify(decObj);
+      const decHash = crypto.createHash('sha256').update(decJson).digest('hex');
+
+      store.transitionState({
+        project_id: ctx.project_id,
+        operation_id: 'op-001',
+        next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+        patch: {
+          decision_json: decJson,
+          decision_sha256: decHash
+        }
+      });
+
+      const active = store.getActiveBootstrap(ctx.project_id);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED);
+      assert.strictEqual(active.turn_id, 'turn_1');
+      assert.strictEqual(active.decision_sha256, decHash);
+
+      store.close();
+      console.log('PASS: ARS-059 — AUDIT_UNCERTAIN -> DECISION_VALIDATED accepted with valid decision patch');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-060: Invalid decision or mismatched hash rejected on AUDIT_UNCERTAIN -> DECISION_VALIDATED
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store = createSqliteAuditorRecoveryStore({ dbPath });
+      const ctx = {
+        project_id: 'proj-alpha',
+        audit_subject_id: 'sub-01',
+        auditor_thread_id: 'thr_1',
+        workspace_state_observed: 'ws_1'
+      };
+      store.beginBootstrap({
+        project_id: ctx.project_id,
+        operation_id: 'op-001',
+        audit_subject_id: ctx.audit_subject_id,
+        thread_id: ctx.auditor_thread_id,
+        workspace_state_observed: ctx.workspace_state_observed
+      });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_1' } });
+      store.transitionState({ project_id: ctx.project_id, operation_id: 'op-001', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      // Mismatched hash
+      assert.throws(
+        () => store.transitionState({
+          project_id: ctx.project_id,
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+          patch: {
+            decision_json: JSON.stringify(makeValidDecision(ctx)),
+            decision_sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+          }
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      // Context mismatch (wrong thread ID in decision)
+      const badCtxDecision = makeValidDecision({ ...ctx, auditor_thread_id: 'wrong-thr' });
+      const badJson = JSON.stringify(badCtxDecision);
+      assert.throws(
+        () => store.transitionState({
+          project_id: ctx.project_id,
+          operation_id: 'op-001',
+          next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+          patch: {
+            decision_json: badJson
+          }
+        }),
+        (err) => err && err.code === 'AUDIT_DECISION_CONTEXT_MISMATCH'
+      );
+
+      store.close();
+      console.log('PASS: ARS-060 — Invalid decision or mismatched hash rejected on AUDIT_UNCERTAIN -> DECISION_VALIDATED');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-061: Existing schema-v1 database containing only pre-05AG states opens successfully
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const store1 = createSqliteAuditorRecoveryStore({ dbPath });
+      store1.beginBootstrap({ project_id: 'proj-pre', operation_id: 'op-pre', audit_subject_id: 'sub-pre', thread_id: 'thr_pre', workspace_state_observed: 'ws_pre' });
+      store1.transitionState({ project_id: 'proj-pre', operation_id: 'op-pre', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store1.transitionState({ project_id: 'proj-pre', operation_id: 'op-pre', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_pre' } });
+      store1.transitionState({ project_id: 'proj-pre', operation_id: 'op-pre', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      store1.close();
+
+      // Open again: schema version is 1 and all pre-05AG states open successfully
+      const store2 = createSqliteAuditorRecoveryStore({ dbPath });
+      const active = store2.getActiveBootstrap('proj-pre');
+      assert.strictEqual(active.state, 'AUDIT_UNCERTAIN');
+      assert.strictEqual(active.turn_id, 'turn_pre');
+      store2.close();
+
+      console.log('PASS: ARS-061 — Existing schema-v1 database containing only pre-05AG states opens successfully');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-051: 51/51 PASS)');
+  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-061: 61/61 PASS)');
   console.log('======================================================================\n');
 }
 

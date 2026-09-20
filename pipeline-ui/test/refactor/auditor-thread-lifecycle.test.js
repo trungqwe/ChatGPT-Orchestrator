@@ -35,6 +35,7 @@ const {
   bootstrapAuditorThread,
   recoverAuditorBootstrap,
   inspectAuditorBootstrap,
+  resolveAuditorBootstrapUncertainty,
   LIFECYCLE_ERROR_CODES
 } = require('../../lib/relay/auditor-thread-lifecycle');
 
@@ -216,7 +217,7 @@ function advanceToState(recoveryStore, { projectId, operationId, targetState, th
 }
 
 async function runAllTests() {
-  console.log('Starting Auditor Thread Lifecycle test suite (ATL-001 .. ATL-060)...');
+  console.log('Starting Auditor Thread Lifecycle test suite (ATL-001 .. ATL-083)...');
 
   // ATL-001: Complete happy-path bootstrap sequence end-to-end
   {
@@ -3038,8 +3039,1248 @@ async function runAllTests() {
     }
   }
 
+  // Helper for ATL-061 .. ATL-083
+  function makeDecisionPayload(ctx = {}) {
+    return {
+      schema_version: 1,
+      decision: 'APPROVE_WORK_PACKAGE',
+      project_id: ctx.project_id || 'proj-01',
+      audit_subject_id: ctx.audit_subject_id || 'sub-01',
+      auditor_thread_id: ctx.auditor_thread_id || 'thr-01',
+      workspace_state_observed: ctx.workspace_state_observed || 'ws-01',
+      summary: 'Audit passed cleanly.',
+      independent_verification: [
+        {
+          kind: 'SOURCE_INSPECTION',
+          result: 'PASS',
+          evidence: 'Source and git evidence inspected.'
+        }
+      ],
+      work_order: null,
+      requested_evidence: [],
+      blocker: null
+    };
+  }
+
+  function createTrackingAdapterFactory(threadResponse, tracking = {}) {
+    tracking.calls = {
+      initialize: 0,
+      readThread: 0,
+      startThread: 0,
+      startTurn: 0,
+      interruptTurn: 0,
+      startReview: 0,
+      close: 0
+    };
+    return async ({ phase, cwd }) => {
+      tracking.phase = phase;
+      tracking.cwd = cwd;
+      return {
+        isInitialized: false,
+        initialize: async () => { tracking.calls.initialize++; },
+        readThread: async (params) => {
+          tracking.calls.readThread++;
+          if (typeof threadResponse === 'function') {
+            return threadResponse(params);
+          }
+          return threadResponse;
+        },
+        startThread: async () => { tracking.calls.startThread++; throw new Error('startThread forbidden'); },
+        startTurn: async () => { tracking.calls.startTurn++; throw new Error('startTurn forbidden'); },
+        interruptTurn: async () => { tracking.calls.interruptTurn++; throw new Error('interruptTurn forbidden'); },
+        startReview: async () => { tracking.calls.startReview++; throw new Error('startReview forbidden'); },
+        close: async () => { tracking.calls.close++; }
+      };
+    };
+  }
+
+  // ATL-061: AUDIT_UNCERTAIN + exact read thread + exact turn interrupted = AUDIT_TERMINAL_NO_DECISION
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-61');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-61', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-61',
+        operation_id: 'op-61',
+        audit_subject_id: 'sub-61',
+        thread_id: 'thr_61',
+        workspace_state_observed: 'ws-61'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-61', operation_id: 'op-61', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-61', operation_id: 'op-61', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_61' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-61', operation_id: 'op-61', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_61',
+          turns: [
+            { id: 'turn_61', status: 'interrupted', itemsView: 'full', items: [] }
+          ]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-61',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+      assert.strictEqual(res.turn_status, 'interrupted');
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-61');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+
+      console.log('PASS: ATL-061 — AUDIT_UNCERTAIN + exact turn interrupted = AUDIT_TERMINAL_NO_DECISION');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-062: Interrupted turn containing decision-looking content still produces AUDIT_TERMINAL_NO_DECISION
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-62');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-62', projDir));
+
+      const ctx = { project_id: 'proj-atl-62', audit_subject_id: 'sub-62', auditor_thread_id: 'thr_62', workspace_state_observed: 'ws-62' };
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: ctx.project_id,
+        operation_id: 'op-62',
+        audit_subject_id: ctx.audit_subject_id,
+        thread_id: ctx.auditor_thread_id,
+        workspace_state_observed: ctx.workspace_state_observed
+      });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-62', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-62', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_62' } });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-62', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: ctx.auditor_thread_id,
+          turns: [
+            {
+              id: 'turn_62',
+              status: 'interrupted',
+              itemsView: 'full',
+              items: [{ type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(makeDecisionPayload(ctx)) }]
+            }
+          ]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: ctx.project_id,
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+      const active = recoveryStore.getActiveBootstrap(ctx.project_id);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+      assert.strictEqual(active.decision_json, null);
+
+      console.log('PASS: ATL-062 — Interrupted turn containing decision-looking content still produces AUDIT_TERMINAL_NO_DECISION');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-063: AUDIT_UNCERTAIN + exact turn failed = AUDIT_TERMINAL_NO_DECISION
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-63');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-63', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-63',
+        operation_id: 'op-63',
+        audit_subject_id: 'sub-63',
+        thread_id: 'thr_63',
+        workspace_state_observed: 'ws-63'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-63', operation_id: 'op-63', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-63', operation_id: 'op-63', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_63' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-63', operation_id: 'op-63', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_63',
+          turns: [{ id: 'turn_63', status: 'failed', itemsView: 'full', items: [] }]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-63',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+      assert.strictEqual(res.turn_status, 'failed');
+
+      console.log('PASS: ATL-063 — AUDIT_UNCERTAIN + exact turn failed = AUDIT_TERMINAL_NO_DECISION');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-064: resolveAuditorBootstrapUncertainty leaves active row present in AUDIT_TERMINAL_NO_DECISION
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-64');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-64', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-64',
+        operation_id: 'op-64',
+        audit_subject_id: 'sub-64',
+        thread_id: 'thr_64',
+        workspace_state_observed: 'ws-64'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-64', operation_id: 'op-64', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-64', operation_id: 'op-64', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_64' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-64', operation_id: 'op-64', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_64',
+          turns: [{ id: 'turn_64', status: 'interrupted', itemsView: 'full', items: [] }]
+        }
+      });
+
+      await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-64',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-64');
+      assert.notStrictEqual(active, null);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+
+      console.log('PASS: ATL-064 — resolveAuditorBootstrapUncertainty leaves active row present in AUDIT_TERMINAL_NO_DECISION');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-065: Only subsequent recoverAuditorBootstrap clears active row, retains history, leaves Registry unbound
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-65');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-65', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-65',
+        operation_id: 'op-65',
+        audit_subject_id: 'sub-65',
+        thread_id: 'thr_65',
+        workspace_state_observed: 'ws-65'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-65', operation_id: 'op-65', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-65', operation_id: 'op-65', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_65' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-65', operation_id: 'op-65', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-65', operation_id: 'op-65', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+
+      const tracking = {};
+      const recoveryAdapterFactory = createTrackingAdapterFactory({}, tracking);
+
+      const recRes = await recoverAuditorBootstrap({
+        projectId: 'proj-atl-65',
+        registryPort,
+        recoveryStore,
+        adapterFactory: recoveryAdapterFactory
+      });
+
+      assert.strictEqual(recRes.ok, true);
+      assert.strictEqual(recRes.status, 'RECOVERED_TERMINAL_NO_DECISION_CLEARED');
+      assert.strictEqual(recoveryStore.getActiveBootstrap('proj-atl-65'), null);
+
+      const history = recoveryStore.getBootstrapHistory('proj-atl-65', 'op-65');
+      assert.strictEqual(history.length, 5);
+
+      const proj = await registryPort.getProject('proj-atl-65');
+      assert.strictEqual(proj.auditor.thread_id, null);
+      assert.strictEqual(proj.auditor.enabled, false);
+
+      assert.strictEqual(tracking.calls.readThread, 0);
+      assert.strictEqual(tracking.calls.startThread, 0);
+
+      console.log('PASS: ATL-065 — Only subsequent recoverAuditorBootstrap clears active row, retains history, leaves Registry unbound');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-066: Crash/reopen between resolution and recovery remains recoverable
+  {
+    const sandbox = createTestSandbox();
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-66');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-66', projDir));
+
+      let store1 = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      store1.beginBootstrap({
+        project_id: 'proj-atl-66',
+        operation_id: 'op-66',
+        audit_subject_id: 'sub-66',
+        thread_id: 'thr_66',
+        workspace_state_observed: 'ws-66'
+      });
+      store1.transitionBootstrap({ project_id: 'proj-atl-66', operation_id: 'op-66', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      store1.transitionBootstrap({ project_id: 'proj-atl-66', operation_id: 'op-66', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_66' } });
+      store1.transitionBootstrap({ project_id: 'proj-atl-66', operation_id: 'op-66', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+      store1.transitionBootstrap({ project_id: 'proj-atl-66', operation_id: 'op-66', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION });
+      store1.close();
+
+      // "Reopen after crash"
+      let store2 = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      const recRes = await recoverAuditorBootstrap({
+        projectId: 'proj-atl-66',
+        registryPort,
+        recoveryStore: store2,
+        adapterFactory: createTrackingAdapterFactory({})
+      });
+
+      assert.strictEqual(recRes.ok, true);
+      assert.strictEqual(recRes.status, 'RECOVERED_TERMINAL_NO_DECISION_CLEARED');
+      assert.strictEqual(store2.getActiveBootstrap('proj-atl-66'), null);
+      store2.close();
+
+      console.log('PASS: ATL-066 — Crash/reopen between resolution and recovery remains recoverable');
+    } finally {
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-067: Exact completed + itemsView == full + valid AuditDecisionV1 = DECISION_VALIDATED
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-67');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-67', projDir));
+
+      const ctx = { project_id: 'proj-atl-67', audit_subject_id: 'sub-67', auditor_thread_id: 'thr_67', workspace_state_observed: 'ws-67' };
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: ctx.project_id,
+        operation_id: 'op-67',
+        audit_subject_id: ctx.audit_subject_id,
+        thread_id: ctx.auditor_thread_id,
+        workspace_state_observed: ctx.workspace_state_observed
+      });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-67', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-67', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_67' } });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-67', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: ctx.auditor_thread_id,
+          turns: [
+            {
+              id: 'turn_67',
+              status: 'completed',
+              itemsView: 'full',
+              items: [{ type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(makeDecisionPayload(ctx)) }]
+            }
+          ]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: ctx.project_id,
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED);
+      assert.ok(res.decision);
+      assert.ok(res.decision_sha256);
+
+      const active = recoveryStore.getActiveBootstrap(ctx.project_id);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED);
+      assert.strictEqual(active.decision_sha256, res.decision_sha256);
+
+      console.log('PASS: ATL-067 — Exact completed + itemsView == full + valid AuditDecisionV1 = DECISION_VALIDATED');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-068: After recovered DECISION_VALIDATED, recoverAuditorBootstrap reaches DURABLE_BOUND without rerun
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-68');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-68', projDir));
+
+      const ctx = { project_id: 'proj-atl-68', audit_subject_id: 'sub-68', auditor_thread_id: 'thr_68', workspace_state_observed: 'ws-68' };
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: ctx.project_id,
+        operation_id: 'op-68',
+        audit_subject_id: ctx.audit_subject_id,
+        thread_id: ctx.auditor_thread_id,
+        workspace_state_observed: ctx.workspace_state_observed
+      });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-68', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-68', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_68' } });
+      recoveryStore.transitionBootstrap({ project_id: ctx.project_id, operation_id: 'op-68', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      // Step 1: Resolve uncertainty
+      const inspectAdapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: ctx.auditor_thread_id,
+          turns: [
+            {
+              id: 'turn_68',
+              status: 'completed',
+              itemsView: 'full',
+              items: [{ type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(makeDecisionPayload(ctx)) }]
+            }
+          ]
+        }
+      });
+      const resolveRes = await resolveAuditorBootstrapUncertainty({
+        projectId: ctx.project_id,
+        registryPort,
+        recoveryStore,
+        adapterFactory: inspectAdapterFactory
+      });
+      assert.strictEqual(resolveRes.status, AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED);
+
+      // Step 2: Recover bootstrap
+      const tracking = {};
+      const resumeAdapterFactory = async ({ phase, cwd }) => {
+        tracking.phase = phase;
+        return {
+          isInitialized: false,
+          initialize: async () => {},
+          resumeThread: async ({ threadId }) => ({ threadId }),
+          close: async () => {}
+        };
+      };
+
+      const recRes = await recoverAuditorBootstrap({
+        projectId: ctx.project_id,
+        registryPort,
+        recoveryStore,
+        adapterFactory: resumeAdapterFactory
+      });
+
+      assert.strictEqual(recRes.ok, true);
+      assert.strictEqual(recRes.status, 'DURABLE_BOUND');
+      assert.strictEqual(recoveryStore.getActiveBootstrap(ctx.project_id), null);
+
+      const boundProj = await registryPort.getProject(ctx.project_id);
+      assert.strictEqual(boundProj.auditor.thread_id, 'thr_68');
+      assert.strictEqual(boundProj.auditor.enabled, true);
+
+      console.log('PASS: ATL-068 — After recovered DECISION_VALIDATED, recoverAuditorBootstrap reaches DURABLE_BOUND without rerun');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-069: inProgress turn preserves AUDIT_UNCERTAIN
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-69');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-69', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-69',
+        operation_id: 'op-69',
+        audit_subject_id: 'sub-69',
+        thread_id: 'thr_69',
+        workspace_state_observed: 'ws-69'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-69', operation_id: 'op-69', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-69', operation_id: 'op-69', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_69' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-69', operation_id: 'op-69', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_69',
+          turns: [{ id: 'turn_69', status: 'inProgress', itemsView: 'partial', items: [] }]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-69',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+      const active = recoveryStore.getActiveBootstrap('proj-atl-69');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-069 — inProgress turn preserves AUDIT_UNCERTAIN');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-070: Missing persisted turn_id in recovery store preserves AUDIT_UNCERTAIN
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-70');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-70', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-70',
+        operation_id: 'op-70',
+        audit_subject_id: 'sub-70',
+        thread_id: 'thr_70',
+        workspace_state_observed: 'ws-70'
+      });
+      // Transition directly to AUDIT_UNCERTAIN without turn_id
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-70', operation_id: 'op-70', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const tracking = {};
+      const adapterFactory = createTrackingAdapterFactory({}, tracking);
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-70',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+      assert.strictEqual(tracking.calls.readThread, 0);
+
+      console.log('PASS: ATL-070 — Missing persisted turn_id preserves AUDIT_UNCERTAIN without adapter call');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-071: Target turn absent from provider thread response preserves AUDIT_UNCERTAIN
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-71');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-71', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-71',
+        operation_id: 'op-71',
+        audit_subject_id: 'sub-71',
+        thread_id: 'thr_71',
+        workspace_state_observed: 'ws-71'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-71', operation_id: 'op-71', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-71', operation_id: 'op-71', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_71' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-71', operation_id: 'op-71', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_71',
+          turns: [{ id: 'other_turn_id', status: 'interrupted', itemsView: 'full', items: [] }]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-71',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+      const active = recoveryStore.getActiveBootstrap('proj-atl-71');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-071 — Target turn absent preserves AUDIT_UNCERTAIN');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-072: Duplicate target turn preserves AUDIT_UNCERTAIN
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-72');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-72', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-72',
+        operation_id: 'op-72',
+        audit_subject_id: 'sub-72',
+        thread_id: 'thr_72',
+        workspace_state_observed: 'ws-72'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-72', operation_id: 'op-72', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-72', operation_id: 'op-72', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_72' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-72', operation_id: 'op-72', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_72',
+          turns: [
+            { id: 'turn_72', status: 'interrupted', itemsView: 'full', items: [] },
+            { id: 'turn_72', status: 'interrupted', itemsView: 'full', items: [] }
+          ]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-72',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-072 — Duplicate target turn preserves AUDIT_UNCERTAIN');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-073: Additional foreign turn preserves AUDIT_UNCERTAIN
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-73');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-73', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-73',
+        operation_id: 'op-73',
+        audit_subject_id: 'sub-73',
+        thread_id: 'thr_73',
+        workspace_state_observed: 'ws-73'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-73', operation_id: 'op-73', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-73', operation_id: 'op-73', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_73' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-73', operation_id: 'op-73', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_73',
+          turns: [
+            { id: 'turn_73', status: 'interrupted', itemsView: 'full', items: [] },
+            { id: 'turn_foreign', status: 'completed', itemsView: 'full', items: [] }
+          ]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-73',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-073 — Additional foreign turn preserves AUDIT_UNCERTAIN');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-074: Completed turn with itemsView != full preserves AUDIT_UNCERTAIN
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-74');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-74', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-74',
+        operation_id: 'op-74',
+        audit_subject_id: 'sub-74',
+        thread_id: 'thr_74',
+        workspace_state_observed: 'ws-74'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-74', operation_id: 'op-74', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-74', operation_id: 'op-74', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_74' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-74', operation_id: 'op-74', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_74',
+          turns: [{ id: 'turn_74', status: 'completed', itemsView: 'partial', items: [] }]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-74',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-074 — Completed turn with itemsView != full preserves AUDIT_UNCERTAIN');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-075: Completed turn with invalid/ambiguous decision preserves AUDIT_UNCERTAIN
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-75');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-75', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-75',
+        operation_id: 'op-75',
+        audit_subject_id: 'sub-75',
+        thread_id: 'thr_75',
+        workspace_state_observed: 'ws-75'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-75', operation_id: 'op-75', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-75', operation_id: 'op-75', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_75' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-75', operation_id: 'op-75', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      // Malformed decision text in agentMessage
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_75',
+          turns: [
+            {
+              id: 'turn_75',
+              status: 'completed',
+              itemsView: 'full',
+              items: [{ type: 'agentMessage', phase: 'final_answer', text: 'NOT_VALID_JSON' }]
+            }
+          ]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-75',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-075 — Completed turn with invalid decision preserves AUDIT_UNCERTAIN');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-076: Wrong provider thread identity returned by readThread fails closed
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-76');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-76', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-76',
+        operation_id: 'op-76',
+        audit_subject_id: 'sub-76',
+        thread_id: 'thr_76',
+        workspace_state_observed: 'ws-76'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-76', operation_id: 'op-76', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-76', operation_id: 'op-76', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_76' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-76', operation_id: 'op-76', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'wrong_thread_id',
+          turns: [{ id: 'turn_76', status: 'interrupted', itemsView: 'full', items: [] }]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-76',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-076 — Wrong provider thread identity fails closed');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-077: Registry already bound or conflicting fails closed
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-77');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      // Already bound project
+      await registryPort.putProject(makeValidProject('proj-atl-77', projDir, {
+        auditor: { thread_id: 'thr_already_bound', enabled: true, engine: 'codex_app_server', cwd: projDir, model_policy: 'auditor_standard' }
+      }));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      await assert.rejects(
+        () => resolveAuditorBootstrapUncertainty({
+          projectId: 'proj-atl-77',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      console.log('PASS: ATL-077 — Registry already bound or conflicting fails closed');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-078: Provider read failure leaves AUDIT_UNCERTAIN unchanged and fails closed
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-78');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-78', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-78',
+        operation_id: 'op-78',
+        audit_subject_id: 'sub-78',
+        thread_id: 'thr_78',
+        workspace_state_observed: 'ws-78'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-78', operation_id: 'op-78', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-78', operation_id: 'op-78', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_78' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-78', operation_id: 'op-78', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const failingAdapterFactory = createTrackingAdapterFactory(() => {
+        throw new Error('Connection reset by provider');
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-78',
+        registryPort,
+        recoveryStore,
+        adapterFactory: failingAdapterFactory
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+      const active = recoveryStore.getActiveBootstrap('proj-atl-78');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN);
+
+      console.log('PASS: ATL-078 — Provider read failure leaves AUDIT_UNCERTAIN unchanged and fails closed');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-079: Resolver never calls startThread, startTurn, interruptTurn, or startReview
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-79');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-79', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-79',
+        operation_id: 'op-79',
+        audit_subject_id: 'sub-79',
+        thread_id: 'thr_79',
+        workspace_state_observed: 'ws-79'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-79', operation_id: 'op-79', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-79', operation_id: 'op-79', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: 'turn_79' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-79', operation_id: 'op-79', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      const tracking = {};
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: 'thr_79',
+          turns: [{ id: 'turn_79', status: 'interrupted', itemsView: 'full', items: [] }]
+        }
+      }, tracking);
+
+      await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-79',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(tracking.calls.startThread, 0);
+      assert.strictEqual(tracking.calls.startTurn, 0);
+      assert.strictEqual(tracking.calls.interruptTurn, 0);
+      assert.strictEqual(tracking.calls.startReview, 0);
+      assert.strictEqual(tracking.calls.readThread, 1);
+      assert.strictEqual(tracking.calls.close, 1);
+
+      console.log('PASS: ATL-079 — Resolver never calls startThread, startTurn, interruptTurn, or startReview');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-080: Real R7 shape characterization: thread.status.type: 'notLoaded' resolves to AUDIT_TERMINAL_NO_DECISION
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-80');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-80', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-80',
+        operation_id: 'op-80',
+        audit_subject_id: 'sub-80',
+        thread_id: '01a0bd4a-abc8-7a90-8e89-6ac0f33d00fd',
+        workspace_state_observed: 'ws-80'
+      });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-80', operation_id: 'op-80', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-80', operation_id: 'op-80', next_state: AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT, patch: { turn_id: '01a0bd4a-ac83-7a03-aed1-c0f922ba91f4' } });
+      recoveryStore.transitionBootstrap({ project_id: 'proj-atl-80', operation_id: 'op-80', next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN });
+
+      // Exact R7 response shape
+      const adapterFactory = createTrackingAdapterFactory({
+        thread: {
+          id: '01a0bd4a-abc8-7a90-8e89-6ac0f33d00fd',
+          status: { type: 'notLoaded' },
+          turns: [
+            {
+              id: '01a0bd4a-ac83-7a03-aed1-c0f922ba91f4',
+              status: 'interrupted',
+              itemsView: 'full',
+              items: [
+                { type: 'commandExecution' },
+                { type: 'reasoning' },
+                { type: 'commandExecution' }
+              ]
+            }
+          ]
+        }
+      });
+
+      const res = await resolveAuditorBootstrapUncertainty({
+        projectId: 'proj-atl-80',
+        registryPort,
+        recoveryStore,
+        adapterFactory
+      });
+
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(res.status, AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION);
+      assert.strictEqual(res.turn_status, 'interrupted');
+
+      console.log('PASS: ATL-080 — Real R7 shape characterization: notLoaded thread status resolves to AUDIT_TERMINAL_NO_DECISION');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-081: Missing project in Registry fails closed with AUDITOR_LIFECYCLE_PRECONDITION_FAILED
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      await assert.rejects(
+        () => resolveAuditorBootstrapUncertainty({
+          projectId: 'non-existent-proj',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      console.log('PASS: ATL-081 — Missing project in Registry fails closed with AUDITOR_LIFECYCLE_PRECONDITION_FAILED');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-082: Active bootstrap missing or not in AUDIT_UNCERTAIN fails closed with AUDITOR_LIFECYCLE_PRECONDITION_FAILED
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-82');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-82', projDir));
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      // No active bootstrap
+      await assert.rejects(
+        () => resolveAuditorBootstrapUncertainty({
+          projectId: 'proj-atl-82',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      // Active bootstrap in PROVISIONAL_THREAD
+      recoveryStore.beginBootstrap({
+        project_id: 'proj-atl-82',
+        operation_id: 'op-82',
+        audit_subject_id: 'sub-82',
+        thread_id: 'thr_82',
+        workspace_state_observed: 'ws-82'
+      });
+      await assert.rejects(
+        () => resolveAuditorBootstrapUncertainty({
+          projectId: 'proj-atl-82',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({})
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED }
+      );
+
+      console.log('PASS: ATL-082 — Active bootstrap missing or not in AUDIT_UNCERTAIN fails closed');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-083: Caller-supplied threadId, turnId, turnStatus, or decision rejected with AUDITOR_LIFECYCLE_INVALID_REQUEST
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      recoveryStore = createSqliteAuditorRecoveryStore({ dbPath: dbFile });
+
+      await assert.rejects(
+        () => resolveAuditorBootstrapUncertainty({
+          projectId: 'proj-atl-83',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({}),
+          threadId: 'injected-thread'
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST }
+      );
+
+      await assert.rejects(
+        () => resolveAuditorBootstrapUncertainty({
+          projectId: 'proj-atl-83',
+          registryPort,
+          recoveryStore,
+          adapterFactory: createTrackingAdapterFactory({}),
+          turnId: 'injected-turn'
+        }),
+        { code: LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST }
+      );
+
+      console.log('PASS: ATL-083 — Caller-supplied threadId, turnId, turnStatus, or decision rejected');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-060: 60/60 PASS)');
+  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-083: 83/83 PASS)');
   console.log('======================================================================\n');
 }
 

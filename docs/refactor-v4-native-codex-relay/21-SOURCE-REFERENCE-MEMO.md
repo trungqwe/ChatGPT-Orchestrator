@@ -47,12 +47,20 @@ OpenAI Codex App Server protocol (qua stdio JSONL: `initialize` / `initialized`,
    - **Duplicate-Key Rejection**: Parser JSON từ chối mọi trường hợp duplicate key ở bất kỳ cấp độ nào (`AUDIT_DECISION_DUPLICATE_KEY`).
    - **Workspace State Echo Limitation**: Việc `workspace_state_observed` khớp với input chỉ chứng minh auditor đã quan sát đúng state được giao. Tầng relay điều phối hành động trong tương lai bắt buộc phải tính toán lại một fresh workspace state ngay trước khi apply side-effect.
 
+4. **Explicit Uncertainty Resolution Policy (WP-V4-05AG)**:
+   - **Two-Stage Durability**: `AUDIT_UNCERTAIN` is no longer a permanent dead-end. It can be resolved via `resolveAuditorBootstrapUncertainty()` by querying provider thread durability authority (`thread/read`).
+   - **Zero Prose Authority for Non-Completed Turns**: For turn status `interrupted` or `failed`, model output is never parsed or credited with decision authority, even if partial messages contain well-formed JSON. The state strictly transitions to `AUDIT_TERMINAL_NO_DECISION`.
+   - **Strict Completed Turn Validation**: Transition to `DECISION_VALIDATED` from `AUDIT_UNCERTAIN` requires `itemsView == 'full'`, exactly 1 turn matching `turn_id`, and full valid `AuditDecisionV1` extraction. Any failure leaves `AUDIT_UNCERTAIN` unchanged.
+   - **Clean Separation of Resolution and Cleanup**: Resolver persists `AUDIT_TERMINAL_NO_DECISION` and leaves the active row in SQLite. Only subsequent `recoverAuditorBootstrap()` cleans the active row while retaining history.
+
 ---
 
 ## 3. Architecture Status
 
 - **WP-V4-02**: APPROVED / CLOSED (Registry v2 schema migration).
 - **WP-V4-03**: APPROVED / CLOSED (Transport foundation & real App Server runtime acceptance).
-- **WP-V4-04**: IMPLEMENTED / READY FOR REVIEW (`AuditDecisionV1` pure semantic contract & test suite).
-- **WP-V4-05**: NOT STARTED (Durable persistence, first meaningful user turn, cross-process exact resume, restart recovery).
+- **WP-V4-04**: APPROVED / CLOSED (`AuditDecisionV1` pure semantic contract & test suite).
+- **WP-V4-05A**: APPROVED / CLOSED (Durable thread lifecycle & recovery store).
+- **WP-V4-05AG**: IMPLEMENTED / READY FOR REVIEW (Explicit `AUDIT_UNCERTAIN` terminal-turn resolution).
+- **WP-V4-05B**: NOT YET CLOSED (Real runtime acceptance blocked on R7 uncertainty resolution).
 - **WP-V4-06**: NOT STARTED (Model policy resolution `auditor_fast`, `auditor_standard`, `auditor_deep` via `model/list`).

@@ -36,7 +36,14 @@ Khi nghi ngờ quy trình gắn kết auditor thread bị gián đoạn hoặc c
 Chạy quy trình khôi phục chính thức:
 - **Nếu ở `PROVISIONAL_THREAD`**: Recovery tự động dọn sạch bản ghi tạm trong SQLite; Registry giữ nguyên `UNBOUND`. Operator khởi tạo bootstrap mới khi sẵn sàng.
 - **Nếu ở `FIRST_TURN_STARTING` hoặc `FIRST_TURN_IN_FLIGHT`**: Hệ thống đánh dấu và giữ nguyên `AUDIT_UNCERTAIN`.
-  - **CẢNH BÁO QUAN TRỌNG**: Không được tự ý ép chạy lại `turn/start` nếu chưa xác minh App Server đã thực thi hay chưa. Operator cần kiểm tra session log của App Server.
+  - **CẢNH BÁO QUAN TRỌNG**: Không được tự ý ép chạy lại `turn/start` nếu chưa xác minh App Server đã thực thi hay chưa. Operator cần chạy quy trình giải quyết bất định `resolveAuditorBootstrapUncertainty`.
+- **Nếu ở `AUDIT_UNCERTAIN`**: Chạy `resolveAuditorBootstrapUncertainty({ projectId, recoveryStore, createInspectionAdapter, expectedProjectRoot })`:
+  - Sử dụng adapter read-only (không mutation, không start turn/thread) để đọc `thread/read(includeTurns=true)`.
+  - Nếu turn có trạng thái `interrupted` hoặc `failed`: chuyển sang `AUDIT_TERMINAL_NO_DECISION` (hàng active vẫn được lưu trong SQLite; không tự xóa).
+  - Nếu turn là `completed` với `itemsView: 'full'` và chứa `AuditDecisionV1` hợp lệ: chuyển sang `DECISION_VALIDATED`.
+  - Nếu turn đang `inProgress` hoặc dữ liệu thread không hợp lệ: fail-closed và giữ nguyên `AUDIT_UNCERTAIN`.
+- **Nếu ở `AUDIT_TERMINAL_NO_DECISION`**: Chạy `recoverAuditorBootstrap`:
+  - Hệ thống tự động xóa bản ghi active bootstrap trong SQLite recovery store, bảo toàn toàn bộ lịch sử trong `auditor_bootstrap_history`, và giữ Registry ở trạng thái `UNBOUND` an toàn để operator có thể bắt đầu lại bootstrap sạch.
 - **Nếu ở `DECISION_VALIDATED` hoặc `RESUME_VERIFYING`**: Recovery tự động tái khởi động kết nối App Server, thực hiện exact `thread/resume(T)`. Nếu resume thành công, recovery tự động hoàn tất `bindAuditorThread` lên Registry v2 (`AUDITOR_BOUND_READY`) mà không tiêu tốn token nào của model turn.
 - **Nếu ở `REGISTRY_BINDING`**: Recovery tự động đối soát Registry v2. Nếu Registry đã gắn đúng ID, bản ghi bootstrap được xóa và hoàn tất `DURABLE_BOUND`. Nếu chưa gắn, lệnh `bindAuditorThread` được gọi lại với tính chất idempotent an toàn tuyệt đối.
 

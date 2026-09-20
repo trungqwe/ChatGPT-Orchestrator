@@ -9,7 +9,8 @@ const {
   awaitAuditDecisionV1,
   buildAuditDecisionV1OutputSchema,
   parseStrictJson,
-  validateAuditDecisionV1
+  validateAuditDecisionV1,
+  extractAuditDecisionV1FromTurn
 } = require('./audit-decision');
 const {
   REGISTRY_ERROR_CODES,
@@ -533,6 +534,18 @@ async function recoverAuditorBootstrap(options) {
     };
   }
 
+  // Case 1b: AUDIT_TERMINAL_NO_DECISION
+  if (state === AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION) {
+    recoveryStore.deleteActiveBootstrap(projectId, operationId);
+    return {
+      ok: true,
+      status: 'RECOVERED_TERMINAL_NO_DECISION_CLEARED',
+      project_id: projectId,
+      previous_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION,
+      thread_id: threadId
+    };
+  }
+
   // Case 2: FIRST_TURN_STARTING / FIRST_TURN_IN_FLIGHT / AUDIT_UNCERTAIN
   if (
     state === AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_STARTING ||
@@ -790,11 +803,283 @@ async function inspectAuditorBootstrap(options) {
   };
 }
 
+/**
+ * Explicit operator resolution for AUDIT_UNCERTAIN bootstrap states.
+ *
+ * Inspects exact stored thread/turn using non-mutating provider thread/read.
+ * If turn is terminal interrupted/failed: transitions to AUDIT_TERMINAL_NO_DECISION.
+ * If turn is completed with valid AuditDecisionV1: transitions to DECISION_VALIDATED.
+ * If turn is non-terminal, malformed, or ambiguous: preserves AUDIT_UNCERTAIN.
+ *
+ * @param {Object} options
+ * @param {string} options.projectId
+ * @param {Object} options.registryPort
+ * @param {Object} options.recoveryStore
+ * @param {Function} options.adapterFactory
+ * @returns {Promise<Object>}
+ */
+async function resolveAuditorBootstrapUncertainty(options) {
+  if (!options || typeof options !== 'object') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'resolveAuditorBootstrapUncertainty requires an options object'
+    );
+  }
+
+  const { projectId, registryPort, recoveryStore, adapterFactory } = options;
+
+  if (typeof projectId !== 'string' || !projectId.trim()) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'projectId must be a non-empty string'
+    );
+  }
+  if (!registryPort || typeof registryPort.getProject !== 'function') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'registryPort must provide a getProject method'
+    );
+  }
+  if (!recoveryStore || typeof recoveryStore.getActiveBootstrap !== 'function' || typeof recoveryStore.transitionBootstrap !== 'function') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'recoveryStore must provide getActiveBootstrap and transitionBootstrap methods'
+    );
+  }
+  if (typeof adapterFactory !== 'function') {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'adapterFactory must be a function'
+    );
+  }
+
+  // Reject caller-supplied identities/decisions
+  if (
+    options.threadId !== undefined ||
+    options.turnId !== undefined ||
+    options.turnStatus !== undefined ||
+    options.decision !== undefined
+  ) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_INVALID_REQUEST,
+      'Caller-supplied threadId, turnId, turnStatus, or decision is forbidden'
+    );
+  }
+
+  // Preconditions: Project exists and auditor is unbound
+  let project;
+  try {
+    project = await registryPort.getProject(projectId);
+  } catch (err) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' not found in registry: ${err.message}`
+    );
+  }
+
+  if (!project) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' not found in registry`
+    );
+  }
+
+  if (project.auditor.thread_id !== null || project.auditor.enabled === true) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' auditor is not unbound: thread_id='${project.auditor.thread_id}', enabled=${project.auditor.enabled}`
+    );
+  }
+
+  // Preconditions: Active bootstrap exists in AUDIT_UNCERTAIN
+  const active = recoveryStore.getActiveBootstrap(projectId);
+  if (!active) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `No active bootstrap record found for project '${projectId}'`
+    );
+  }
+
+  if (active.state !== AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN) {
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Active bootstrap for project '${projectId}' is in state '${active.state}', expected 'AUDIT_UNCERTAIN'`
+    );
+  }
+
+  // If uncertainty occurred before turn_id was recorded, fail closed without mutation
+  if (!active.turn_id || typeof active.turn_id !== 'string' || !active.turn_id.trim()) {
+    return {
+      ok: false,
+      status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+      project_id: projectId,
+      thread_id: active.thread_id,
+      turn_id: null,
+      reason: 'Active bootstrap lacks persisted turn_id'
+    };
+  }
+
+  // Spawn fresh inspection client (guaranteed close in finally block)
+  let client = null;
+  let readRes = null;
+  try {
+    client = await adapterFactory({
+      phase: 'uncertainty_inspect',
+      cwd: project.project_root
+    });
+    if (typeof client.initialize === 'function' && !client.isInitialized) {
+      await client.initialize();
+    }
+    readRes = await client.readThread({
+      threadId: active.thread_id,
+      includeTurns: true
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+      project_id: projectId,
+      thread_id: active.thread_id,
+      turn_id: active.turn_id,
+      reason: `Provider inspection failed: ${err.message}`
+    };
+  } finally {
+    if (client && typeof client.close === 'function') {
+      try { await client.close(); } catch {}
+    }
+    client = null;
+  }
+
+  // Validate exact returned thread identity
+  const returnedThreadId = readRes?.thread?.id || readRes?.threadId || readRes?.id;
+  if (returnedThreadId !== active.thread_id) {
+    return {
+      ok: false,
+      status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+      project_id: projectId,
+      thread_id: active.thread_id,
+      turn_id: active.turn_id,
+      reason: `Provider thread ID mismatch: expected '${active.thread_id}', got '${returnedThreadId}'`
+    };
+  }
+
+  // Validate exact turn identity: must contain exactly 1 turn whose ID matches active.turn_id
+  const turns = readRes?.thread && Array.isArray(readRes.thread.turns) ? readRes.thread.turns : [];
+  if (turns.length !== 1 || turns[0]?.id !== active.turn_id) {
+    return {
+      ok: false,
+      status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+      project_id: projectId,
+      thread_id: active.thread_id,
+      turn_id: active.turn_id,
+      reason: `Turn history shape invalid: expected exactly 1 turn with id '${active.turn_id}', found ${turns.length} turns`
+    };
+  }
+
+  const targetTurn = turns[0];
+  const turnStatus = targetTurn.status;
+
+  // Case A: Terminal interrupted or failed turn (never inspect model output for decision)
+  if (turnStatus === 'interrupted' || turnStatus === 'failed') {
+    recoveryStore.transitionBootstrap({
+      project_id: projectId,
+      operation_id: active.operation_id,
+      next_state: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION,
+      metadata: {
+        resolution: 'provider_terminal_no_decision',
+        turn_status: turnStatus
+      }
+    });
+    return {
+      ok: true,
+      status: AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION,
+      project_id: projectId,
+      thread_id: active.thread_id,
+      turn_id: active.turn_id,
+      resolution: 'provider_terminal_no_decision',
+      turn_status: turnStatus
+    };
+  }
+
+  // Case B: Completed turn
+  if (turnStatus === 'completed') {
+    if (targetTurn.itemsView !== 'full') {
+      return {
+        ok: false,
+        status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+        project_id: projectId,
+        thread_id: active.thread_id,
+        turn_id: active.turn_id,
+        reason: `Completed turn itemsView is '${targetTurn.itemsView}', requires 'full'`
+      };
+    }
+
+    const expectedContext = Object.freeze({
+      project_id: active.project_id,
+      audit_subject_id: active.audit_subject_id,
+      auditor_thread_id: active.thread_id,
+      workspace_state_observed: active.workspace_state_observed
+    });
+
+    let validatedDecision;
+    try {
+      validatedDecision = extractAuditDecisionV1FromTurn(targetTurn, expectedContext);
+    } catch (err) {
+      return {
+        ok: false,
+        status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+        project_id: projectId,
+        thread_id: active.thread_id,
+        turn_id: active.turn_id,
+        reason: `Completed turn decision validation failed: ${err.message}`
+      };
+    }
+
+    const decisionJson = JSON.stringify(validatedDecision);
+    const decisionSha256 = crypto.createHash('sha256').update(decisionJson, 'utf8').digest('hex');
+
+    recoveryStore.transitionBootstrap({
+      project_id: projectId,
+      operation_id: active.operation_id,
+      next_state: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+      patch: {
+        decision_json: decisionJson,
+        decision_sha256: decisionSha256
+      },
+      metadata: {
+        resolution: 'provider_turn_completed_decision_validated'
+      }
+    });
+
+    return {
+      ok: true,
+      status: AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED,
+      project_id: projectId,
+      thread_id: active.thread_id,
+      turn_id: active.turn_id,
+      decision: validatedDecision,
+      decision_sha256: decisionSha256
+    };
+  }
+
+  // Case C: In-progress or other non-terminal status
+  return {
+    ok: false,
+    status: AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN,
+    project_id: projectId,
+    thread_id: active.thread_id,
+    turn_id: active.turn_id,
+    turn_status: turnStatus || 'unknown',
+    reason: `Turn is in non-terminal or unrecognized status '${turnStatus}'`
+  };
+}
+
 module.exports = {
   LIFECYCLE_ERROR_CODES,
   AuditorLifecycleError,
   AUDITOR_BOOTSTRAP_STATES,
   bootstrapAuditorThread,
   recoverAuditorBootstrap,
-  inspectAuditorBootstrap
+  inspectAuditorBootstrap,
+  resolveAuditorBootstrapUncertainty
 };

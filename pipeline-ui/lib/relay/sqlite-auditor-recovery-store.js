@@ -29,7 +29,8 @@ const AUDITOR_BOOTSTRAP_STATES = Object.freeze({
   RESUME_VERIFYING: 'RESUME_VERIFYING',
   RESUME_VERIFIED: 'RESUME_VERIFIED',
   REGISTRY_BINDING: 'REGISTRY_BINDING',
-  AUDIT_UNCERTAIN: 'AUDIT_UNCERTAIN'
+  AUDIT_UNCERTAIN: 'AUDIT_UNCERTAIN',
+  AUDIT_TERMINAL_NO_DECISION: 'AUDIT_TERMINAL_NO_DECISION'
 });
 
 const RECOVERY_ERROR_CODES = Object.freeze({
@@ -50,7 +51,8 @@ const ALLOWED_TRANSITIONS = Object.freeze({
   RESUME_VERIFYING: new Set(['RESUME_VERIFIED', 'AUDIT_UNCERTAIN']),
   RESUME_VERIFIED: new Set(['REGISTRY_BINDING', 'AUDIT_UNCERTAIN']),
   REGISTRY_BINDING: new Set(['AUDIT_UNCERTAIN']),
-  AUDIT_UNCERTAIN: new Set()
+  AUDIT_UNCERTAIN: new Set(['AUDIT_TERMINAL_NO_DECISION', 'DECISION_VALIDATED']),
+  AUDIT_TERMINAL_NO_DECISION: new Set()
 });
 
 const CONTROL_CHAR_REGEX = /[\x00-\x1f\x7f]/;
@@ -373,6 +375,14 @@ function validatePersistedSemantics(db) {
           throw createRecoveryError(
             RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
             `Corrupt database: project '${row.project_id}' in state 'AUDIT_UNCERTAIN' has mismatched decision fields`
+          );
+        }
+        break;
+      case AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION:
+        if (turn_id === null || decision_json !== null || decision_sha256 !== null) {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+            `Corrupt database: project '${row.project_id}' in state 'AUDIT_TERMINAL_NO_DECISION' requires turn_id != null and decision_json == null`
           );
         }
         break;
@@ -935,7 +945,7 @@ function createSqliteAuditorRecoveryStore(options = {}) {
         }
         validateNonEmptyString(patch.turn_id, 'patch.turn_id', 256);
         patchTurnId = patch.turn_id;
-      } else if (active.state === AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT && next_state === AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED) {
+      } else if ((active.state === AUDITOR_BOOTSTRAP_STATES.FIRST_TURN_IN_FLIGHT || active.state === AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN) && next_state === AUDITOR_BOOTSTRAP_STATES.DECISION_VALIDATED) {
         if (active.turn_id === null || active.turn_id === undefined) {
           throw createRecoveryError(
             RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
@@ -1008,6 +1018,31 @@ function createSqliteAuditorRecoveryStore(options = {}) {
           throw createRecoveryError(
             RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
             'patch must be empty for transition to AUDIT_UNCERTAIN'
+          );
+        }
+      } else if (next_state === AUDITOR_BOOTSTRAP_STATES.AUDIT_TERMINAL_NO_DECISION) {
+        if (active.state !== AUDITOR_BOOTSTRAP_STATES.AUDIT_UNCERTAIN) {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_TRANSITION,
+            `Cannot transition to AUDIT_TERMINAL_NO_DECISION from '${active.state}'`
+          );
+        }
+        if (active.turn_id === null || active.turn_id === undefined || !String(active.turn_id).trim()) {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+            'Cannot transition to AUDIT_TERMINAL_NO_DECISION: turn_id must already exist in record'
+          );
+        }
+        if (active.decision_json !== null || active.decision_sha256 !== null) {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+            'Cannot transition to AUDIT_TERMINAL_NO_DECISION: record must contain no decision authority'
+          );
+        }
+        if (Object.keys(patch).length > 0) {
+          throw createRecoveryError(
+            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+            'patch must be empty for transition to AUDIT_TERMINAL_NO_DECISION'
           );
         }
       } else {
