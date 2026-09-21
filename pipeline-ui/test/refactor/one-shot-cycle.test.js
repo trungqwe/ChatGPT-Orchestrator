@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * One-Shot Full-Cycle Coordinator Test Suite (OSC-001 .. OSC-072)
+ * One-Shot Full-Cycle Coordinator Deterministic Test Suite
  * Deterministic test matrix for runOneShotCycle.
  */
 
