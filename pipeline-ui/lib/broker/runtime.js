@@ -1,9 +1,10 @@
-'use strict';
+﻿'use strict';
 
 const { createProjectRegistry } = require('./registry');
 const { createWorkspaceStatePort } = require('./workspace-state');
 const { createSqliteLifecycleStore } = require('./sqlite-lifecycle-store');
 const { createAntigravityWorkerPort } = require('./worker-adapter');
+const { createWorkerAdapterRegistry } = require('./worker-adapter-registry');
 const { createBroker } = require('./broker');
 
 /**
@@ -13,7 +14,7 @@ const { createBroker } = require('./broker');
  * - Project Registry
  * - Workspace State Port
  * - SQLite Lifecycle Store (MANDATORY for durable control commands)
- * - Antigravity Worker Port
+ * - Generic Worker Adapter Registry (wrapping Antigravity by default)
  * - Deterministic Broker Core
  *
  * Supports dependency injection for testing while enforcing durable defaults in production.
@@ -36,9 +37,24 @@ function createBrokerRuntime(options = {}) {
     clock: options.clock
   });
 
-  const workerPort = options.workerPort || createAntigravityWorkerPort(
-    options.workerOptions || {}
-  );
+  let workerPort;
+  if (options.workerPort) {
+    workerPort = options.workerPort;
+  } else if (options.workerAdapterRegistry) {
+    workerPort = options.workerAdapterRegistry;
+  } else {
+    const antigravityAdapter = createAntigravityWorkerPort(
+      options.workerOptions || {}
+    );
+    workerPort = createWorkerAdapterRegistry({
+      adapters: [
+        {
+          engine: 'antigravity',
+          adapter: antigravityAdapter
+        }
+      ]
+    });
+  }
 
   const broker = options.broker || createBroker({
     registryPort,
