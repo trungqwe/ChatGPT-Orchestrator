@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Auditor Recover CLI Semantic Test Suite (ARC-001 .. ARC-058)
+ * Auditor Recover CLI Semantic Test Suite (ARC-001 .. ARC-065)
  *
  * Deterministic test matrix covering:
  * - Strict parser (unknown commands, unknown flags, bounds, forbidden flags, confirm)
@@ -10,14 +10,17 @@
  * - Adapter factory signature & canonical cwd authority
  * - Runtime initialization phase authority (exit 11)
  * - Operational structured unmapped error fallback (exit 12)
+ * - Read-only recovery mode for inspect and process entry boundaries (ARC-059 .. ARC-065)
  */
 
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 const {
+  main,
   runCli,
   parseCliArgs,
   truncateUtf8,
@@ -46,6 +49,91 @@ let testCounter = 0;
 function getTempDbPath(name) {
   const file = path.join(testTempDir, `${name}-${Date.now()}-${testCounter++}.sqlite3`);
   return file;
+}
+
+function createV1RecoveryDatabase(dbPath, projectId = 'proj-v1-legacy') {
+  const { DatabaseSync } = require('node:sqlite');
+  const rawDb = new DatabaseSync(dbPath);
+  rawDb.exec(`
+    CREATE TABLE auditor_bootstrap (
+      project_id TEXT PRIMARY KEY,
+      operation_id TEXT NOT NULL UNIQUE,
+      audit_subject_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      turn_id TEXT,
+      workspace_state_observed TEXT NOT NULL,
+      state TEXT NOT NULL,
+      decision_json TEXT,
+      decision_sha256 TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE auditor_bootstrap_history (
+      history_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      operation_id TEXT NOT NULL,
+      previous_state TEXT,
+      next_state TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      iso TEXT NOT NULL,
+      metadata TEXT
+    );
+    CREATE UNIQUE INDEX idx_auditor_bootstrap_op ON auditor_bootstrap(operation_id);
+    CREATE INDEX idx_auditor_history_project ON auditor_bootstrap_history(project_id);
+    CREATE INDEX idx_auditor_history_op ON auditor_bootstrap_history(operation_id);
+    PRAGMA user_version = 1;
+  `);
+
+  const decisionObj = {
+    schema_version: 1,
+    decision: 'DISPATCH_WORKER',
+    project_id: projectId,
+    audit_subject_id: 'subj-01',
+    auditor_thread_id: 'thr-01',
+    workspace_state_observed: 'ws-01',
+    summary: 'Decision valid.',
+    independent_verification: [{ kind: 'SOURCE_INSPECTION', result: 'PASS', evidence: 'ok' }],
+    work_order: { work_order_id: 'wo-1', directive: 'do work', verification: ['test'], worker_model_policy: 'worker_standard' },
+    requested_evidence: [],
+    blocker: null
+  };
+  const dJson = JSON.stringify(decisionObj);
+  const dHash = crypto.createHash('sha256').update(dJson, 'utf8').digest('hex');
+  const nowIso = new Date().toISOString();
+
+  rawDb.prepare(`
+    INSERT INTO auditor_bootstrap (
+      project_id, operation_id, audit_subject_id, thread_id, turn_id,
+      workspace_state_observed, state, decision_json, decision_sha256,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(projectId, 'op-v1-01', 'subj-01', 'thr-01', 'turn-01', 'ws-01', 'DECISION_VALIDATED', dJson, dHash, nowIso, nowIso);
+
+  rawDb.prepare(`
+    INSERT INTO auditor_bootstrap_history (
+      project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(projectId, 'op-v1-01', null, 'PROVISIONAL_THREAD', 1700000000000, nowIso, null);
+
+  rawDb.prepare(`
+    INSERT INTO auditor_bootstrap_history (
+      project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(projectId, 'op-v1-01', 'PROVISIONAL_THREAD', 'FIRST_TURN_STARTING', 1700000000100, nowIso, null);
+
+  rawDb.prepare(`
+    INSERT INTO auditor_bootstrap_history (
+      project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(projectId, 'op-v1-01', 'FIRST_TURN_STARTING', 'FIRST_TURN_IN_FLIGHT', 1700000000200, nowIso, null);
+
+  rawDb.prepare(`
+    INSERT INTO auditor_bootstrap_history (
+      project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(projectId, 'op-v1-01', 'FIRST_TURN_IN_FLIGHT', 'DECISION_VALIDATED', 1700000001000, nowIso, null);
+
+  rawDb.close();
 }
 
 /**
@@ -96,7 +184,7 @@ function createMockRuntime(overrides = {}) {
 }
 
 async function runAllTests() {
-  console.log('Starting Auditor Recover CLI test suite (ARC-001 .. ARC-058)...\n');
+  console.log('Starting Auditor Recover CLI test suite (ARC-001 .. ARC-065)...\n');
 
   // ARC-001: inspect — no active bootstrap
   {
@@ -1097,7 +1185,7 @@ async function runAllTests() {
     console.log('PASS: ARC-049 — retire-legacy rejects --operation-id with exit 2');
   }
 
-  // ARC-050: --help
+  // ARC-050: --help & strict help parsing (Section 14)
   {
     const res = await runCli(['--help']);
     assert.strictEqual(res.exitCode, 0);
@@ -1107,7 +1195,15 @@ async function runAllTests() {
     assert(res.response.commands.includes('recover'));
     assert(res.response.commands.includes('resolve-uncertainty'));
     assert(res.response.commands.includes('retire-legacy'));
-    console.log('PASS: ARC-050 — --help emits valid help JSON listing all 4 commands');
+
+    // Trailing arguments after help flags must be rejected with exit 2 (Section 14)
+    for (const trailingArgv of [['--help', 'junk'], ['help', '--project-id', 'x'], ['-h', '--unknown']]) {
+      const badHelp = await runCli(trailingArgv);
+      assert.strictEqual(badHelp.exitCode, 2);
+      assert.strictEqual(badHelp.response.code, 'INVALID_CLI_REQUEST');
+    }
+
+    console.log('PASS: ARC-050 — --help emits valid help JSON listing all 4 commands; trailing arguments rejected');
   }
 
   // ARC-051: Unknown command
@@ -1247,6 +1343,238 @@ async function runAllTests() {
     console.log('PASS: ARC-058 — runtime init REGISTRY_CORRUPT maps to exit 11');
   }
 
+  // ARC-059: inspect with missing recovery DB -> exit 0, active_bootstrap null, no directory/DB created
+  {
+    const missingDir = path.join(testTempDir, `missing-dir-${Date.now()}-${testCounter++}`);
+    const missingDbPath = path.join(missingDir, 'sub', 'auditor-recovery.sqlite3');
+    const mockRegistryPort = {
+      getProject: async () => ({ id: 'proj-059', project_root: '/repo/059' })
+    };
+
+    const res = await runCli(['inspect', '--project-id', 'proj-059'], {
+      registryPort: mockRegistryPort,
+      recoveryOptions: { dbPath: missingDbPath }
+    });
+
+    assert.strictEqual(res.exitCode, 0);
+    assert.strictEqual(res.response.ok, true);
+    assert.strictEqual(res.response.operation, 'inspect');
+    assert.strictEqual(res.response.project_id, 'proj-059');
+    assert.strictEqual(res.response.active_bootstrap, null);
+    assert.deepStrictEqual(res.response.history, []);
+    assert.strictEqual(fs.existsSync(missingDbPath), false, 'Missing DB file must not be created');
+    assert.strictEqual(fs.existsSync(missingDir), false, 'Missing directory must not be created');
+    console.log('PASS: ARC-059 — inspect with missing recovery DB: exit 0, active_bootstrap null, no directory/DB created');
+  }
+
+  // ARC-060: inspect existing v2 recovery DB -> reads correctly, no recovery mutation
+  {
+    const dbPath = getTempDbPath('arc-060');
+    const store = createSqliteAuditorRecoveryStore({ dbPath });
+    store.beginBootstrap({
+      project_id: 'proj-060',
+      operation_id: 'op-060',
+      audit_subject_id: 'subj-060',
+      thread_id: 'thr-060',
+      workspace_state_observed: 'ws-060',
+      authority_version: 1,
+      expected_project_root: '/repo/060',
+      expected_project_root_identity: '/repo/060',
+      expected_auditor_model_policy: 'strict-read-only'
+    });
+    store.close();
+
+    const hashBefore = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+    const mockRegistryPort = {
+      getProject: async () => ({ id: 'proj-060', project_root: '/repo/060' })
+    };
+
+    const res = await runCli(['inspect', '--project-id', 'proj-060'], {
+      registryPort: mockRegistryPort,
+      recoveryOptions: { dbPath }
+    });
+
+    assert.strictEqual(res.exitCode, 0);
+    assert.strictEqual(res.response.ok, true);
+    assert.ok(res.response.active_bootstrap);
+    assert.strictEqual(res.response.active_bootstrap.project_id, 'proj-060');
+    assert.strictEqual(res.response.active_bootstrap.authority_version, 1);
+    assert.strictEqual(res.response.active_bootstrap.state, 'PROVISIONAL_THREAD');
+    assert.strictEqual(res.response.history.length, 1);
+
+    const hashAfter = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+    assert.strictEqual(hashBefore, hashAfter, 'inspect must leave v2 recovery DB bytes completely unchanged');
+
+    const { DatabaseSync } = require('node:sqlite');
+    const rawDb = new DatabaseSync(dbPath, { readOnly: true });
+    assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 2);
+    rawDb.close();
+
+    console.log('PASS: ARC-060 — inspect existing v2 recovery DB reads correctly with zero recovery mutation');
+  }
+
+  // ARC-061: inspect existing v1 recovery DB -> no migration, legacy authority visible
+  {
+    const dbPath = getTempDbPath('arc-061');
+    createV1RecoveryDatabase(dbPath, 'proj-061');
+
+    const hashBefore = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+    const mockRegistryPort = {
+      getProject: async () => ({ id: 'proj-061', project_root: '/repo/061' })
+    };
+
+    const res = await runCli(['inspect', '--project-id', 'proj-061'], {
+      registryPort: mockRegistryPort,
+      recoveryOptions: { dbPath }
+    });
+
+    assert.strictEqual(res.exitCode, 0);
+    assert.strictEqual(res.response.ok, true);
+    assert.ok(res.response.active_bootstrap);
+    assert.strictEqual(res.response.active_bootstrap.project_id, 'proj-061');
+    assert.strictEqual(res.response.active_bootstrap.authority_version, 0, 'Legacy v1 authority must be projected as 0');
+    assert.strictEqual(res.response.active_bootstrap.expected_project_root, null);
+    assert.strictEqual(res.response.active_bootstrap.expected_auditor_model_policy, null);
+    assert.strictEqual(res.response.active_bootstrap.state, 'DECISION_VALIDATED');
+    assert.strictEqual(res.response.history.length, 4);
+
+    const hashAfter = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+    assert.strictEqual(hashBefore, hashAfter, 'inspect must leave v1 recovery DB bytes completely unchanged');
+
+    const { DatabaseSync } = require('node:sqlite');
+    const rawDb = new DatabaseSync(dbPath, { readOnly: true });
+    assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 1, 'user_version must remain 1 (no migration)');
+    const cols = rawDb.prepare("PRAGMA table_info('auditor_bootstrap')").all();
+    const colNames = new Set(cols.map(c => c.name));
+    assert.strictEqual(colNames.has('authority_version'), false, 'V2 columns must NOT be present in v1 DB');
+    rawDb.close();
+
+    console.log('PASS: ARC-061 — inspect existing v1 recovery DB leaves user_version 1 and projects legacy authority');
+  }
+
+  // ARC-062: recover command still receives writable recovery store
+  {
+    const dbPath = getTempDbPath('arc-062');
+    const runtime = createAuditorRecoveryCliRuntime({
+      command: 'recover',
+      registryPort: {
+        getProject: async () => ({ id: 'proj-062', project_root: '/repo/062' }),
+        bindAuditorThread: async () => {}
+      },
+      recoveryOptions: { dbPath }
+    });
+
+    const storeFromRuntime = runtime.recoveryStore;
+    assert.ok(storeFromRuntime);
+
+    // Verify store allows write mutation (not read-only)
+    assert.doesNotThrow(() => {
+      storeFromRuntime.beginBootstrap({
+        project_id: 'proj-062',
+        operation_id: 'op-062',
+        audit_subject_id: 'subj-062',
+        thread_id: 'thr-062',
+        workspace_state_observed: 'ws-062',
+        authority_version: 1,
+        expected_project_root: '/repo/062',
+        expected_project_root_identity: '/repo/062',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+    });
+
+    await runtime.close();
+    console.log('PASS: ARC-062 — recover command still receives writable recovery store');
+  }
+
+  // ARC-063: partial runtime initialization failure -> created recovery store close() invoked, exit 11
+  {
+    const dbPath = getTempDbPath('arc-063');
+    let closeCalled = false;
+
+
+    // Verify recovery store was closed via spy when later initialization fails
+    const baseStore = createSqliteAuditorRecoveryStore({ dbPath });
+    const originalClose = baseStore.close.bind(baseStore);
+    baseStore.close = () => {
+      closeCalled = true;
+      originalClose();
+    };
+
+    assert.throws(() => {
+      createAuditorRecoveryCliRuntime({
+        command: 'recover',
+        recoveryStore: baseStore,
+        adapterOptions: {
+          client: { fake: true }
+        }
+      });
+    }, (err) => {
+      return err.code === 'AUDITOR_CLI_RUNTIME_INVALID_OPTION';
+    });
+    assert.strictEqual(closeCalled, true, 'recoveryStore.close() must be invoked when later init step fails');
+
+    // And verify runCli maps this partial initialization failure to exit 11
+    const res = await runCli(['recover', '--project-id', 'proj-063'], {
+      recoveryOptions: { dbPath: getTempDbPath('arc-063-cli') },
+      adapterOptions: {
+        client: { fake: true }
+      }
+    });
+    assert.strictEqual(res.exitCode, 11);
+    assert.strictEqual(res.response.ok, false);
+    assert.strictEqual(res.response.code, 'AUDITOR_CLI_RUNTIME_INVALID_OPTION');
+    assert.strictEqual('stack' in res.response, false);
+
+    console.log('PASS: ARC-063 — partial runtime initialization failure closes recoveryStore and exits 11');
+  }
+
+  // ARC-064: process-entry runtime-init failure -> exactly one stdout JSON object, exit 11, no stack
+  {
+    let written = '';
+    const mockStdout = {
+      write: (str) => { written += str; }
+    };
+
+    const exitCode = await main(['inspect', '--project-id', 'proj-064'], {
+      runtimeFactory: async () => {
+        const err = new Error('Process entry init failure');
+        err.code = 'AUDITOR_RECOVERY_SCHEMA_INVALID';
+        throw err;
+      }
+    }, mockStdout);
+
+    assert.strictEqual(exitCode, 11);
+    const lines = written.trim().split('\n');
+    assert.strictEqual(lines.length, 1, 'Must emit exactly one stdout line');
+    const json = JSON.parse(lines[0]);
+    assert.strictEqual(json.ok, false);
+    assert.strictEqual(json.operation, 'inspect');
+    assert.strictEqual(json.code, 'AUDITOR_RECOVERY_SCHEMA_INVALID');
+    assert.strictEqual('stack' in json, false, 'Stdout JSON must not contain stack property');
+
+    console.log('PASS: ARC-064 — process-entry runtime-init failure: exactly one stdout JSON object, exit 11, no stack');
+  }
+
+  // ARC-065: process-entry normal/help path -> exactly one stdout JSON object
+  {
+    let written = '';
+    const mockStdout = {
+      write: (str) => { written += str; }
+    };
+
+    const exitCode = await main(['--help'], {}, mockStdout);
+
+    assert.strictEqual(exitCode, 0);
+    const lines = written.trim().split('\n');
+    assert.strictEqual(lines.length, 1, 'Must emit exactly one stdout line');
+    const json = JSON.parse(lines[0]);
+    assert.strictEqual(json.ok, true);
+    assert.strictEqual(json.operation, 'help');
+    assert(Array.isArray(json.commands));
+
+    console.log('PASS: ARC-065 — process-entry normal/help path: exactly one stdout JSON object, exit 0');
+  }
+
   // Additional non-ARC boundary verification: adapterOptions.client blocked in production factory
   {
     assert.throws(() => {
@@ -1269,7 +1597,7 @@ async function runAllTests() {
   }
 
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-058: 58/58 PASS)');
+  console.log('ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-065: 65/65 PASS)');
   console.log('======================================================================');
 }
 

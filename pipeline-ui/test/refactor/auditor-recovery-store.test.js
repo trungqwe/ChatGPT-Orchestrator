@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Auditor Recovery Store Test Suite (ARS-001 .. ARS-078)
+ * Auditor Recovery Store Test Suite (ARS-001 .. ARS-086)
  * Verifies SQLite recovery store authority, single active bootstrap,
  * transition matrix, append-only history, decision hash & schema verification,
  * reopen semantics, schema v2 immutable authority, and legacy retirement.
@@ -87,7 +87,7 @@ function makeValidDecision(ctx) {
 }
 
 async function runTests() {
-  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-061)...');
+  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-086)...');
 
   // ARS-001: Fresh DB creation and schema initialization
   {
@@ -2806,8 +2806,208 @@ async function runTests() {
     }
   }
 
+  // ARS-083 / ARS-READONLY-01: missing DB + readOnly -> no directory/file created, active null, history []
+  {
+    const missingDir = path.join(os.tmpdir(), `ars-missing-${Date.now()}`);
+    const missingDbPath = path.join(missingDir, 'nested', 'auditor-recovery.sqlite3');
+    try {
+      const store = createSqliteAuditorRecoveryStoreRaw({ dbPath: missingDbPath, readOnly: true });
+      assert.strictEqual(store.getActiveBootstrap('proj-missing'), null);
+      assert.deepStrictEqual(store.listActiveBootstraps(), []);
+      assert.deepStrictEqual(store.getHistory('proj-missing'), []);
+      assert.deepStrictEqual(store.getBootstrapHistory('proj-missing'), []);
+      assert.strictEqual(fs.existsSync(missingDbPath), false, 'DB file must not be created');
+      assert.strictEqual(fs.existsSync(missingDir), false, 'Parent directory must not be created');
+      store.close();
+      console.log('PASS: ARS-083 / ARS-READONLY-01 — missing DB + readOnly -> no directory/file created, active null, history []');
+    } finally {
+      cleanupTempDir(missingDir);
+    }
+  }
+
+  // ARS-084 / ARS-READONLY-02: existing v2 DB + readOnly -> reads state, user_version remains 2, no row mutation
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      // 1. Setup existing v2 DB with active bootstrap & history
+      const setupStore = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      setupStore.beginBootstrap({
+        project_id: 'proj-ro-v2',
+        operation_id: 'op-ro-v2',
+        audit_subject_id: 'sub-ro-v2',
+        thread_id: 'thr-ro-v2',
+        workspace_state_observed: 'ws-ro-v2',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+      setupStore.close();
+
+      const { DatabaseSync } = require('node:sqlite');
+      const hashBefore = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+
+      // 2. Open read-only
+      const roStore = createSqliteAuditorRecoveryStoreRaw({ dbPath, readOnly: true });
+      const active = roStore.getActiveBootstrap('proj-ro-v2');
+      assert.ok(active);
+      assert.strictEqual(active.project_id, 'proj-ro-v2');
+      assert.strictEqual(active.operation_id, 'op-ro-v2');
+      assert.strictEqual(active.authority_version, 1);
+      assert.strictEqual(active.expected_project_root, 'd:/TU_CODE/Orchestrator');
+      assert.strictEqual(active.state, 'PROVISIONAL_THREAD');
+
+      const history = roStore.getHistory('proj-ro-v2', 'op-ro-v2');
+      assert.strictEqual(history.length, 1);
+      assert.strictEqual(history[0].next_state, 'PROVISIONAL_THREAD');
+
+      const allActive = roStore.listActiveBootstraps();
+      assert.strictEqual(allActive.length, 1);
+      assert.strictEqual(allActive[0].project_id, 'proj-ro-v2');
+      roStore.close();
+
+      // Verify PRAGMA user_version is 2
+      const rawCheck = new DatabaseSync(dbPath, { readOnly: true });
+      assert.strictEqual(rawCheck.prepare('PRAGMA user_version;').get().user_version, 2);
+      rawCheck.close();
+
+      // Verify byte-identical DB file
+      const hashAfter = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+      assert.strictEqual(hashBefore, hashAfter, 'DB file bytes must be unchanged after readOnly open/inspect');
+
+      console.log('PASS: ARS-084 / ARS-READONLY-02 — existing v2 DB + readOnly -> reads state, user_version remains 2, no row mutation');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-085 / ARS-READONLY-03: existing v1 DB + readOnly -> reads legacy active state, authority_version projected as 0, user_version remains 1, no migration
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      createGenuineV1Database(dbPath);
+
+      const { DatabaseSync } = require('node:sqlite');
+      const hashBefore = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+
+      // Open read-only on v1 database
+      const roStore = createSqliteAuditorRecoveryStoreRaw({ dbPath, readOnly: true });
+      const active = roStore.getActiveBootstrap('proj-legacy-01');
+      assert.ok(active);
+      assert.strictEqual(active.project_id, 'proj-legacy-01');
+      assert.strictEqual(active.authority_version, 0, 'Legacy v1 active row must be projected with authority_version 0');
+      assert.strictEqual(active.expected_project_root, null);
+      assert.strictEqual(active.expected_project_root_identity, null);
+      assert.strictEqual(active.expected_auditor_model_policy, null);
+      assert.strictEqual(active.state, 'DECISION_VALIDATED');
+      assert.strictEqual(active.turn_id, 'turn-legacy-01');
+
+      const history = roStore.getHistory('proj-legacy-01', 'op-legacy-01');
+      assert.strictEqual(history.length, 4);
+
+      roStore.close();
+
+      // Verify PRAGMA user_version remains 1 (NO auto-migration)
+      const rawCheck = new DatabaseSync(dbPath, { readOnly: true });
+      assert.strictEqual(rawCheck.prepare('PRAGMA user_version;').get().user_version, 1, 'PRAGMA user_version must remain 1');
+      const cols = rawCheck.prepare("PRAGMA table_info('auditor_bootstrap')").all();
+      const colNames = new Set(cols.map(c => c.name));
+      assert.strictEqual(colNames.has('authority_version'), false, 'V2 columns must NOT be added to v1 DB in readOnly mode');
+      rawCheck.close();
+
+      // Verify DB file bytes are completely unchanged
+      const hashAfter = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+      assert.strictEqual(hashBefore, hashAfter, 'DB file bytes must be unchanged after readOnly inspect of v1 DB');
+
+      console.log('PASS: ARS-085 / ARS-READONLY-03 — existing v1 DB + readOnly -> reads legacy active state, authority_version projected as 0, user_version remains 1, no migration');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-086 / ARS-READONLY-04: readOnly mutation API -> structured fail-closed error, DB unchanged
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      const setupStore = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      setupStore.beginBootstrap({
+        project_id: 'proj-mut-guard',
+        operation_id: 'op-mut-guard',
+        audit_subject_id: 'sub-mut',
+        thread_id: 'thr-mut',
+        workspace_state_observed: 'ws-mut',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+      setupStore.close();
+
+      const hashBefore = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+
+      const roStore = createSqliteAuditorRecoveryStoreRaw({ dbPath, readOnly: true });
+
+      // 1. beginBootstrap rejected
+      assert.throws(
+        () => roStore.beginBootstrap({
+          project_id: 'proj-new',
+          operation_id: 'op-new',
+          audit_subject_id: 'sub',
+          thread_id: 'thr',
+          workspace_state_observed: 'ws',
+          authority_version: 1,
+          expected_project_root: 'd:/TU_CODE/Orchestrator',
+          expected_project_root_identity: 'd:/tu_code/orchestrator',
+          expected_auditor_model_policy: 'strict-read-only'
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      // 2. transitionState rejected
+      assert.throws(
+        () => roStore.transitionState({
+          project_id: 'proj-mut-guard',
+          operation_id: 'op-mut-guard',
+          next_state: 'FIRST_TURN_STARTING'
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      // 3. transitionBootstrap rejected
+      assert.throws(
+        () => roStore.transitionBootstrap({
+          project_id: 'proj-mut-guard',
+          operation_id: 'op-mut-guard',
+          next_state: 'FIRST_TURN_STARTING'
+        }),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      // 4. retireLegacyBootstrap rejected
+      assert.throws(
+        () => roStore.retireLegacyBootstrap('proj-mut-guard', 'op-mut-guard'),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      // 5. deleteActiveBootstrap rejected
+      assert.throws(
+        () => roStore.deleteActiveBootstrap('proj-mut-guard', 'op-mut-guard'),
+        { code: RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST }
+      );
+
+      roStore.close();
+
+      const hashAfter = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+      assert.strictEqual(hashBefore, hashAfter, 'DB file bytes must be unchanged after rejected mutations');
+
+      console.log('PASS: ARS-086 / ARS-READONLY-04 — readOnly mutation API -> structured fail-closed error, DB unchanged');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-082: 82/82 PASS)');
+  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-086: 86/86 PASS)');
   console.log('======================================================================\n');
 }
 

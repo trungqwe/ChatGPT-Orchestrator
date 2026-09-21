@@ -79,6 +79,12 @@ function parseCliArgs(argv) {
 
   const first = argv[0];
   if (HELP_COMMANDS.has(first)) {
+    if (argv.length > 1) {
+      return {
+        error: `Unexpected argument '${argv[1]}' after help`,
+        exitCode: 2
+      };
+    }
     return {
       isHelp: true,
       command: 'help'
@@ -240,22 +246,39 @@ function createAuditorAdapterFactory(options = {}) {
  * Production Runtime Composition (Section 7)
  */
 function createAuditorRecoveryCliRuntime(options = {}) {
-  const registryPort = options.registryPort || createProjectRegistry(options.registryOptions);
-  const recoveryStore = options.recoveryStore || createSqliteAuditorRecoveryStore(options.recoveryOptions);
-  const adapterFactory = options.adapterFactory || createAuditorAdapterFactory(options);
+  let recoveryStore = null;
 
-  return {
-    registryPort,
-    recoveryStore,
-    adapterFactory,
-    close: async () => {
-      if (recoveryStore && typeof recoveryStore.close === 'function') {
-        try {
-          recoveryStore.close();
-        } catch {}
-      }
+  try {
+    const registryPort = options.registryPort || createProjectRegistry(options.registryOptions);
+    const recoveryOptions = {
+      ...(options.recoveryOptions || {})
+    };
+    if (options.command === 'inspect') {
+      recoveryOptions.readOnly = true;
     }
-  };
+    recoveryStore = options.recoveryStore || createSqliteAuditorRecoveryStore(recoveryOptions);
+    const adapterFactory = options.adapterFactory || createAuditorAdapterFactory(options);
+
+    return {
+      registryPort,
+      recoveryStore,
+      adapterFactory,
+      close: async () => {
+        if (recoveryStore && typeof recoveryStore.close === 'function') {
+          try {
+            recoveryStore.close();
+          } catch {}
+        }
+      }
+    };
+  } catch (err) {
+    if (recoveryStore && typeof recoveryStore.close === 'function') {
+      try {
+        recoveryStore.close();
+      } catch {}
+    }
+    throw err;
+  }
 }
 
 /**
@@ -317,7 +340,10 @@ async function runCli(argv, options = {}) {
     if (options.runtime) {
       runtime = options.runtime;
     } else {
-      runtime = await runtimeFactory(options);
+      runtime = await runtimeFactory({
+        ...options,
+        command
+      });
     }
   } catch (err) {
     return {
@@ -466,7 +492,7 @@ async function runCli(argv, options = {}) {
           operation: 'recover',
           project_id: result.project_id,
           code: 'CLI_RUNTIME_FAILURE',
-          error: `Unhandled recover status: ${result.status}`
+          error: truncateUtf8(`Unhandled recover status: ${result.status}`, 1024)
         }
       };
     }
@@ -532,7 +558,7 @@ async function runCli(argv, options = {}) {
           operation: 'resolve-uncertainty',
           project_id: result.project_id,
           code: 'CLI_RUNTIME_FAILURE',
-          error: `Unhandled resolve-uncertainty status: ${result.status}`
+          error: truncateUtf8(`Unhandled resolve-uncertainty status: ${result.status}`, 1024)
         }
       };
     }
@@ -562,7 +588,7 @@ async function runCli(argv, options = {}) {
       response: {
         ok: false,
         code: 'INVALID_CLI_REQUEST',
-        error: `Unhandled command '${command}'`
+        error: truncateUtf8(`Unhandled command '${command}'`, 1024)
       }
     };
 
@@ -588,25 +614,31 @@ async function runCli(argv, options = {}) {
 }
 
 // Process Entrypoint with Top-Level Error Boundary (Sections 14, 15)
+async function main(argv, options = {}, stdout = process.stdout) {
+  try {
+    const { exitCode, response } = await runCli(argv, options);
+    stdout.write(JSON.stringify(response) + '\n');
+    return exitCode;
+  } catch {
+    const topLevelError = {
+      ok: false,
+      operation: 'cli',
+      code: 'TOP_LEVEL_UNEXPECTED_FAILURE',
+      error: truncateUtf8('An unexpected process failure occurred', 1024)
+    };
+    stdout.write(JSON.stringify(topLevelError) + '\n');
+    return 1;
+  }
+}
+
 if (require.main === module) {
-  runCli(process.argv.slice(2))
-    .then(({ exitCode, response }) => {
-      process.stdout.write(JSON.stringify(response) + '\n');
-      process.exitCode = exitCode;
-    })
-    .catch(() => {
-      const topLevelError = {
-        ok: false,
-        operation: 'cli',
-        code: 'TOP_LEVEL_UNEXPECTED_FAILURE',
-        error: 'An unexpected process failure occurred'
-      };
-      process.stdout.write(JSON.stringify(topLevelError) + '\n');
-      process.exitCode = 1;
-    });
+  main(process.argv.slice(2)).then((exitCode) => {
+    process.exitCode = exitCode;
+  });
 }
 
 module.exports = {
+  main,
   runCli,
   parseCliArgs,
   truncateUtf8,

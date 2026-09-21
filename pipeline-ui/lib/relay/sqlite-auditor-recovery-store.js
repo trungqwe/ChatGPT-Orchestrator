@@ -869,10 +869,10 @@ function rowToBootstrapRecord(row) {
     decision_json: row.decision_json !== null ? row.decision_json : null,
     decision_sha256: row.decision_sha256 !== null ? row.decision_sha256 : null,
     validated_decision: validatedDecision,
-    authority_version: row.authority_version,
-    expected_project_root: row.expected_project_root !== null ? row.expected_project_root : null,
-    expected_project_root_identity: row.expected_project_root_identity !== null ? row.expected_project_root_identity : null,
-    expected_auditor_model_policy: row.expected_auditor_model_policy !== null ? row.expected_auditor_model_policy : null,
+    authority_version: typeof row.authority_version === 'number' ? row.authority_version : 0,
+    expected_project_root: (row.expected_project_root !== null && row.expected_project_root !== undefined) ? row.expected_project_root : null,
+    expected_project_root_identity: (row.expected_project_root_identity !== null && row.expected_project_root_identity !== undefined) ? row.expected_project_root_identity : null,
+    expected_auditor_model_policy: (row.expected_auditor_model_policy !== null && row.expected_auditor_model_policy !== undefined) ? row.expected_auditor_model_policy : null,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -913,16 +913,100 @@ function rowToHistoryRecord(row) {
  * @returns {Object} recovery store instance
  */
 function createSqliteAuditorRecoveryStore(options = {}) {
+  const isReadOnly = options.readOnly === true;
   const clock = options.clock || {
     now: () => Date.now(),
     iso: () => new Date().toISOString()
   };
 
   const dbPath = options.dbPath || options.path || DEFAULT_RECOVERY_DB_PATH;
+  const dbExists = fs.existsSync(dbPath);
 
-  const dir = path.dirname(dbPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // If in readOnly mode and the DB does NOT exist:
+  // Do NOT create DB file, do NOT create its parent directory.
+  // Expose read semantics: getActiveBootstrap -> null, getBootstrapHistory -> [], listActiveBootstraps -> [].
+  // Mutation methods fail closed with structured error.
+  if (isReadOnly && !dbExists) {
+    let closed = false;
+    function assertNotClosed() {
+      if (closed) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CLOSED,
+          'Auditor recovery store is closed'
+        );
+      }
+    }
+
+    return {
+      beginBootstrap() {
+        assertNotClosed();
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+          'Cannot mutate recovery store in read-only mode'
+        );
+      },
+      transitionState() {
+        assertNotClosed();
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+          'Cannot mutate recovery store in read-only mode'
+        );
+      },
+      transitionBootstrap() {
+        assertNotClosed();
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+          'Cannot mutate recovery store in read-only mode'
+        );
+      },
+      retireLegacyBootstrap() {
+        assertNotClosed();
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+          'Cannot mutate recovery store in read-only mode'
+        );
+      },
+      deleteActiveBootstrap() {
+        assertNotClosed();
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+          'Cannot mutate recovery store in read-only mode'
+        );
+      },
+      getActiveBootstrap(projectId) {
+        assertNotClosed();
+        if (typeof projectId !== 'string' || !projectId.trim()) {
+          return null;
+        }
+        return null;
+      },
+      listActiveBootstraps() {
+        assertNotClosed();
+        return [];
+      },
+      getHistory(projectId, operationId = null) {
+        assertNotClosed();
+        validateNonEmptyString(projectId, 'projectId', 128);
+        if (operationId !== null && operationId !== undefined) {
+          validateOperationId(operationId);
+        }
+        return [];
+      },
+      getBootstrapHistory(projectId, operationId) {
+        return this.getHistory(projectId, operationId);
+      },
+      close() {
+        closed = true;
+      }
+    };
+  }
+
+  // If writable mode and directory does not exist, create it
+  if (!isReadOnly) {
+    const dir = path.dirname(dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
   }
 
   let db = null;
@@ -938,17 +1022,29 @@ function createSqliteAuditorRecoveryStore(options = {}) {
   }
 
   try {
-    db = new DatabaseSync(dbPath);
+    if (isReadOnly) {
+      db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    } else {
+      db = new DatabaseSync(dbPath);
+    }
 
     // Initial connection pragmas
     db.exec('PRAGMA foreign_keys = ON;');
     db.exec('PRAGMA busy_timeout = 5000;');
-    db.exec('PRAGMA synchronous = FULL;');
+    if (!isReadOnly) {
+      db.exec('PRAGMA synchronous = FULL;');
+    }
 
     const versionRow = db.prepare('PRAGMA user_version;').get();
     const currentVersion = versionRow ? versionRow.user_version : 0;
 
     if (currentVersion === 0) {
+      if (isReadOnly) {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
+          'Database has user_version 0 and cannot be opened in read-only mode'
+        );
+      }
       // Check if partial tables exist
       const existingTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('auditor_bootstrap', 'auditor_bootstrap_history')").all();
       if (existingTables.length > 0) {
@@ -1001,8 +1097,7 @@ function createSqliteAuditorRecoveryStore(options = {}) {
         throw err;
       }
     } else if (currentVersion === 1) {
-      // Detail 1: For PRAGMA user_version == 1, first run exact V1 physical integrity,
-      // exact V1 schema-shape validation, persisted semantic validation, and history-chain validation.
+      // Validate V1 physical integrity, schema shape, and persisted semantics
       const v1CheckRow = db.prepare('PRAGMA integrity_check;').get();
       if (!v1CheckRow || v1CheckRow.integrity_check !== 'ok') {
         throw createRecoveryError(
@@ -1014,38 +1109,36 @@ function createSqliteAuditorRecoveryStore(options = {}) {
       validateSchemaShapeV1(db);
       validatePersistedSemanticsV1(db);
 
-      // Only after all V1 validation passes may the migration transaction modify schema/data.
-      db.exec('BEGIN IMMEDIATE;');
-      try {
-        db.exec(`
-          ALTER TABLE auditor_bootstrap ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 0;
-          ALTER TABLE auditor_bootstrap ADD COLUMN expected_project_root TEXT;
-          ALTER TABLE auditor_bootstrap ADD COLUMN expected_project_root_identity TEXT;
-          ALTER TABLE auditor_bootstrap ADD COLUMN expected_auditor_model_policy TEXT;
-          PRAGMA user_version = ${SCHEMA_VERSION};
-        `);
+      if (!isReadOnly) {
+        // Only after all V1 validation passes may the migration transaction modify schema/data.
+        db.exec('BEGIN IMMEDIATE;');
+        try {
+          db.exec(`
+            ALTER TABLE auditor_bootstrap ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE auditor_bootstrap ADD COLUMN expected_project_root TEXT;
+            ALTER TABLE auditor_bootstrap ADD COLUMN expected_project_root_identity TEXT;
+            ALTER TABLE auditor_bootstrap ADD COLUMN expected_auditor_model_policy TEXT;
+            PRAGMA user_version = ${SCHEMA_VERSION};
+          `);
 
-        // D. STILL INSIDE THE SAME TRANSACTION:
-        // PRAGMA integrity_check
-        // validateSchemaShapeV2()
-        // validatePersistedSemanticsV2()
-        const inTxCheck = db.prepare('PRAGMA integrity_check;').get();
-        if (!inTxCheck || inTxCheck.integrity_check !== 'ok') {
-          throw createRecoveryError(
-            RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-            `Physical integrity check failed during migration: ${inTxCheck ? inTxCheck.integrity_check : 'null'}`
-          );
+          const inTxCheck = db.prepare('PRAGMA integrity_check;').get();
+          if (!inTxCheck || inTxCheck.integrity_check !== 'ok') {
+            throw createRecoveryError(
+              RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+              `Physical integrity check failed during migration: ${inTxCheck ? inTxCheck.integrity_check : 'null'}`
+            );
+          }
+
+          validateSchemaShapeV2(db);
+          validatePersistedSemanticsV2(db);
+
+          db.exec('COMMIT;');
+        } catch (err) {
+          try { db.exec('ROLLBACK;'); } catch {}
+          throw err;
         }
-
-        validateSchemaShapeV2(db);
-        validatePersistedSemanticsV2(db);
-
-        // E. only after all V2 validation succeeds
-        db.exec('COMMIT;');
-      } catch (err) {
-        try { db.exec('ROLLBACK;'); } catch {}
-        throw err;
       }
+      // In readOnly mode, no migration is performed: schema and user_version remains 1.
     } else if (currentVersion !== SCHEMA_VERSION) {
       throw createRecoveryError(
         RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_SCHEMA_INVALID,
@@ -1053,20 +1146,24 @@ function createSqliteAuditorRecoveryStore(options = {}) {
       );
     }
 
-    // Both fresh and reopen/migrated paths reach the exact same validation gate
-    const checkRow = db.prepare('PRAGMA integrity_check;').get();
-    if (!checkRow || checkRow.integrity_check !== 'ok') {
-      throw createRecoveryError(
-        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
-        `Physical integrity check failed: ${checkRow ? checkRow.integrity_check : 'null'}`
-      );
+    // Both fresh and reopen/migrated paths reach the exact same validation gate (for V2)
+    if (currentVersion === SCHEMA_VERSION || (!isReadOnly && currentVersion === 1)) {
+      const checkRow = db.prepare('PRAGMA integrity_check;').get();
+      if (!checkRow || checkRow.integrity_check !== 'ok') {
+        throw createRecoveryError(
+          RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_CORRUPT,
+          `Physical integrity check failed: ${checkRow ? checkRow.integrity_check : 'null'}`
+        );
+      }
+
+      validateSchemaShapeV2(db);
+      validatePersistedSemanticsV2(db);
     }
 
-    validateSchemaShapeV2(db);
-    validatePersistedSemanticsV2(db);
-
-    // Enable WAL only after successful schema and integrity validation
-    db.exec('PRAGMA journal_mode = WAL;');
+    // Enable WAL only in writable mode after successful schema and integrity validation
+    if (!isReadOnly) {
+      db.exec('PRAGMA journal_mode = WAL;');
+    }
   } catch (err) {
     if (db) {
       try { db.close(); } catch {}
@@ -1083,41 +1180,6 @@ function createSqliteAuditorRecoveryStore(options = {}) {
   // Prepared statements
   const stmtGetActive = db.prepare('SELECT * FROM auditor_bootstrap WHERE project_id = ?');
   const stmtListActive = db.prepare('SELECT * FROM auditor_bootstrap ORDER BY created_at ASC');
-  const stmtInsertBootstrap = db.prepare(`
-    INSERT INTO auditor_bootstrap (
-      project_id, operation_id, audit_subject_id, thread_id, turn_id,
-      workspace_state_observed, state, decision_json, decision_sha256,
-      authority_version, expected_project_root, expected_project_root_identity, expected_auditor_model_policy,
-      created_at, updated_at
-    ) VALUES (
-      ?, ?, ?, ?, ?,
-      ?, ?, ?, ?,
-      ?, ?, ?, ?,
-      ?, ?
-    )
-  `);
-  const stmtInsertHistory = db.prepare(`
-    INSERT INTO auditor_bootstrap_history (
-      project_id, operation_id, previous_state, next_state,
-      timestamp, iso, metadata
-    ) VALUES (
-      ?, ?, ?, ?,
-      ?, ?, ?
-    )
-  `);
-  const stmtUpdateBootstrap = db.prepare(`
-    UPDATE auditor_bootstrap
-    SET state = ?,
-        turn_id = COALESCE(?, turn_id),
-        decision_json = COALESCE(?, decision_json),
-        decision_sha256 = COALESCE(?, decision_sha256),
-        updated_at = ?
-    WHERE project_id = ? AND operation_id = ?
-  `);
-  const stmtDeleteBootstrap = db.prepare(`
-    DELETE FROM auditor_bootstrap
-    WHERE project_id = ? AND operation_id = ?
-  `);
   const stmtGetHistory = db.prepare(`
     SELECT * FROM auditor_bootstrap_history
     WHERE project_id = ? AND operation_id = ?
@@ -1129,6 +1191,49 @@ function createSqliteAuditorRecoveryStore(options = {}) {
     ORDER BY history_seq ASC
   `);
 
+  let stmtInsertBootstrap = null;
+  let stmtInsertHistory = null;
+  let stmtUpdateBootstrap = null;
+  let stmtDeleteBootstrap = null;
+
+  if (!isReadOnly) {
+    stmtInsertBootstrap = db.prepare(`
+      INSERT INTO auditor_bootstrap (
+        project_id, operation_id, audit_subject_id, thread_id, turn_id,
+        workspace_state_observed, state, decision_json, decision_sha256,
+        authority_version, expected_project_root, expected_project_root_identity, expected_auditor_model_policy,
+        created_at, updated_at
+      ) VALUES (
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?
+      )
+    `);
+    stmtInsertHistory = db.prepare(`
+      INSERT INTO auditor_bootstrap_history (
+        project_id, operation_id, previous_state, next_state,
+        timestamp, iso, metadata
+      ) VALUES (
+        ?, ?, ?, ?,
+        ?, ?, ?
+      )
+    `);
+    stmtUpdateBootstrap = db.prepare(`
+      UPDATE auditor_bootstrap
+      SET state = ?,
+          turn_id = COALESCE(?, turn_id),
+          decision_json = COALESCE(?, decision_json),
+          decision_sha256 = COALESCE(?, decision_sha256),
+          updated_at = ?
+      WHERE project_id = ? AND operation_id = ?
+    `);
+    stmtDeleteBootstrap = db.prepare(`
+      DELETE FROM auditor_bootstrap
+      WHERE project_id = ? AND operation_id = ?
+    `);
+  }
+
   /**
    * Begin an auditor bootstrap session.
    * Enforces at most 1 active bootstrap per project.
@@ -1136,6 +1241,12 @@ function createSqliteAuditorRecoveryStore(options = {}) {
    */
   function beginBootstrap(params = {}) {
     assertOpen();
+    if (isReadOnly) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+        'Cannot mutate recovery store in read-only mode'
+      );
+    }
 
     const {
       project_id,
@@ -1230,6 +1341,12 @@ function createSqliteAuditorRecoveryStore(options = {}) {
    */
   function transitionState(params = {}) {
     assertOpen();
+    if (isReadOnly) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+        'Cannot mutate recovery store in read-only mode'
+      );
+    }
 
     if (!params || typeof params !== 'object' || Array.isArray(params)) {
       throw createRecoveryError(
@@ -1520,6 +1637,12 @@ function createSqliteAuditorRecoveryStore(options = {}) {
    */
   function retireLegacyBootstrap(arg1, arg2, arg3) {
     assertOpen();
+    if (isReadOnly) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+        'Cannot mutate recovery store in read-only mode'
+      );
+    }
 
     let project_id;
     let operation_id;
@@ -1602,6 +1725,12 @@ function createSqliteAuditorRecoveryStore(options = {}) {
    */
   function deleteActiveBootstrap(projectId, operationId) {
     assertOpen();
+    if (isReadOnly) {
+      throw createRecoveryError(
+        RECOVERY_ERROR_CODES.AUDITOR_RECOVERY_INVALID_REQUEST,
+        'Cannot mutate recovery store in read-only mode'
+      );
+    }
     validateNonEmptyString(projectId, 'projectId', 128);
     validateOperationId(operationId);
 
