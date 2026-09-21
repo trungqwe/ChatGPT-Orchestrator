@@ -602,9 +602,9 @@ function createAntigravityWorkerPort(options = {}) {
         };
 
         if (typeof completionSource.scanResolvedSession === 'function') {
-          await completionSource.scanResolvedSession(resolution, visitor, { clock });
+          await completionSource.scanResolvedSession(resolution, visitor, { deadline, clock });
         } else {
-          await completionSource.scanSession(sessionId, project, visitor, { clock });
+          await completionSource.scanSession(sessionId, project, visitor, { deadline, clock });
         }
       } catch (err) {
         if (err.code === COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_INTEGRITY_FAILURE) {
@@ -623,6 +623,9 @@ function createAntigravityWorkerPort(options = {}) {
         };
       }
 
+      const postScanNow = clock.monotonic();
+
+      // Section 9: Ambiguity still has priority
       if (ambiguityError) {
         return {
           ok: false,
@@ -642,7 +645,8 @@ function createAntigravityWorkerPort(options = {}) {
         };
       }
 
-      if (candidateCompletions.length === 1) {
+      // Section 6: Successful completion requires candidateCompletions.length === 1 AND postScanNow < deadline
+      if (candidateCompletions.length === 1 && postScanNow < deadline) {
         return {
           ok: true,
           state: DISPATCH_STATES.READY_FOR_REVIEW,
@@ -654,10 +658,8 @@ function createAntigravityWorkerPort(options = {}) {
         };
       }
 
-      // No terminal completion yet
-      const now = clock.monotonic();
-      if (now >= deadline) {
-        // WA-008 is retired: absence of boundary at wait deadline fails closed (WO-V4-09C-D1 / D2 / D2-R1)
+      // Section 7 & 8: Deadline reached
+      if (postScanNow >= deadline) {
         if (boundaryIndex === -1) {
           return {
             ok: false,
@@ -674,9 +676,27 @@ function createAntigravityWorkerPort(options = {}) {
         };
       }
 
-      const remainingMs = deadline - now;
+      const remainingMs = deadline - postScanNow;
       const sleepTime = Math.min(pollIntervalMs, Math.max(1, remainingMs));
       await sleep(sleepTime);
+
+      const postSleepNow = clock.monotonic();
+      if (postSleepNow >= deadline) {
+        if (boundaryIndex === -1) {
+          return {
+            ok: false,
+            code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
+            dispatch_id,
+            error: 'Authoritative dispatch boundary previously acknowledged could not be found in transcript during wait'
+          };
+        }
+        return {
+          ok: true,
+          state: DISPATCH_STATES.RUNNING,
+          dispatch_id,
+          work_order_id
+        };
+      }
     }
   }
 

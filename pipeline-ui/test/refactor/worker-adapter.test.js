@@ -2483,38 +2483,6 @@ async function runAllTests() {
     assert.strictEqual(res.definitive, false);
     assert.strictEqual(spawnCalls, 1);
     assert.ok(res.error.includes('not observed within acknowledgement deadline'));
-
-    // Sub-assertion (WO-V4-09C-D2-R1): postScanNow >= deadline must fail non-definitively even if boundary observed
-    {
-      const clock = createMockClock(1000);
-      const env = formatDispatchEnvelope({
-        project_id: 'ai-multi-task',
-        work_order_id: 'WO-001',
-        dispatch_id: 'D-TEST-1',
-        expected_workspace_state_id: 'sha256:ws-12345',
-        directive: 'Directive.'
-      });
-      const transcript = [{ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }];
-      const cs = createMockCompletionSource(transcript);
-      const origScan = cs.scanResolvedSession;
-      cs.scanResolvedSession = async (res, visitor, opts) => {
-        await origScan(res, visitor, opts);
-        clock.advance(1000); // Advances clock to 2000, exactly reaching deadline (1000 + 1000 = 2000)
-      };
-
-      const lateAdapter = createAntigravityWorkerPort({
-        clock,
-        dispatchAckTimeoutMs: 1000,
-        spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
-        completionSource: cs
-      });
-
-      const resLate = await lateAdapter.dispatch(createDispatchArgs());
-      assert.strictEqual(resLate.ok, false);
-      assert.strictEqual(resLate.definitive, false);
-      assert.ok(resLate.error.includes('not observed within acknowledgement deadline'));
-    }
-
     console.log('✓ ACK-002 PASSED: missing boundary through deadline yields non-definitive failure with no resend.');
   }
 
@@ -2760,6 +2728,39 @@ async function runAllTests() {
       assert.strictEqual(res.definitive, false);
       assert.strictEqual(totalSlept, c.expectedTimeout, `Timeout ${c.input} normalized to ${c.expectedTimeout}ms (got ${totalSlept}ms)`);
     }
+
+    // Sub-assertion (WO-V4-09C-D2-R2 / Section 11): exact boundary scan ends exactly at dispatch ACK deadline -> ok=false, definitive=false, not DISPATCH_ACCEPTED
+    {
+      const clock = createMockClock(1000);
+      const env = formatDispatchEnvelope({
+        project_id: 'ai-multi-task',
+        work_order_id: 'WO-001',
+        dispatch_id: 'D-TEST-1',
+        expected_workspace_state_id: 'sha256:ws-12345',
+        directive: 'Directive.'
+      });
+      const transcript = [{ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }];
+      const cs = createMockCompletionSource(transcript);
+      const origScan = cs.scanResolvedSession;
+      cs.scanResolvedSession = async (res, visitor, opts) => {
+        await origScan(res, visitor, opts);
+        clock.advance(1000); // Advances clock to 2000, exactly reaching deadline (1000 + 1000 = 2000)
+      };
+
+      const lateAdapter = createAntigravityWorkerPort({
+        clock,
+        dispatchAckTimeoutMs: 1000,
+        spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
+        completionSource: cs
+      });
+
+      const resLate = await lateAdapter.dispatch(createDispatchArgs());
+      assert.strictEqual(resLate.ok, false);
+      assert.strictEqual(resLate.definitive, false);
+      assert.notStrictEqual(resLate.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+      assert.ok(resLate.error.includes('not observed within acknowledgement deadline'));
+    }
+
     console.log('✓ ACK-008 PASSED: acknowledgement timeout correctly normalized (default 30000, clamp 1..30000).');
   }
 
@@ -2878,6 +2879,69 @@ async function runAllTests() {
     assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
     assert.strictEqual(res.dispatch_id, 'D-ACK-11');
     assert.strictEqual(res.work_order_id, 'WO-001');
+
+    // Sub-assertion (WO-V4-09C-D2-R2 / Section 13 & 14):
+    // scanOptions.deadline, clock supplied, and late completion observed at/after deadline yields RUNNING (never READY_FOR_REVIEW)
+    {
+      const clock = createMockClock(1000);
+      const env = formatDispatchEnvelope({
+        project_id: 'ai-multi-task',
+        work_order_id: 'WO-001',
+        dispatch_id: 'D-ACK-11-LATE',
+        expected_workspace_state_id: 'sha256:ws',
+        directive: 'Work.'
+      });
+
+      const lateEvents = [
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env },
+        {
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACK-11-LATE","state":"READY_FOR_REVIEW"}'
+        }
+      ];
+
+      const cs = {
+        resolveSessionTranscript: () => ({
+          sessionId: 'test-sess',
+          transcriptPath: '/fake/transcript.jsonl',
+          agentSessionId: 'test-agent'
+        }),
+        scanResolvedSession: async (res, visitor, scanOptions) => {
+          // Section 14 assertion
+          assert.ok(scanOptions && typeof scanOptions.deadline === 'number' && isFinite(scanOptions.deadline), 'deadline must be finite number');
+          assert.ok(scanOptions.deadline > 1000, 'deadline must be strictly greater than wait start time');
+          assert.strictEqual(scanOptions.clock, clock, 'clock must be injected monotonic clock');
+
+          for (let i = 0; i < lateEvents.length; i++) {
+            await visitor(lateEvents[i], i);
+          }
+          // Section 13 fixture: fake monotonic clock advances exactly to or beyond wait deadline during scan
+          clock.advance(1000); // from 1000 to 2000 (which is deadline: 1000 + 1000 = 2000)
+        }
+      };
+
+      const lateAdapter = createAntigravityWorkerPort({
+        clock,
+        sleep: async (ms) => clock.advance(ms),
+        completionSource: cs
+      });
+
+      const resLate = await lateAdapter.wait({
+        project: createBaseProject(),
+        project_id: 'ai-multi-task',
+        dispatch_id: 'D-ACK-11-LATE',
+        work_order_id: 'WO-001',
+        timeout_secs: 1
+      });
+
+      assert.strictEqual(resLate.ok, true);
+      assert.notStrictEqual(resLate.state, DISPATCH_STATES.READY_FOR_REVIEW);
+      assert.strictEqual(resLate.state, DISPATCH_STATES.RUNNING);
+      assert.strictEqual(resLate.dispatch_id, 'D-ACK-11-LATE');
+    }
+
     console.log('✓ ACK-011 PASSED: wait() with observed boundary and valid completion returns READY_FOR_REVIEW.');
   }
 
