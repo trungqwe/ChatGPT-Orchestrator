@@ -79,6 +79,114 @@ function rowToHistory(row) {
 }
 
 /**
+ * isPlainDataObject — WO-V4-09C-U1 Section 5
+ * Accepts ONLY objects with Object.prototype or null prototype.
+ * Rejects Date, Map, Set, RegExp, class instances, arrays, null, primitives.
+ */
+function isPlainDataObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * hasExactEnumerableDataKeys — WO-V4-09C-U1 Section 5
+ * Returns true iff value is a plain data object with EXACTLY the listed keys
+ * as own, enumerable, data-descriptor (no symbol, no accessor, no non-enumerable).
+ * Never invokes getters.
+ */
+function hasExactEnumerableDataKeys(value, expectedKeys) {
+  if (!isPlainDataObject(value)) return false;
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== expectedKeys.length) return false;
+  const expected = new Set(expectedKeys);
+  for (const key of ownKeys) {
+    if (typeof key !== 'string' || !expected.has(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      !descriptor ||
+      descriptor.enumerable !== true ||
+      !Object.prototype.hasOwnProperty.call(descriptor, 'value')
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Reconciliation authority constants
+const _RECONCILE_AUTHORITY_KEYS = Object.freeze([
+  'dispatch_id', 'project_id', 'work_order_id',
+  'expected_state', 'target_state', 'classification', 'evidence_authority'
+]);
+const _PROJECT_ID_REGEX = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const _RECONCILE_CONTROL_CHAR_REGEX = /[\x00-\x1F\x7F]/;
+
+/**
+ * Validates all authority fields. Returns { ok: false, code, error } on failure,
+ * or null on success. Does NOT invoke getters.
+ */
+function _validateReconcileAuthority(authority) {
+  const dispatchId = authority.dispatch_id;
+  const projectId = authority.project_id;
+  const workOrderId = authority.work_order_id;
+  const expectedState = authority.expected_state;
+  const targetState = authority.target_state;
+  const classification = authority.classification;
+  const evidenceAuthority = authority.evidence_authority;
+
+  if (
+    typeof dispatchId !== 'string' ||
+    dispatchId.length === 0 ||
+    dispatchId.trim() !== dispatchId ||
+    _RECONCILE_CONTROL_CHAR_REGEX.test(dispatchId) ||
+    Buffer.byteLength(dispatchId, 'utf8') > 512
+  ) {
+    return { ok: false, code: ERROR_CODES.INVALID_REQUEST, error: 'dispatch_id must be a non-empty trim-exact string with no control characters and UTF-8 length <= 512' };
+  }
+
+  if (typeof projectId !== 'string' || !_PROJECT_ID_REGEX.test(projectId)) {
+    return { ok: false, code: ERROR_CODES.INVALID_REQUEST, error: 'project_id must match ^[a-z0-9][a-z0-9._-]{0,127}$' };
+  }
+
+  if (
+    typeof workOrderId !== 'string' ||
+    workOrderId.length === 0 ||
+    workOrderId.trim() !== workOrderId ||
+    _RECONCILE_CONTROL_CHAR_REGEX.test(workOrderId) ||
+    Buffer.byteLength(workOrderId, 'utf8') > 512
+  ) {
+    return { ok: false, code: ERROR_CODES.INVALID_REQUEST, error: 'work_order_id must be a non-empty trim-exact string with no control characters and UTF-8 length <= 512' };
+  }
+
+  if (expectedState !== DISPATCH_STATES.DISPATCH_UNCERTAIN) {
+    return { ok: false, code: ERROR_CODES.ILLEGAL_STATE_TRANSITION, error: `expected_state must be '${DISPATCH_STATES.DISPATCH_UNCERTAIN}'` };
+  }
+
+  if (targetState !== DISPATCH_STATES.PROVENANCE_AMBIGUOUS) {
+    return { ok: false, code: ERROR_CODES.ILLEGAL_STATE_TRANSITION, error: `Target state '${targetState}' is not authorized for uncertain dispatch reconciliation` };
+  }
+
+  if (classification !== 'DELIVERY_UNPROVEN') {
+    return { ok: false, code: ERROR_CODES.INVALID_REQUEST, error: "classification must be 'DELIVERY_UNPROVEN'" };
+  }
+
+  if (
+    typeof evidenceAuthority !== 'string' ||
+    evidenceAuthority.length === 0 ||
+    evidenceAuthority.trim() !== evidenceAuthority ||
+    _RECONCILE_CONTROL_CHAR_REGEX.test(evidenceAuthority) ||
+    Buffer.byteLength(evidenceAuthority, 'utf8') > 512
+  ) {
+    return { ok: false, code: ERROR_CODES.INVALID_REQUEST, error: 'evidence_authority must be a non-empty trim-exact single-line string with no control characters and UTF-8 length <= 512' };
+  }
+
+  return null; // valid
+}
+
+/**
  * Validates table shapes, column constraints, primary keys, and data affinities (LCAUTH-06).
  */
 function validateSchemaShape(db) {
@@ -509,6 +617,14 @@ function createSqliteLifecycleStore(options = {}) {
        ORDER BY history_seq ASC`
     );
 
+    const getLatestHistoryByDispatchStmt = db.prepare(
+      `SELECT previous_state, next_state, patch
+       FROM history
+       WHERE dispatch_id = ?
+       ORDER BY history_seq DESC
+       LIMIT 1`
+    );
+
     let closed = false;
 
     function ensureOpen() {
@@ -897,6 +1013,251 @@ function createSqliteLifecycleStore(options = {}) {
       }
     }
 
+    /**
+     * Evaluates idempotent replay inside an active SQLite transaction.
+     * History-first ordering: check history transition before diagnostics shape.
+     * Caller is responsible for ROLLBACK after this function returns.
+     * Throws on structural corruption; returns structured result on semantic mismatch or valid replay.
+     */
+    function _evaluateSqliteReplayInner(authority, row) {
+      const dispatchId = authority.dispatch_id;
+
+      // Step 1: Find latest history row (history-first ordering)
+      const histRow = getLatestHistoryByDispatchStmt.get(dispatchId);
+      if (!histRow) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+
+      // Semantic mismatch: wrong transition path -> ILLEGAL_STATE_TRANSITION
+      if (
+        histRow.previous_state !== DISPATCH_STATES.DISPATCH_UNCERTAIN ||
+        histRow.next_state !== DISPATCH_STATES.PROVENANCE_AMBIGUOUS
+      ) {
+        return {
+          ok: false,
+          code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
+          error: 'Reconciliation replay mismatch: latest history transition does not match expected reconciliation path'
+        };
+      }
+
+      // Step 2: Check dispatch diagnostics shape
+      const rawDiag = row.diagnostics;
+      if (rawDiag === null || rawDiag === undefined) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+      const rowDiag = typeof rawDiag === 'string' ? rawDiag : v8.deserialize(rawDiag);
+      if (!isPlainDataObject(rowDiag)) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+
+      const recon = rowDiag.reconciliation;
+      if (!hasExactEnumerableDataKeys(recon, ['classification', 'evidence_authority', 'reconciled_at'])) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+
+      // Step 3: Check diagnostics values (semantic mismatch)
+      if (
+        recon.classification !== 'DELIVERY_UNPROVEN' ||
+        recon.evidence_authority !== authority.evidence_authority ||
+        typeof recon.reconciled_at !== 'string'
+      ) {
+        return {
+          ok: false,
+          code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
+          error: 'Reconciliation replay mismatch: diagnostics do not match the provided authority'
+        };
+      }
+
+      // Step 4: Check history patch shape (structural corruption)
+      if (histRow.patch === null || histRow.patch === undefined) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+      const patch = typeof histRow.patch === 'string' ? histRow.patch : v8.deserialize(histRow.patch);
+      if (
+        !hasExactEnumerableDataKeys(patch, ['diagnostics']) ||
+        !hasExactEnumerableDataKeys(patch.diagnostics, ['reconciliation']) ||
+        !hasExactEnumerableDataKeys(patch.diagnostics.reconciliation, ['classification', 'evidence_authority', 'reconciled_at'])
+      ) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+
+      // Step 5: Check patch values match diagnostics (semantic mismatch)
+      if (
+        patch.diagnostics.reconciliation.classification !== recon.classification ||
+        patch.diagnostics.reconciliation.evidence_authority !== recon.evidence_authority ||
+        patch.diagnostics.reconciliation.reconciled_at !== recon.reconciled_at
+      ) {
+        return {
+          ok: false,
+          code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
+          error: 'Reconciliation replay mismatch: history patch does not match dispatch reconciliation metadata'
+        };
+      }
+
+      // All checks pass - idempotent replay
+      return {
+        ok: true,
+        reconciled: false,
+        idempotent_replay: true,
+        dispatch: rowToDispatch(row)
+      };
+    }
+
+    /**
+     * reconcileUncertainDispatch — WO-V4-09C-U1 Section 5 / Design Seal.
+     * Out-of-band operator recovery primitive only. MUST NOT be invoked by
+     * broker, waitWorker, dispatchWorker, or any automated runtime method.
+     *
+     * Authorizes exactly: DISPATCH_UNCERTAIN -> PROVENANCE_AMBIGUOUS
+     * Classification:     DELIVERY_UNPROVEN only
+     */
+    function reconcileUncertainDispatch(authority) {
+      ensureOpen();
+
+      // 1. Authority shape validation
+      if (!hasExactEnumerableDataKeys(authority, _RECONCILE_AUTHORITY_KEYS)) {
+        return {
+          ok: false,
+          code: ERROR_CODES.INVALID_REQUEST,
+          error: 'Authority must be a plain data object with exactly the required keys: ' + _RECONCILE_AUTHORITY_KEYS.join(', ')
+        };
+      }
+
+      // 2. Field-level finite validation
+      const fieldError = _validateReconcileAuthority(authority);
+      if (fieldError) return fieldError;
+
+      const dispatchId = authority.dispatch_id;
+      const projectId = authority.project_id;
+      const workOrderId = authority.work_order_id;
+      const classification = authority.classification;
+      const evidenceAuthority = authority.evidence_authority;
+
+      try {
+        db.exec('BEGIN IMMEDIATE');
+
+        // 3. Re-read dispatch row inside transaction
+        const row = getDispatchStmt.get(dispatchId);
+        if (!row) {
+          db.exec('ROLLBACK');
+          return { ok: false, code: ERROR_CODES.DISPATCH_NOT_FOUND, error: `Dispatch '${dispatchId}' not found` };
+        }
+
+        // 4. Identity verification
+        if (row.project_id !== projectId) {
+          db.exec('ROLLBACK');
+          return {
+            ok: false,
+            code: ERROR_CODES.PROJECT_IDENTITY_MISMATCH,
+            error: `Project identity mismatch: authority '${projectId}' does not match dispatch '${row.project_id}'`
+          };
+        }
+        if (row.work_order_id !== workOrderId) {
+          db.exec('ROLLBACK');
+          return {
+            ok: false,
+            code: ERROR_CODES.INVALID_REQUEST,
+            error: `Work order mismatch: authority '${workOrderId}' does not match dispatch '${row.work_order_id}'`
+          };
+        }
+
+        // 5a. Idempotent replay path
+        if (row.state === DISPATCH_STATES.PROVENANCE_AMBIGUOUS) {
+          const replayResult = _evaluateSqliteReplayInner(authority, row);
+          db.exec('ROLLBACK');
+          return replayResult;
+        }
+
+        // 5b. State must be DISPATCH_UNCERTAIN
+        if (row.state !== DISPATCH_STATES.DISPATCH_UNCERTAIN) {
+          db.exec('ROLLBACK');
+          return {
+            ok: false,
+            code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
+            currentState: row.state,
+            expectedState: DISPATCH_STATES.DISPATCH_UNCERTAIN,
+            error: `Illegal state transition: reconciliation requires current state '${DISPATCH_STATES.DISPATCH_UNCERTAIN}', but dispatch is in '${row.state}'`
+          };
+        }
+
+        // 6. Inspect and validate diagnostics
+        let base = {};
+        if (row.diagnostics !== null && row.diagnostics !== undefined) {
+          const desDiag = typeof row.diagnostics === 'string' ? row.diagnostics : v8.deserialize(row.diagnostics);
+          if (!isPlainDataObject(desDiag)) {
+            db.exec('ROLLBACK');
+            throw new Error(`Lifecycle store corruption: malformed diagnostics in dispatch '${dispatchId}'`);
+          }
+          base = desDiag;
+        }
+        if (Object.hasOwn(base, 'reconciliation')) {
+          db.exec('ROLLBACK');
+          throw new Error(`Lifecycle store corruption: dispatch '${dispatchId}' in DISPATCH_UNCERTAIN already contains reconciliation metadata`);
+        }
+
+        // 7. Single clock snapshot
+        const nowIso = clock.iso();
+        const nowTs = clock.now();
+
+        // 8. Build new diagnostics and history patch
+        const newDiagnostics = {
+          ...base,
+          reconciliation: {
+            classification,
+            evidence_authority: evidenceAuthority,
+            reconciled_at: nowIso
+          }
+        };
+        const historyPatch = {
+          diagnostics: {
+            reconciliation: {
+              classification,
+              evidence_authority: evidenceAuthority,
+              reconciled_at: nowIso
+            }
+          }
+        };
+
+        const diagBlob = v8.serialize(newDiagnostics);
+        const patchBlob = v8.serialize(historyPatch);
+
+        // 9. Parameterized UPDATE (error column NOT touched - Section 10)
+        const updateResult = db.prepare(
+          `UPDATE dispatches SET state = ?, updated_at = ?, diagnostics = ? WHERE dispatch_id = ?`
+        ).run(DISPATCH_STATES.PROVENANCE_AMBIGUOUS, nowIso, diagBlob, dispatchId);
+
+        if (updateResult.changes !== 1) {
+          db.exec('ROLLBACK');
+          throw new Error(`Integrity error: reconciliation UPDATE affected ${updateResult.changes} rows (expected exactly 1)`);
+        }
+
+        // 10. Insert exactly one history row
+        insertHistoryStmt.run(
+          row.project_id,
+          row.dispatch_id,
+          row.work_order_id,
+          DISPATCH_STATES.DISPATCH_UNCERTAIN,
+          DISPATCH_STATES.PROVENANCE_AMBIGUOUS,
+          nowTs,
+          nowIso,
+          patchBlob
+        );
+
+        db.exec('COMMIT');
+
+        const updatedRow = getDispatchStmt.get(dispatchId);
+        return {
+          ok: true,
+          reconciled: true,
+          idempotent_replay: false,
+          dispatch: rowToDispatch(updatedRow)
+        };
+      } catch (err) {
+        try { db.exec('ROLLBACK'); } catch {}
+        throw err;
+      }
+    }
+
     return {
       isDurable: true,
       getDispatch,
@@ -906,6 +1267,7 @@ function createSqliteLifecycleStore(options = {}) {
       transition,
       getProjectHistory,
       getAllHistory,
+      reconcileUncertainDispatch,
       close
     };
   } catch (err) {
@@ -919,5 +1281,7 @@ function createSqliteLifecycleStore(options = {}) {
 }
 
 module.exports = {
-  createSqliteLifecycleStore
+  createSqliteLifecycleStore,
+  isPlainDataObject,
+  hasExactEnumerableDataKeys
 };
