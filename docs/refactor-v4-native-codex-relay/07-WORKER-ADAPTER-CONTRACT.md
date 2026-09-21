@@ -77,6 +77,11 @@ These two methods are the **ONLY** required WorkerPortV1 methods.
 - **Authority**: Zero broker semantic authority.
 - **Rationale**: `broker.getWorkerStatus(projectId)` is derived entirely from broker lifecycle state stored in the SQLite Lifecycle Store (`lifecycleStore.getActiveDispatch(projectId)`), NOT from worker adapter status. While the Antigravity adapter implementation exports a local `status()` helper returning `{ ok: true, state: 'IDLE' }`, it is **not** part of the required generic WorkerPortV1 contract and carries zero lifecycle weight.
 
+### `close`
+- **Status**: Runtime-owned capability if needed for future engines.
+- **Authority**: Zero WorkerPortV1 contract requirement in WP08.
+- **Rationale**: Antigravity requires no process cleanup contract.
+
 ---
 
 ## 4. Engine Resolution & Exact Authority
@@ -90,7 +95,7 @@ These two methods are the **ONLY** required WorkerPortV1 methods.
    - Unknown engine → fail closed (never default to Antigravity).
    - Missing worker descriptor → fail closed.
    - Case mismatch (e.g. `Antigravity`, `ANTIGRAVITY`) → fail closed.
-   - Whitespace (e.g. `antigravity `) → fail closed.
+   - Whitespace in runtime project descriptor (e.g. `"antigravity "`) → fail closed.
    - No fuzzy matching, no case folding, no alias resolution.
 3. **No Caller or Directive Overrides**:
    - Callers cannot override engine selection via API flags, CLI flags, or environment variables.
@@ -128,3 +133,82 @@ These two methods are the **ONLY** required WorkerPortV1 methods.
 3. **Trust Hierarchy**:
    - Worker output is treated as `UNTRUSTED_HINT`.
    - The Native Codex Auditor is the sole semantic approval authority.
+
+---
+
+## 7. Resolution Failure Semantics
+
+### Dispatch Resolution Failure
+- Generic adapter resolution failure during `dispatch()` occurs **before** calling any adapter method.
+- Invariants:
+  - Adapter calls: 0
+  - AO sends: 0
+  - Subprocess spawns: 0
+  - Fallback attempts: 0
+- Returns a deterministic definitive local failure:
+  ```js
+  {
+    ok: false,
+    definitive: true,
+    error: "Worker adapter unavailable"
+  }
+  ```
+- Does **NOT** require `code: "WORKER_SESSION_UNAVAILABLE"` (`WORKER_SESSION_UNAVAILABLE` is Antigravity/session-specific, not shared broker authority; `contracts.js` is not modified).
+- The existing broker translates this definitive dispatch failure into its existing `DISPATCH_FAILED` lifecycle semantics. No new broker lifecycle state is created.
+
+### Wait Resolution Failure
+- In the broker core (`broker.js`), transport exceptions during `wait()` are caught by the broker catch boundary:
+  ```text
+  workerPort.wait throws
+      ↓
+  broker catches
+      ↓
+  returns WORKER_WAIT_UNAVAILABLE
+      ↓
+  existing lifecycle state remains unchanged
+  ```
+- Therefore, when worker engine resolution fails during `wait()`:
+  - The generic registry facade **MUST THROW** a local bounded Error before calling any adapter.
+  - It **MUST NOT** return `{ ok: false, code: "WORKER_WAIT_UNAVAILABLE" }` (broker does not interpret that return shape as `WORKER_WAIT_UNAVAILABLE`).
+  - It **MUST NOT** return `{ definitive: true }` (which would trigger transition to `DISPATCH_FAILED`).
+  - Required flow:
+    ```text
+    resolution failure
+    → throw
+    → broker catch boundary
+    → WORKER_WAIT_UNAVAILABLE
+    → zero lifecycle mutation
+    ```
+
+---
+
+## 8. Worker Adapter Registry Public Surface & Snapshot Semantics
+
+1. **Facade Public API**:
+   `createWorkerAdapterRegistry(...)` returns a broker-facing `WorkerPortV1` facade exposing **strictly**:
+   ```js
+   {
+     dispatch,
+     wait
+   }
+   ```
+   It does **NOT** expose:
+   - `resolve()`
+   - `get()`
+   - `lookup()`
+   - `adapters`
+   - `map`
+   - `register()`
+   - `unregister()`
+   Engine resolution is private implementation plumbing.
+2. **Registration Storage & Immutability**:
+   - Internal storage uses a closure-private Map / lookup structure, never exposed to callers.
+   - No runtime mutation API (`register`, `unregister`) is provided.
+   - At construction, the registry snapshots `engine` (string) and `adapter` (reference) from each registration entry.
+   - Mutation of the original `adapters` array, `entry.engine`, or `entry.adapter` after construction has zero effect on engine mapping.
+   - Does not rely on `Object.freeze(new Map())`.
+   - Registration mapping immutability ≠ deep immutability of adapter implementation state (adapters may maintain mutable transport state).
+3. **Registration Entry Validation**:
+   - Each registration requires: plain object, non-empty `engine` string, `adapter` object with `dispatch` and `wait` functions.
+   - Duplicate exact engine strings are rejected at construction.
+   - Registration engine tokens with leading or trailing whitespace are rejected at construction.
