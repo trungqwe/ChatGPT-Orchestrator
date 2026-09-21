@@ -1,20 +1,26 @@
-# WO-V4-09A-R2: One-Shot Full-Cycle Coordinator & Real Acceptance Design Seal (R2)
+# WO-V4-09A-R3: One-Shot Full-Cycle Coordinator & Real Acceptance Design Seal (R3)
 
 ## 1. Document & Work Package Identity
 
 - **Work Package**: WP-V4-09 (One-Shot Full Cycle)
-- **Phase**: Design Seal Revision 2 (WO-V4-09A-R2)
+- **Phase**: Design Seal Revision 3 (WO-V4-09A-R3)
 - **Status**: DESIGN_COMPLETE / EXTERNAL_REVIEW_PENDING
-- **Parent Commit**: `1e9db50049b5d270a8a14857539b17f4931e6d0f`
+- **Parent Commit**: `f1b5147ff111b98514cabf4a732ed910ff8eaf68`
 - **Canonical Branch**: `dev/v4-clean`
 - **Scope**: Documentation only (no production code, no test modifications, no registry modifications, no runtime execution)
-- **Purpose**: Correct remaining design ambiguities found during external review of WO-V4-09A-R1:
-  1. Canonical project root authority (use `canonicalizeProjectRoot`, not raw string comparison)
-  2. `policy.max_active_dispatches === 1` as explicit Gate A requirement
-  3. Exact `awaitAuditDecisionV1` error-boundary mapping (`AUDIT_DECISION_ITEMS_INCOMPLETE` → `DECISION_INVALID`, `AUDIT_DECISION_TURN_NOT_COMPLETED` → `AUDITOR_TURN_FAILED`)
-  4. Remove contradictory rule claiming hydration read failure is separately recoverable by coordinator
-  5. Auditor close failure overrides approved result
-  6. Full-cycle pass invariant count corrected to 14
+- **Purpose**: Correct safety semantics identified during external review of WO-V4-09A-R2:
+  1. **Correct close-failure precedence**: Delete the unsafe R2 rule that close failure unconditionally overrides candidate results. Seal the general rule: `execution authority > cleanup authority`. Primary execution failure authority (e.g., `AUDITOR_TURN_UNCERTAIN`, `DISPATCH_UNCERTAIN`, `PROVENANCE_AMBIGUOUS`, `WORKER_WAIT_UNAVAILABLE`) and active-worker conditions (`WORKER_PENDING`) must never be masked by a cleanup failure.
+  2. **Add bounded cleanup metadata**: Result envelope includes `cleanup: { auditor_close, code }` with strict bounded enumerations and no raw exceptions or provider payloads.
+  3. **Close failure with success / semantic terminal result**: When the cycle body produced a non-operational semantic/success result (`APPROVED`, `APPROVED_WITHOUT_DISPATCH`, `EVIDENCE_REQUIRED`, `BLOCKED`, `STOPPED`, `CYCLE_LIMIT_REACHED`) and `auditor.close()` fails, return `status: FAILED`, `code: AUDITOR_CLOSE_FAILED`. In particular, `APPROVED` must never survive a failed close.
+  4. **Close failure must not mask existing operational failure**: When the cycle body already failed with a primary operational code, that primary code remains authoritative; cleanup failure is recorded in `cleanup`.
+  5. **`WORKER_PENDING` precedence**: When the worker is still pending, close failure must not replace `WORKER_PENDING` with generic failure, preserving operator awareness of ongoing background execution.
+  6. **Dispatch ownership race**: `broker.dispatchWorker()` may return idempotent replays (`idempotent_replay: true`) if an active dispatch raced between Gate A and Gate C. The coordinator must not adopt such unowned dispatches.
+  7. **Strict fresh dispatch acceptance shape**: Proceed to `waitWorker()` only if the dispatch result is a freshly created, non-replay `DISPATCH_ACCEPTED` matching project and work order identities.
+  8. **Idempotent replay result**: Return fail-closed `status: FAILED`, `code: DISPATCH_REPLAY_NOT_OWNED` with zero wait calls, zero retries, and zero second dispatches.
+  9. **Malformed successful dispatch results**: Any successful dispatch result diverging from the fresh acceptance shape returns `status: FAILED`, `code: DISPATCH_RESULT_INVALID`.
+  10. **Wait result ownership and state validation**: Single authorized `waitWorker()` must retain exact dispatch and work order identities. States `DISPATCH_ACCEPTED` and `RUNNING` remain `WORKER_PENDING`. Unexpected states like `DISPATCHING` return `DISPATCH_RESULT_INVALID`.
+  11. **Full-cycle pass condition**: All 14 invariants sealed, with invariant 8 clarifying fresh coordinator-owned dispatch and invariant 14 clarifying close-failure precedence.
+  12. **Planned OSC test matrix**: Minimum 42 tests explicitly covering dispatch ownership, wait ownership, and close-failure precedence.
 
 ---
 
@@ -99,24 +105,24 @@ The coordinator orchestrates existing domain authorities and does **not** own:
 
 ## 4. auditorFactory Contract
 
-Called exactly once:
+Factory signature:
 ```js
-const auditor = await auditorFactory({
+auditorFactory({
   phase: 'one_shot_cycle',
-  cwd: canonicalProjectRoot   // MUST be the canonical root from canonicalizeProjectRoot
+  cwd: canonicalProjectRoot  // canonicalProjectRoot from canonicalizeProjectRoot(project.project_root)
 })
 ```
 
-The `cwd` must be derived from `canonicalizeProjectRoot(projectA.project_root).canonicalRoot` — not from raw `project_root`, raw `auditor.cwd`, `path.normalize` alone, `computeRootIdentityKey` alone, or caller input.
+Called **at most once** per cycle, strictly after Gate A passes and worker is confirmed `IDLE`.
 
-The returned adapter instance must support:
+The factory returns an adapter conforming to `CodexAuditorAdapter` contract:
 ```text
 initialize, resumeThread, listModels, startTurn, waitForTurnCompletion, readThread, close
 ```
 
-Required initialization sequence:
+Coordinator initialization sequence:
 ```text
-auditorFactory (exactly once)
+auditorFactory({ phase: 'one_shot_cycle', cwd: canonicalProjectRoot })
   → auditor.initialize()
   → auditor.resumeThread({ threadId: exactRegistryThreadId })
   → (verify returned ID matches exactRegistryThreadId byte-for-byte)
@@ -128,7 +134,7 @@ No `startThread()`. The same adapter instance is retained through both Turn A an
 
 ---
 
-## 5. Adapter Cleanup Authority (finally boundary)
+## 5. Adapter Cleanup Authority & Close-Failure Precedence
 
 Once an auditor adapter has been created, the coordinator **must** close it through a `finally` boundary:
 ```text
@@ -137,22 +143,137 @@ close attempts: exactly 1
 
 This applies on every terminal path after successful factory creation.
 
-### Close Failure Overrides Result
+### 5.1 Bounded Cleanup Metadata
 
-If the cycle body computed any candidate result:
-```text
-APPROVED, APPROVED_WITHOUT_DISPATCH, EVIDENCE_REQUIRED,
-BLOCKED, STOPPED, WORKER_PENDING, CYCLE_LIMIT_REACHED, FAILED
+The conceptual result envelope includes a bounded `cleanup` record:
+```js
+cleanup: {
+  auditor_close: 'NOT_REQUIRED' | 'SUCCEEDED' | 'FAILED',
+  code: null | 'AUDITOR_CLOSE_FAILED'
+}
 ```
-but the subsequent `await auditor.close()` fails, the externally returned result becomes:
+
+Rules:
+- Before auditor creation:
+  ```text
+  auditor_close = NOT_REQUIRED
+  code = null
+  ```
+- After successful creation and successful close:
+  ```text
+  auditor_close = SUCCEEDED
+  code = null
+  ```
+- After close failure:
+  ```text
+  auditor_close = FAILED
+  code = AUDITOR_CLOSE_FAILED
+  ```
+- No raw close exception.
+- No stack trace.
+- No provider payload.
+- No unbounded diagnostic.
+
+### 5.2 General Precedence Rule: Execution Authority > Cleanup Authority
+
+```text
+execution authority > cleanup authority
+```
+
+Cleanup failure is secondary evidence when an operational failure or active-worker condition already exists. Primary execution authority must never be hidden by cleanup failure.
+
+### 5.3 Close Failure with Success / Semantic Terminal Result
+
+If the cycle body produced a non-operational semantic or success result:
+```text
+APPROVED
+APPROVED_WITHOUT_DISPATCH
+EVIDENCE_REQUIRED
+BLOCKED
+STOPPED
+CYCLE_LIMIT_REACHED
+```
+and `auditor.close()` fails, externally return:
 ```text
 status: FAILED
 code: AUDITOR_CLOSE_FAILED
 ```
+while preserving already validated bounded decision/workspace metadata.
 
-- Do not return `APPROVED`.
-- Do not perform another turn or worker action.
-- Preserve already-known bounded execution metadata (dispatch_id, workspace snapshots, etc.) where safe.
+In particular:
+```text
+APPROVED must never survive a failed close.
+```
+
+### 5.4 Close Failure Must Not Mask Existing Operational Failure
+
+If the cycle body already produced:
+```text
+status: FAILED
+```
+with any primary operational code, close failure **MUST NOT** replace that code.
+
+Example:
+```text
+body:
+  status = FAILED
+  code = AUDITOR_TURN_UNCERTAIN
+
+close:
+  FAILED
+
+final:
+  status: FAILED
+  code = AUDITOR_TURN_UNCERTAIN
+  cleanup: {
+    auditor_close: 'FAILED',
+    code: 'AUDITOR_CLOSE_FAILED'
+  }
+```
+Not: `code = AUDITOR_CLOSE_FAILED`.
+
+The primary execution failure remains authoritative. This applies generally to all pre-existing `FAILED` results, including:
+```text
+AUDITOR_TURN_FAILED
+AUDITOR_TURN_UNCERTAIN
+DECISION_INVALID
+AUTHORITY_DRIFT
+WORKER_POLICY_MISMATCH
+WORKSPACE_STATE_FAILED
+STALE_AUDIT_STATE
+DISPATCH_FAILED
+DISPATCH_UNCERTAIN
+PROVENANCE_AMBIGUOUS
+WORKER_WAIT_UNAVAILABLE
+DISPATCH_REPLAY_NOT_OWNED
+DISPATCH_RESULT_INVALID
+```
+and all other bounded broker failures propagated by the coordinator.
+
+### 5.5 WORKER_PENDING Precedence
+
+If the body result is:
+```text
+status: WORKER_PENDING
+```
+the worker may still be active in the background.
+
+Therefore a subsequent auditor close failure **MUST NOT** replace `WORKER_PENDING` with generic `FAILED / AUDITOR_CLOSE_FAILED`.
+
+Final result:
+```text
+status: WORKER_PENDING
+code: null (or sealed pending code)
+cleanup: {
+  auditor_close: 'FAILED',
+  code: 'AUDITOR_CLOSE_FAILED'
+}
+```
+
+This preserves operator knowledge that worker execution may still be in progress.
+- No retry.
+- No second wait.
+- No second dispatch.
 
 ---
 
@@ -211,6 +332,7 @@ Missing project or schema violation → STARTING_STATE_INVALID (0 turns, 0 dispa
 Auditor unbound or disabled → AUDITOR_UNAVAILABLE (0 turns, 0 dispatches)
 Worker not IDLE → WORKER_BUSY (0 turns, 0 dispatches)
 Root/cwd identity mismatch → STARTING_STATE_INVALID (0 turns, 0 dispatches)
+policy.max_active_dispatches !== 1 → STARTING_STATE_INVALID (0 turns, 0 dispatches)
 ```
 
 ---
@@ -354,7 +476,7 @@ No retry. Do not treat an unsent definitive failure as uncertainty.
 
 ### B. `awaitAuditDecisionV1()` errors
 
-**Important source reality**: `awaitAuditDecisionV1` wraps `readThread` hydration failures as `AUDIT_DECISION_ITEMS_INCOMPLETE`. WP09B must not bypass the helper to recover the underlying hydration transport failure separately.
+`awaitAuditDecisionV1` wraps `readThread` hydration failures as `AUDIT_DECISION_ITEMS_INCOMPLETE`. WP09B must not bypass the helper to recover the underlying hydration transport failure separately.
 
 **Raw completion/wait uncertainty** — if the helper propagates an operational wait/transport error that does NOT carry an `AUDIT_DECISION_*` code (e.g., `WAIT_TURN_TIMEOUT`, transport/process loss while awaiting completion):
 ```text
@@ -387,8 +509,6 @@ AUDIT_DECISION_ITEMS_INCOMPLETE    ← wraps hydration failure; DECISION_INVALID
 AUDIT_DECISION_OUTPUT_MISSING
 AUDIT_DECISION_OUTPUT_AMBIGUOUS
 ```
-
-**Correction from R1**: `AUDIT_DECISION_ITEMS_INCOMPLETE` must be treated as `DECISION_INVALID` at the coordinator boundary even when its internal cause was a failed hydration `readThread()`. `awaitAuditDecisionV1` has intentionally collapsed that underlying cause into its bounded decision-authority error. WP09B must not bypass the helper to recover a lower-level distinction. The erroneous R1 rule claiming "thread read unavailable → AUDITOR_TURN_UNCERTAIN" when that read occurs inside `awaitAuditDecisionV1` hydration is hereby deleted and replaced by this classification.
 
 No retry in any category.
 
@@ -487,7 +607,9 @@ Physical re-hashing is mandatory. The model's echoed state string is never suffi
 
 ---
 
-## 16. Worker Dispatch
+## 16. Worker Dispatch & Ownership Race
+
+### 16.1 Dispatch Call Shape
 
 ```js
 const dispatchResult = await broker.dispatchWorker({
@@ -500,12 +622,109 @@ const dispatchResult = await broker.dispatchWorker({
 ```
 
 No extra fields. No direct worker adapter calls. No session override. No engine override. No model-policy override.
-
 Maximum `broker.dispatchWorker` calls per cycle: **1** (including uncertain attempts).
+
+### 16.2 Dispatch Ownership Race Reality
+
+Source reality: `broker.dispatchWorker()` can return:
+```js
+{
+  ok: true,
+  idempotent_replay: true,
+  dispatch_id,
+  state
+}
+```
+if an exact matching active dispatch appears before the coordinator's dispatch call. This may occur despite Gate A reporting `IDLE` because another actor can race between Gate A and Gate C.
+
+The one-shot coordinator **MUST NOT** adopt such an existing dispatch as its own newly-created worker action.
+
+### 16.3 Strict Fresh Dispatch Acceptance Shape
+
+After the one allowed call to `broker.dispatchWorker(...)`, the coordinator may proceed to `waitWorker()` **only if all of the following are true**:
+```text
+dispatchResult.ok === true
+dispatchResult.idempotent_replay !== true
+dispatchResult.state === "DISPATCH_ACCEPTED"
+dispatchResult.dispatch_id is non-empty string
+dispatchResult.work_order_id === decisionA.work_order.work_order_id
+dispatchResult.project_id === projectId
+```
+This is the only newly accepted dispatch shape for WP09 one-shot ownership.
+
+### 16.4 Idempotent Replay Handling
+
+If:
+```text
+dispatchResult.ok === true
+dispatchResult.idempotent_replay === true
+```
+fail closed:
+```text
+status: FAILED
+code: DISPATCH_REPLAY_NOT_OWNED
+```
+
+Rules:
+- `waitWorker` calls: 0
+- second dispatch calls: 0
+- worker transcript reads: 0
+- Do NOT treat the existing active dispatch as completion of this cycle.
+- Do NOT retry.
+
+`DISPATCH_REPLAY_NOT_OWNED` is local to `one-shot-cycle.js`. No shared `broker/contracts.js` modification.
+
+### 16.5 Malformed Successful Dispatch Results
+
+If:
+```text
+dispatchResult.ok === true
+```
+but the returned result is not the exact fresh acceptance shape in §16.3, fail closed:
+```text
+status: FAILED
+code: DISPATCH_RESULT_INVALID
+```
+Examples:
+- missing `dispatch_id`
+- wrong `project_id`
+- wrong `work_order_id`
+- unexpected state (e.g., `DISPATCHING`, `UNKNOWN`)
+
+Rules:
+- 0 wait calls
+- 0 retry calls
+- 0 second dispatch calls
+
+`DISPATCH_RESULT_INVALID` is local to the coordinator.
+
+### 16.6 Broker Failure Results
+
+If:
+```text
+dispatchResult.ok === false
+```
+preserve bounded broker failure authority where supplied:
+```text
+WORKER_BUSY
+STALE_AUDIT_STATE
+DISPATCH_FAILED
+DISPATCH_UNCERTAIN
+DUPLICATE_WORK_ORDER_CONFLICT
+LIFECYCLE_STORE_FAILURE
+REGISTRY_UNAVAILABLE
+WORKSPACE_STATE_UNAVAILABLE
+```
+
+Do not reinterpret `DISPATCH_UNCERTAIN` as definitive failure.
+- No retry.
+- No `waitWorker()` after failed dispatch.
 
 ---
 
-## 17. Worker Wait
+## 17. Worker Wait & Ownership Validation
+
+After a newly-owned `DISPATCH_ACCEPTED`, the coordinator calls `broker.waitWorker()` **at most once**:
 
 ```js
 const waitResult = await broker.waitWorker({
@@ -515,12 +734,47 @@ const waitResult = await broker.waitWorker({
 })
 ```
 
-Called at most once. Only `READY_FOR_REVIEW` permits Turn B.
+### 17.1 Wait Result Ownership Validation
 
-Transitions:
-- `READY_FOR_REVIEW` → proceed to Gate D, S2, Turn B
-- `DISPATCH_ACCEPTED` / `RUNNING` (timeout) → `WORKER_PENDING`; no Turn B, no retry
-- `DISPATCH_FAILED` / `DISPATCH_UNCERTAIN` / `PROVENANCE_AMBIGUOUS` / `WORKER_WAIT_UNAVAILABLE` → fail closed
+Require any successful wait result to retain exact identity:
+```text
+waitResult.dispatch_id === dispatchResult.dispatch_id
+waitResult.work_order_id === decisionA.work_order.work_order_id (when present)
+```
+
+Unexpected successful state:
+`DISPATCHING` or any unknown success state is NOT `READY_FOR_REVIEW`.
+Return bounded failure:
+```text
+status: FAILED
+code: DISPATCH_RESULT_INVALID
+```
+No Turn B.
+
+### 17.2 WORKER_PENDING Status
+
+Treat as `WORKER_PENDING` only:
+```text
+DISPATCH_ACCEPTED
+RUNNING
+```
+returned by the single authorized wait call (e.g., wait timed out while worker is still processing).
+- No Turn B.
+- No retry.
+- No second wait.
+
+Only `READY_FOR_REVIEW` permits Gate D / S2 / Turn B.
+
+### 17.3 Preserved Broker Wait Failures
+
+If `broker.waitWorker()` returns `ok: false` or throws bounded broker errors:
+```text
+DISPATCH_FAILED
+DISPATCH_UNCERTAIN
+PROVENANCE_AMBIGUOUS
+WORKER_WAIT_UNAVAILABLE
+```
+Fail closed with preserved authority.
 
 `READY_FOR_REVIEW` does not constitute approval. Worker completion metadata from `broker.waitWorker()` is bounded (`state`, `dispatch_id`, `work_order_id`) and does not expose a raw worker report or transcript.
 
@@ -638,13 +892,13 @@ WP09 real acceptance passes if and only if a single continuous execution verifie
  5. Gate C authority is confirmed (re-canonicalized) unchanged before dispatch.
  6. Worker model policy matches Registry exactly (consistency check, not override).
  7. Freshness gate S1 matches S0 immediately before worker dispatch.
- 8. Exactly one real worker dispatch is accepted by the broker.
+ 8. Exactly one real worker dispatch is accepted by the broker as a fresh coordinator-owned dispatch (not idempotent replay: dispatchResult.ok === true, dispatchResult.idempotent_replay !== true, dispatchResult.state === "DISPATCH_ACCEPTED", dispatchResult.dispatch_id non-empty, matching project_id and work_order_id).
  9. Worker reaches READY_FOR_REVIEW with exact project and dispatch identities.
 10. Post-worker snapshot S2 is computed after Gate D authority confirmation.
 11. Same exact logical auditor thread performs Turn B with explicit reviewPrompt.
 12. Turn B returns authoritative APPROVE_WORK_PACKAGE decision.
 13. Final freshness gate S3 matches S2 immediately before final approval.
-14. Auditor adapter closed exactly once in finally block; close failure overrides APPROVED.
+14. Auditor adapter closed exactly once in finally block; close failure overrides non-operational semantic/success results (APPROVED converted to FAILED / AUDITOR_CLOSE_FAILED), while primary operational failures and WORKER_PENDING retain their primary status and record cleanup failure in bounded metadata.
 ```
 
 Any divergence constitutes `NOT_FULL_CYCLE_PASS`.
@@ -657,7 +911,7 @@ Any divergence constitutes `NOT_FULL_CYCLE_PASS`.
 {
   ok,               // boolean
   status,           // terminal status string
-  code,             // operational error code
+  code,             // operational error code (primary execution authority)
   project_id,
   audit_subject_id,
   auditor_thread_id,
@@ -672,6 +926,11 @@ Any divergence constitutes `NOT_FULL_CYCLE_PASS`.
     s1,  // null if not computed
     s2,  // null if not computed
     s3   // null if not computed
+  },
+
+  cleanup: {
+    auditor_close,  // 'NOT_REQUIRED' | 'SUCCEEDED' | 'FAILED'
+    code            // null | 'AUDITOR_CLOSE_FAILED'
   }
 }
 ```
@@ -687,9 +946,9 @@ APPROVED_WITHOUT_DISPATCH — Turn A APPROVE_WORK_PACKAGE (no dispatch)
 EVIDENCE_REQUIRED         — Turn A or Turn B REQUEST_EVIDENCE
 BLOCKED                   — Turn A or Turn B BLOCKED
 STOPPED                   — Turn A or Turn B STOP
-WORKER_PENDING            — worker did not reach READY_FOR_REVIEW within timeout
+WORKER_PENDING            — worker did not reach READY_FOR_REVIEW within timeout (preserved across close failure)
 CYCLE_LIMIT_REACHED       — Turn B DISPATCH_WORKER (second dispatch refused)
-FAILED                    — operational failure (see code)
+FAILED                    — operational failure (see code; primary execution failure preserved across close failure)
 ```
 
 ---
@@ -710,6 +969,8 @@ AUDITOR_TURN_UNCERTAIN
 DECISION_INVALID
 STALE_AUDIT_STATE
 AUDITOR_CLOSE_FAILED
+DISPATCH_REPLAY_NOT_OWNED
+DISPATCH_RESULT_INVALID
 ```
 
 Preserved broker codes where appropriate:
@@ -718,6 +979,10 @@ DISPATCH_FAILED
 DISPATCH_UNCERTAIN
 PROVENANCE_AMBIGUOUS
 WORKER_WAIT_UNAVAILABLE
+DUPLICATE_WORK_ORDER_CONFLICT
+LIFECYCLE_STORE_FAILURE
+REGISTRY_UNAVAILABLE
+WORKSPACE_STATE_UNAVAILABLE
 ```
 
 No new shared `broker/contracts.js` error codes required.
@@ -759,16 +1024,16 @@ pipeline-ui/lib/auditor/codex-app-server-client.js
 pipeline-ui/lib/auditor/model-policy-resolver.js
 ```
 
-The purpose of R2 is specifically to make WP09B implementable without modifying these protected modules.
+The purpose of R3 is specifically to finalize all safety semantics so that WP09B is implementable cleanly without modifying these protected modules.
 
 ---
 
 ## 27. Planned WP09B Deterministic Test Matrix (OSC)
 
-Test prefix: `OSC`. **Minimum 42 test cases** covering all the following (existing cases refined with R2 corrections; new cases added as needed):
+Test prefix: `OSC`. **Minimum 42 test cases** covering all the following (existing cases refined with R3 corrections; new cases added as needed):
 
 **Gate and Starting State:**
-- `OSC-001`: Missing project fails closed before adapter creation (`STARTING_STATE_INVALID`; 0 factory calls).
+- `OSC-001`: Missing project fails closed before adapter creation (`STARTING_STATE_INVALID`; 0 factory calls; `cleanup.auditor_close = NOT_REQUIRED`).
 - `OSC-002`: Unbound auditor (`auditor.thread_id === null`) fails closed before model/worker.
 - `OSC-003`: Disabled auditor (`auditor.enabled === false`) fails closed before model/worker.
 - `OSC-004`: Worker not IDLE (`worker_state !== "IDLE"`) fails closed before model turn (`WORKER_BUSY`).
@@ -782,7 +1047,7 @@ Test prefix: `OSC`. **Minimum 42 test cases** covering all the following (existi
 - `OSC-012`: S0 computed via `workspacePort.getWorkspaceState(projectB)`.
 
 **Canonical Root Authority (OSC-CANON):**
-- `OSC-CANON-01` (integrates into OSC-001/005 area): Gate A obtains `canonicalProjectRoot` through `canonicalizeProjectRoot(project.project_root)` — not raw string, not `path.normalize` alone.
+- `OSC-CANON-01`: Gate A obtains `canonicalProjectRoot` through `canonicalizeProjectRoot(project.project_root)` — not raw string, not `path.normalize` alone.
 - `OSC-CANON-02`: Gate A detects `auditor.cwd` canonical identity mismatch with `project_root` identity fails closed before factory.
 - `OSC-CANON-03`: Gate B, Gate C, Gate D, and final gate each re-canonicalize `project_root` and `auditor.cwd`; identity drift at any gate returns `AUTHORITY_DRIFT`.
 
@@ -802,40 +1067,52 @@ Test prefix: `OSC`. **Minimum 42 test cases** covering all the following (existi
 - `OSC-TURN-06`: Other strict `AUDIT_DECISION_*` validation failures → `DECISION_INVALID`; no retry.
 - `OSC-018`: Same classification policy applies to Turn A and Turn B.
 
-**Dispatch Gate:**
-- `OSC-019` (was 021): Registry Gate C drift before dispatch returns `AUTHORITY_DRIFT` (0 dispatches).
-- `OSC-020` (was 022): `decisionA.work_order.worker_model_policy !== projectC.worker.model_policy` returns `WORKER_POLICY_MISMATCH` (0 dispatches).
-- `OSC-021` (was 023): S1 computed via `workspacePort.getWorkspaceState(projectC)`.
-- `OSC-022` (was 024): S1 drift returns `STALE_AUDIT_STATE` (0 dispatches).
-- `OSC-023` (was 025): Dispatch uses exact broker request shape with no extra fields.
-- `OSC-024` (was 026): `broker.dispatchWorker` called at most once per cycle.
-- `OSC-025` (was 027): `DISPATCH_UNCERTAIN` terminates without retry.
-- `OSC-026` (was 028): Worker pending stops cycle with `WORKER_PENDING` — no Turn B.
-- `OSC-027` (was 029): `READY_FOR_REVIEW` alone never constitutes approval.
+**Dispatch Gate & Dispatch Ownership (OSC-DISP-OWN):**
+- `OSC-019`: Registry Gate C drift before dispatch returns `AUTHORITY_DRIFT` (0 dispatches).
+- `OSC-020`: `decisionA.work_order.worker_model_policy !== projectC.worker.model_policy` returns `WORKER_POLICY_MISMATCH` (0 dispatches).
+- `OSC-021`: S1 computed via `workspacePort.getWorkspaceState(projectC)`.
+- `OSC-022`: S1 drift returns `STALE_AUDIT_STATE` (0 dispatches).
+- `OSC-023`: Dispatch uses exact broker request shape with no extra fields.
+- `OSC-024`: `broker.dispatchWorker` called at most once per cycle.
+- `OSC-DISP-OWN-01`: Fresh broker `DISPATCH_ACCEPTED` result is accepted as coordinator-owned dispatch; proceeds to `waitWorker()`.
+- `OSC-DISP-OWN-02`: `dispatchResult.ok === true && dispatchResult.idempotent_replay === true` → fails closed with `DISPATCH_REPLAY_NOT_OWNED` → exactly 0 `waitWorker` calls, 0 second dispatch calls, 0 worker transcript reads.
+- `OSC-DISP-OWN-03`: Successful dispatch result with malformed/wrong identity (missing dispatch_id, wrong project_id, wrong work_order_id, unexpected state) → `DISPATCH_RESULT_INVALID` → exactly 0 `waitWorker` calls.
+- `OSC-DISP-OWN-04`: Broker `DISPATCH_UNCERTAIN` preserved exactly → zero retry → close failure cannot mask uncertainty.
 
-**Turn B:**
-- `OSC-028` (was 030): Registry Gate D detects authority drift — `AUTHORITY_DRIFT` (no Turn B).
-- `OSC-029` (was 031): S2 computed via `workspacePort.getWorkspaceState(projectD)` using fresh Gate D project.
-- `OSC-030` (was 032): Turn B uses same `auditSubjectId` as Turn A.
-- `OSC-031` (was 033): Turn B uses explicit `reviewPrompt` from caller input.
-- `OSC-032` (was 034): Turn B uses same adapter instance, same logical thread, same pinned model and effort.
-- `OSC-033` (was 035): Raw worker output/transcript is NOT passed to Turn B by coordinator.
-- `OSC-034` (was 036): Turn B transport uncertainty maps to `AUDITOR_TURN_UNCERTAIN` — no resend.
-- `OSC-035` (was 037): Turn B `DISPATCH_WORKER` returns `CYCLE_LIMIT_REACHED` with zero second dispatch.
-- `OSC-036` (was 038): Turn B `APPROVE_WORK_PACKAGE` requires final fresh Registry gate + S3 computation.
-- `OSC-037` (was 039): S3 drift prevents `APPROVED`, returns `STALE_AUDIT_STATE`.
+**Worker Wait & Ownership Validation (OSC-WAIT-OWN):**
+- `OSC-WAIT-OWN-01`: Wait `READY_FOR_REVIEW` with exact dispatch identity permits Gate D / S2 / Turn B.
+- `OSC-WAIT-OWN-02`: Wait `DISPATCH_ACCEPTED` or `RUNNING` (timeout) returns `WORKER_PENDING` (no Turn B, no retry).
+- `OSC-WAIT-OWN-03`: Unexpected successful wait state such as `DISPATCHING` or unknown state returns `DISPATCH_RESULT_INVALID` → zero Turn B.
+- `OSC-027`: `READY_FOR_REVIEW` alone never constitutes approval.
 
-**Close:**
-- `OSC-CLOSE-01` (was 040): `auditor.close()` attempted exactly once on every post-factory terminal path.
-- `OSC-CLOSE-02` (was 041): `AUDITOR_CLOSE_FAILED` overrides any candidate result including `APPROVED`; no additional turn or dispatch.
+**Turn B Review & Gates:**
+- `OSC-028`: Registry Gate D detects authority drift — `AUTHORITY_DRIFT` (no Turn B).
+- `OSC-029`: S2 computed via `workspacePort.getWorkspaceState(projectD)` using fresh Gate D project.
+- `OSC-030`: Turn B uses same `auditSubjectId` as Turn A.
+- `OSC-031`: Turn B uses explicit `reviewPrompt` from caller input.
+- `OSC-032`: Turn B uses same adapter instance, same logical thread, same pinned model and effort.
+- `OSC-033`: Raw worker output/transcript is NOT passed to Turn B by coordinator.
+- `OSC-034`: Turn B transport uncertainty maps to `AUDITOR_TURN_UNCERTAIN` — no resend.
+- `OSC-035`: Turn B `DISPATCH_WORKER` returns `CYCLE_LIMIT_REACHED` with zero second dispatch.
+- `OSC-036`: Turn B `APPROVE_WORK_PACKAGE` requires final fresh Registry gate + S3 computation.
+- `OSC-037`: S3 drift prevents `APPROVED`, returns `STALE_AUDIT_STATE`.
+
+**Close Failure Precedence & Cleanup Metadata (OSC-CLOSE-PREC):**
+- `OSC-CLOSE-PREC-01`: Candidate `APPROVED` + close failure → `status: FAILED`, `code: AUDITOR_CLOSE_FAILED`; validated workspace metadata preserved; `APPROVED` never survives.
+- `OSC-CLOSE-PREC-02`: Primary `AUDITOR_TURN_UNCERTAIN` + close failure → primary `status: FAILED, code: AUDITOR_TURN_UNCERTAIN` preserved; `cleanup: { auditor_close: 'FAILED', code: 'AUDITOR_CLOSE_FAILED' }`.
+- `OSC-CLOSE-PREC-03`: Primary `DISPATCH_UNCERTAIN` + close failure → primary `DISPATCH_UNCERTAIN` preserved; cleanup marks `AUDITOR_CLOSE_FAILED`.
+- `OSC-CLOSE-PREC-04`: `WORKER_PENDING` + close failure → `status: WORKER_PENDING` preserved; cleanup marks `AUDITOR_CLOSE_FAILED`.
+- `OSC-CLOSE-01`: `auditor.close()` attempted exactly once on every post-factory terminal path.
+- `OSC-CLOSE-02`: Successful close sets `cleanup: { auditor_close: 'SUCCEEDED', code: null }`.
 
 **Happy Path:**
 - `OSC-042`: Happy-path exact ordering verified end-to-end:
   ```text
   Gate A → worker IDLE check → factory → initialize → resume → listModels
   → resolveAuditorModelPolicy → Gate B → S0 → Turn A → Gate C
-  → worker_model_policy check → S1 → dispatchWorker → waitWorker
-  → Gate D → S2 → Turn B → final Registry gate + S3 → APPROVED → close
+  → worker_model_policy check → S1 → dispatchWorker (fresh DISPATCH_ACCEPTED)
+  → waitWorker (READY_FOR_REVIEW) → Gate D → S2 → Turn B
+  → final Registry gate + S3 → APPROVED → close (SUCCEEDED)
   ```
 
 ---
@@ -878,13 +1155,13 @@ logical auditor threads:        exactly 1 (existing bound thread)
 new auditor threads:            0
 ```
 
-### WP09A-R2 Execution Facts:
+### WP09A-R3 Execution Facts:
 ```text
-real auditor turns:    0
+real auditor turns:     0
 real worker dispatches: 0
-real AGY messages:     0
-model turns:           0
-Registry mutations:    NO
+real AGY messages:      0
+model turns:            0
+Registry mutations:     NO
 ```
 
 ---
@@ -899,9 +1176,9 @@ Registry mutations:    NO
 
 ## 31. External Review & Approval Gate
 
-This design document (Revision 2) seals the corrected technical specification of the One-Shot Full-Cycle Coordinator.
+This design document (Revision 3) seals the safety semantics of the One-Shot Full-Cycle Coordinator.
 
 Before proceeding to WP09B implementation:
 - The corrected design must be reviewed and approved by the external operator.
-- The parent commit must remain `1e9db50049b5d270a8a14857539b17f4931e6d0f`.
+- The parent commit must remain `f1b5147ff111b98514cabf4a732ed910ff8eaf68`.
 - No implementation work may start until explicit authorization is received.
