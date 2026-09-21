@@ -1023,6 +1023,14 @@ function createSqliteAuditorRecoveryStore(options = {}) {
 
   try {
     if (isReadOnly) {
+      // WAL coordination semantics for read-only recovery inspection:
+      // - readOnly prevents authoritative DB writes;
+      // - an existing WAL-mode database may cause SQLite itself to
+      //   create/reuse -wal/-shm coordination files;
+      // - these are transient SQLite coordination artifacts, not
+      //   recovery authority;
+      // - immutable/no-lock mode is intentionally not used because
+      //   inspect must observe committed WAL state.
       db = new DatabaseSync(dbPath, { open: true, readOnly: true });
     } else {
       db = new DatabaseSync(dbPath);

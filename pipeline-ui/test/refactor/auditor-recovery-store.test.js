@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Auditor Recovery Store Test Suite (ARS-001 .. ARS-086)
+ * Auditor Recovery Store Test Suite (ARS-001 .. ARS-088)
  * Verifies SQLite recovery store authority, single active bootstrap,
  * transition matrix, append-only history, decision hash & schema verification,
  * reopen semantics, schema v2 immutable authority, and legacy retirement.
@@ -87,7 +87,7 @@ function makeValidDecision(ctx) {
 }
 
 async function runTests() {
-  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-086)...');
+  console.log('Starting Auditor Recovery Store test suite (ARS-001 .. ARS-088)...');
 
   // ARS-001: Fresh DB creation and schema initialization
   {
@@ -3006,8 +3006,167 @@ async function runTests() {
     }
   }
 
+  // ARS-087 / ARS-READONLY-WAL-01: WAL-mode DB with active writer connection keeps uncheckpointed state observable via readOnly store
+  {
+    const { dir, dbPath } = createTempDbPath();
+    let writerDb = null;
+    try {
+      // 1. Create a valid v2 recovery DB
+      const setupStore = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      setupStore.close();
+
+      // 2 & 3. Ensure WAL mode and keep a writable SQLite connection alive
+      const { DatabaseSync } = require('node:sqlite');
+      writerDb = new DatabaseSync(dbPath);
+      writerDb.exec('PRAGMA journal_mode = WAL;');
+      // 4. Disable automatic checkpoint sufficiently for the test
+      writerDb.exec('PRAGMA wal_autocheckpoint = 0;');
+
+      // 5. Commit a valid recovery row/history state that remains observable through WAL
+      writerDb.exec('BEGIN IMMEDIATE;');
+      writerDb.prepare(`
+        INSERT INTO auditor_bootstrap (
+          project_id, operation_id, audit_subject_id, thread_id, workspace_state_observed,
+          state, authority_version, expected_project_root, expected_project_root_identity,
+          expected_auditor_model_policy, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'proj-wal-01', 'op-wal-01', 'subj-wal-01', 'thr-wal-01', 'ws-wal-01',
+        'PROVISIONAL_THREAD', 1, 'd:/TU_CODE/Orchestrator', 'd:/tu_code/orchestrator',
+        'strict-read-only', '2026-09-21T00:00:00Z', '2026-09-21T00:00:00Z'
+      );
+      writerDb.prepare(`
+        INSERT INTO auditor_bootstrap_history (
+          project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'proj-wal-01', 'op-wal-01', null, 'PROVISIONAL_THREAD', 1000, '2026-09-21T00:00:00Z', '{}'
+      );
+      writerDb.exec('COMMIT;');
+
+      // 6. Open recovery store with readOnly: true while writerDb is still open
+      const roStore = createSqliteAuditorRecoveryStoreRaw({ dbPath, readOnly: true });
+
+      // 7. Require the read-only store sees that newly committed state
+      const active = roStore.getActiveBootstrap('proj-wal-01');
+      assert.ok(active, 'readOnly store must observe committed active bootstrap in WAL');
+      assert.strictEqual(active.project_id, 'proj-wal-01');
+      assert.strictEqual(active.operation_id, 'op-wal-01');
+      assert.strictEqual(active.authority_version, 1);
+      assert.strictEqual(active.state, 'PROVISIONAL_THREAD');
+      assert.strictEqual(active.expected_project_root, 'd:/TU_CODE/Orchestrator');
+
+      const history = roStore.getHistory('proj-wal-01', 'op-wal-01');
+      assert.strictEqual(history.length, 1, 'readOnly store must observe history in WAL');
+      assert.strictEqual(history[0].next_state, 'PROVISIONAL_THREAD');
+
+      const allActive = roStore.listActiveBootstraps();
+      assert.strictEqual(allActive.length, 1);
+      assert.strictEqual(allActive[0].project_id, 'proj-wal-01');
+
+      roStore.close();
+
+      // 8. Require:
+      // * main DB schema unchanged
+      // * user_version unchanged
+      // * no recovery row mutation by reader
+      const verCheck = writerDb.prepare('PRAGMA user_version;').get();
+      assert.strictEqual(verCheck.user_version, 2, 'user_version must remain 2');
+      const tableCount = writerDb.prepare("SELECT count(*) as count FROM sqlite_master WHERE type='table' AND name IN ('auditor_bootstrap', 'auditor_bootstrap_history')").get();
+      assert.strictEqual(tableCount.count, 2, 'Schema tables must be preserved');
+      const rowCount = writerDb.prepare('SELECT count(*) as count FROM auditor_bootstrap').get();
+      assert.strictEqual(rowCount.count, 1, 'Reader must not have mutated bootstrap rows');
+
+      console.log('PASS: ARS-087 / ARS-READONLY-WAL-01 — WAL-mode DB keeps uncheckpointed state observable via readOnly store without mutation');
+    } finally {
+      if (writerDb) {
+        try { writerDb.close(); } catch {}
+      }
+      cleanupTempDir(dir);
+    }
+  }
+
+  // ARS-088 / ARS-READONLY-WAL-02: Quiescent v2 WAL-mode DB permits only SQLite coordination artifacts during readOnly inspection
+  {
+    const { dir, dbPath } = createTempDbPath();
+    try {
+      // 1. Start with a quiescent v2 WAL-mode DB
+      const setupStore = createSqliteAuditorRecoveryStoreRaw({ dbPath });
+      setupStore.beginBootstrap({
+        project_id: 'proj-quiescent',
+        operation_id: 'op-quiescent',
+        audit_subject_id: 'sub-quiescent',
+        thread_id: 'thr-quiescent',
+        workspace_state_observed: 'ws-quiescent',
+        authority_version: 1,
+        expected_project_root: 'd:/TU_CODE/Orchestrator',
+        expected_project_root_identity: 'd:/tu_code/orchestrator',
+        expected_auditor_model_policy: 'strict-read-only'
+      });
+      setupStore.close();
+
+      // 2. Record directory entries and main DB hash before read-only open
+      const entriesBefore = new Set(fs.readdirSync(dir));
+      const hashBefore = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+
+      // 3. Run read-only inspection
+      const roStore = createSqliteAuditorRecoveryStoreRaw({ dbPath, readOnly: true });
+      const active = roStore.getActiveBootstrap('proj-quiescent');
+      assert.ok(active);
+      assert.strictEqual(active.project_id, 'proj-quiescent');
+      const history = roStore.getHistory('proj-quiescent', 'op-quiescent');
+      assert.strictEqual(history.length, 1);
+      const allActive = roStore.listActiveBootstraps();
+      assert.strictEqual(allActive.length, 1);
+      roStore.close();
+
+      // 4. Record directory entries after
+      const entriesAfter = new Set(fs.readdirSync(dir));
+
+      // 5. Permit only SQLite coordination artifacts (<db>-wal, <db>-shm) as optional additions/removals
+      const dbBase = path.basename(dbPath);
+      const allowedArtifacts = new Set([`${dbBase}-wal`, `${dbBase}-shm`]);
+
+      for (const entry of entriesAfter) {
+        if (!entriesBefore.has(entry)) {
+          assert.ok(
+            allowedArtifacts.has(entry),
+            `Unexpected filesystem entry created during read-only inspection: ${entry}`
+          );
+        }
+      }
+      for (const entry of entriesBefore) {
+        if (!entriesAfter.has(entry)) {
+          assert.ok(
+            allowedArtifacts.has(entry),
+            `Unexpected filesystem entry removed during read-only inspection: ${entry}`
+          );
+        }
+      }
+
+      // Require: main DB hash unchanged, schema unchanged, user_version == 2, rows/history unchanged
+      const hashAfter = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+      assert.strictEqual(hashBefore, hashAfter, 'Main DB file bytes must remain unchanged');
+
+      const { DatabaseSync } = require('node:sqlite');
+      const checkDb = new DatabaseSync(dbPath, { readOnly: true });
+      assert.strictEqual(checkDb.prepare('PRAGMA user_version;').get().user_version, 2);
+      const checkActive = checkDb.prepare('SELECT * FROM auditor_bootstrap WHERE project_id = ?').get('proj-quiescent');
+      assert.ok(checkActive);
+      assert.strictEqual(checkActive.operation_id, 'op-quiescent');
+      assert.strictEqual(checkActive.state, 'PROVISIONAL_THREAD');
+      const checkHistory = checkDb.prepare('SELECT * FROM auditor_bootstrap_history WHERE project_id = ?').all('proj-quiescent');
+      assert.strictEqual(checkHistory.length, 1);
+      checkDb.close();
+
+      console.log('PASS: ARS-088 / ARS-READONLY-WAL-02 — Quiescent v2 WAL-mode DB permits only SQLite coordination artifacts, main DB hash & data unchanged');
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-086: 86/86 PASS)');
+  console.log('ALL AUDITOR RECOVERY STORE TESTS PASSED (ARS-001 .. ARS-088: 88/88 PASS)');
   console.log('======================================================================\n');
 }
 

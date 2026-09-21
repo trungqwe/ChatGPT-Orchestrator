@@ -12,7 +12,7 @@
 | V4-05AG | Explicit Uncertainty Resolution & Registry Gate | APPROVED / CLOSED (WO-V4-05AG-R2 / R3 / R3-R1: 82 ARS + 122 ATL tests pass; V2 migration atomic rollback, bootstrap authority self-verification, post-persistence Registry freshness gate before first turn, 13 deterministic suites pass) |
 | V4-05B | Real First Audit Acceptance | COMPLETE / ACCEPTED (WO-V4-05B-R9: real V1→V2 migration, legacy retirement, 1 real model turn, hydration, DURABLE_BOUND, cross-process resume verified; substantive DISPATCH_WORKER finding closed by R3/R3-R1; WP-V4-05 COMPLETE) |
 | V4-06 | Model resolver & usage observability | COMPLETE (WO-V4-06A complete: pure resolver, pagination hardening, first-turn pinning; WO-V4-06B complete: pure token usage observer, exact turn correlation, early race resolution, snapshot preservation, bounded storage; 23 TUO + 104 CAS + 21 MPR + 133 ATL + 122 AD + 82 ARS tests pass; 15 deterministic suites pass; no budget enforcement by design, reserved for V4-12) |
-| V4-07 | Audit/recover CLI | IN_PROGRESS (implementation corrected; read-only inspect sealed; ARC-001..065 pass; full deterministic regressions pass; external review pending) |
+| V4-07 | Audit/recover CLI | IN_PROGRESS (WAL-safe read-only inspection sealed; logical recovery authority remains immutable during inspect; SQLite -wal/-shm treated only as transient coordination artifacts; latest committed WAL state covered by deterministic tests; external review pending) |
 | V4-08 | Generic worker boundary | Antigravity regression |
 | V4-09 | One-shot full cycle | real workspace acceptance |
 | V4-10 | Recovery/provenance | fault matrix |

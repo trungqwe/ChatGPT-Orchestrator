@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Auditor Recover CLI Semantic Test Suite (ARC-001 .. ARC-065)
+ * Auditor Recover CLI Semantic Test Suite (ARC-001 .. ARC-067)
  *
  * Deterministic test matrix covering:
  * - Strict parser (unknown commands, unknown flags, bounds, forbidden flags, confirm)
@@ -184,7 +184,7 @@ function createMockRuntime(overrides = {}) {
 }
 
 async function runAllTests() {
-  console.log('Starting Auditor Recover CLI test suite (ARC-001 .. ARC-065)...\n');
+  console.log('Starting Auditor Recover CLI test suite (ARC-001 .. ARC-067)...\n');
 
   // ARC-001: inspect — no active bootstrap
   {
@@ -1575,6 +1575,148 @@ async function runAllTests() {
     console.log('PASS: ARC-065 — process-entry normal/help path: exactly one stdout JSON object, exit 0');
   }
 
+  // ARC-066: inspect against an existing WAL-mode recovery DB whose latest committed active recovery state is still visible through WAL
+  {
+    const dbPath = getTempDbPath('arc-066');
+    const { DatabaseSync } = require('node:sqlite');
+
+    // 1. Initialize schema v2
+    const initStore = createSqliteAuditorRecoveryStore({ dbPath });
+    initStore.close();
+
+    // 2. Open writer connection in WAL mode with wal_autocheckpoint = 0
+    const writerDb = new DatabaseSync(dbPath);
+    writerDb.exec('PRAGMA journal_mode = WAL;');
+    writerDb.exec('PRAGMA wal_autocheckpoint = 0;');
+
+    // 3. Commit active state into WAL
+    writerDb.exec('BEGIN IMMEDIATE;');
+    writerDb.prepare(`
+      INSERT INTO auditor_bootstrap (
+        project_id, operation_id, audit_subject_id, thread_id, workspace_state_observed,
+        state, authority_version, expected_project_root, expected_project_root_identity,
+        expected_auditor_model_policy, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'proj-066', 'op-066', 'subj-066', 'thr-066', 'ws-066',
+      'PROVISIONAL_THREAD', 1, '/repo/066', '/repo/066',
+      'strict-read-only', '2026-09-21T00:00:00Z', '2026-09-21T00:00:00Z'
+    );
+    writerDb.prepare(`
+      INSERT INTO auditor_bootstrap_history (
+        project_id, operation_id, previous_state, next_state, timestamp, iso, metadata
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'proj-066', 'op-066', null, 'PROVISIONAL_THREAD', 1000, '2026-09-21T00:00:00Z', '{}'
+    );
+    writerDb.exec('COMMIT;');
+
+    // 4. Run inspect CLI against uncheckpointed WAL state (while writerDb remains open)
+    const mockRegistryPort = {
+      getProject: async () => ({ id: 'proj-066', project_root: '/repo/066' })
+    };
+
+    const res = await runCli(['inspect', '--project-id', 'proj-066'], {
+      registryPort: mockRegistryPort,
+      recoveryOptions: { dbPath }
+    });
+
+    assert.strictEqual(res.exitCode, 0);
+    assert.strictEqual(res.response.ok, true);
+    assert.ok(res.response.active_bootstrap, 'inspect must return active bootstrap from WAL');
+    assert.strictEqual(res.response.active_bootstrap.project_id, 'proj-066');
+    assert.strictEqual(res.response.active_bootstrap.operation_id, 'op-066');
+    assert.strictEqual(res.response.active_bootstrap.state, 'PROVISIONAL_THREAD');
+    assert.strictEqual(res.response.active_bootstrap.authority_version, 1);
+    assert.strictEqual(res.response.history.length, 1);
+
+    // 5. Require no logical recovery mutation
+    const row = writerDb.prepare('SELECT count(*) as count FROM auditor_bootstrap').get();
+    assert.strictEqual(row.count, 1);
+    const hist = writerDb.prepare('SELECT count(*) as count FROM auditor_bootstrap_history').get();
+    assert.strictEqual(hist.count, 1);
+
+    writerDb.close();
+    console.log('PASS: ARC-066 — inspect against existing WAL-mode DB returns latest committed active state with no logical mutation');
+  }
+
+  // ARC-067: Inspect filesystem-side-effect classification: main DB byte-identical, only optional SQLite -wal/-shm coordination artifacts
+  {
+    const dbPath = getTempDbPath('arc-067');
+    const dir = path.dirname(dbPath);
+
+    // 1. Create quiescent v2 WAL-mode DB
+    const store = createSqliteAuditorRecoveryStore({ dbPath });
+    store.beginBootstrap({
+      project_id: 'proj-067',
+      operation_id: 'op-067',
+      audit_subject_id: 'subj-067',
+      thread_id: 'thr-067',
+      workspace_state_observed: 'ws-067',
+      authority_version: 1,
+      expected_project_root: '/repo/067',
+      expected_project_root_identity: '/repo/067',
+      expected_auditor_model_policy: 'strict-read-only'
+    });
+    store.close();
+
+    // 2. Record directory entries and main DB hash before inspect
+    const entriesBefore = new Set(fs.readdirSync(dir));
+    const hashBefore = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+
+    // 3. Run inspect CLI
+    const mockRegistryPort = {
+      getProject: async () => ({ id: 'proj-067', project_root: '/repo/067' })
+    };
+
+    const res = await runCli(['inspect', '--project-id', 'proj-067'], {
+      registryPort: mockRegistryPort,
+      recoveryOptions: { dbPath }
+    });
+
+    assert.strictEqual(res.exitCode, 0);
+    assert.strictEqual(res.response.ok, true);
+
+    // 4. Record directory entries after
+    const entriesAfter = new Set(fs.readdirSync(dir));
+    const baseName = path.basename(dbPath);
+    const allowedSidecars = new Set([`${baseName}-wal`, `${baseName}-shm`]);
+
+    for (const entry of entriesAfter) {
+      if (!entriesBefore.has(entry)) {
+        assert.ok(
+          allowedSidecars.has(entry),
+          `Unexpected file created during inspect: ${entry}`
+        );
+      }
+    }
+    for (const entry of entriesBefore) {
+      if (!entriesAfter.has(entry)) {
+        assert.ok(
+          allowedSidecars.has(entry),
+          `Unexpected file removed during inspect: ${entry}`
+        );
+      }
+    }
+
+    // 5. Require: main DB remains byte-identical, no schema/user_version/row changes
+    const hashAfter = crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+    assert.strictEqual(hashBefore, hashAfter, 'Main DB file must remain byte-identical after inspect');
+
+    const { DatabaseSync } = require('node:sqlite');
+    const rawDb = new DatabaseSync(dbPath, { readOnly: true });
+    assert.strictEqual(rawDb.prepare('PRAGMA user_version;').get().user_version, 2);
+    const activeRow = rawDb.prepare('SELECT * FROM auditor_bootstrap WHERE project_id = ?').get('proj-067');
+    assert.ok(activeRow);
+    assert.strictEqual(activeRow.operation_id, 'op-067');
+    assert.strictEqual(activeRow.state, 'PROVISIONAL_THREAD');
+    const historyRows = rawDb.prepare('SELECT * FROM auditor_bootstrap_history WHERE project_id = ?').all('proj-067');
+    assert.strictEqual(historyRows.length, 1);
+    rawDb.close();
+
+    console.log('PASS: ARC-067 — inspect filesystem-side-effect classification: main DB byte-identical, only optional SQLite -wal/-shm coordination artifacts');
+  }
+
   // Additional non-ARC boundary verification: adapterOptions.client blocked in production factory
   {
     assert.throws(() => {
@@ -1597,7 +1739,7 @@ async function runAllTests() {
   }
 
   console.log('\n======================================================================');
-  console.log('ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-065: 65/65 PASS)');
+  console.log('ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-067: 67/67 PASS)');
   console.log('======================================================================');
 }
 
