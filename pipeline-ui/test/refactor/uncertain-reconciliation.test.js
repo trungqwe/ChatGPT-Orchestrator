@@ -1220,6 +1220,88 @@ runTest('UR-035-SQL', 'Valid identical replay satisfies full durable history pro
   } finally { store.close(); }
 });
 
+runTest('UR-035-MEM-EMPTY-TS', 'Sealed replay contract: empty-string reconciled_at succeeds replay with zero clock calls (memory)', () => {
+  let isoCalls = 0;
+  let nowCalls = 0;
+  const clock = {
+    iso: () => { isoCalls++; return ''; },
+    now: () => { nowCalls++; return 1_700_000_000_000; },
+    isoCalls: () => isoCalls,
+    nowCalls: () => nowCalls
+  };
+  const store = createMemoryLifecycleStore({ clock });
+  setupUncertain(store);
+
+  // First call: reconciliation succeeds and persists reconciled_at === ''
+  const r1 = store.reconcileUncertainDispatch(BASE_AUTHORITY);
+  assert(r1.ok, `r1 ok: ${r1.error}`);
+  assertEqual(r1.reconciled, true, 'r1.reconciled');
+  assertEqual(r1.idempotent_replay, false, 'r1.idempotent_replay');
+  assertEqual(r1.dispatch.diagnostics.reconciliation.reconciled_at, '', 'diagnostics reconciled_at is empty string');
+
+  const historyList = store.getAllHistory();
+  const latestHist = historyList[historyList.length - 1];
+  assertEqual(latestHist.patch.diagnostics.reconciliation.reconciled_at, '', 'history patch reconciled_at is empty string');
+
+  const histBefore = historyList.length;
+  const isoBefore = clock.isoCalls();
+  const nowBefore = clock.nowCalls();
+  const dBefore = store.getDispatch(BASE_AUTHORITY.dispatch_id);
+
+  // Second call: idempotent replay with zero additional clock calls / mutations
+  const r2 = store.reconcileUncertainDispatch(BASE_AUTHORITY);
+  assertEqual(r2.ok, true, 'r2.ok');
+  assertEqual(r2.reconciled, false, 'r2.reconciled');
+  assertEqual(r2.idempotent_replay, true, 'r2.idempotent_replay');
+  assertEqual(clock.isoCalls(), isoBefore, '0 additional clock.iso calls');
+  assertEqual(clock.nowCalls(), nowBefore, '0 additional clock.now calls');
+  assertEqual(store.getAllHistory().length, histBefore, '0 additional history append');
+  assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).updated_at, dBefore.updated_at, '0 updated_at rewrite');
+  assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, '0 state mutation');
+});
+
+runTest('UR-035-SQL-EMPTY-TS', 'Sealed replay contract: empty-string reconciled_at succeeds replay with zero clock calls (sqlite)', () => {
+  let isoCalls = 0;
+  let nowCalls = 0;
+  const clock = {
+    iso: () => { isoCalls++; return ''; },
+    now: () => { nowCalls++; return 1_700_000_000_000; },
+    isoCalls: () => isoCalls,
+    nowCalls: () => nowCalls
+  };
+  const store = createSqlStore('ur035-empty-ts', clock);
+  try {
+    setupUncertain(store);
+
+    // First call: reconciliation succeeds and persists reconciled_at === ''
+    const r1 = store.reconcileUncertainDispatch(BASE_AUTHORITY);
+    assert(r1.ok, `r1 ok: ${r1.error}`);
+    assertEqual(r1.reconciled, true, 'r1.reconciled');
+    assertEqual(r1.idempotent_replay, false, 'r1.idempotent_replay');
+    assertEqual(r1.dispatch.diagnostics.reconciliation.reconciled_at, '', 'diagnostics reconciled_at is empty string');
+
+    const historyList = store.getAllHistory();
+    const latestHist = historyList[historyList.length - 1];
+    assertEqual(latestHist.patch.diagnostics.reconciliation.reconciled_at, '', 'history patch reconciled_at is empty string');
+
+    const histBefore = historyList.length;
+    const isoBefore = clock.isoCalls();
+    const nowBefore = clock.nowCalls();
+    const dBefore = store.getDispatch(BASE_AUTHORITY.dispatch_id);
+
+    // Second call: idempotent replay with zero additional clock calls / mutations
+    const r2 = store.reconcileUncertainDispatch(BASE_AUTHORITY);
+    assertEqual(r2.ok, true, 'r2.ok');
+    assertEqual(r2.reconciled, false, 'r2.reconciled');
+    assertEqual(r2.idempotent_replay, true, 'r2.idempotent_replay');
+    assertEqual(clock.isoCalls(), isoBefore, '0 additional clock.iso calls');
+    assertEqual(clock.nowCalls(), nowBefore, '0 additional clock.now calls');
+    assertEqual(store.getAllHistory().length, histBefore, '0 additional history append');
+    assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).updated_at, dBefore.updated_at, '0 updated_at rewrite');
+    assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, '0 state mutation');
+  } finally { store.close(); }
+});
+
 // ─── UR-036: Replay: dispatch.diagnostics.reconciliation has extra own key ────
 
 runTest('UR-036-SQL', 'Replay: diagnostics.reconciliation with extra key → throws corruption (sqlite)', () => {

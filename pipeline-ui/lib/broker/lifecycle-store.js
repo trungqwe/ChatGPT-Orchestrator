@@ -368,8 +368,7 @@ function createMemoryLifecycleStore(options = {}) {
     if (
       recon.classification !== 'DELIVERY_UNPROVEN' ||
       recon.evidence_authority !== authority.evidence_authority ||
-      typeof recon.reconciled_at !== 'string' ||
-      recon.reconciled_at.length === 0
+      typeof recon.reconciled_at !== 'string'
     ) {
       return {
         ok: false,
