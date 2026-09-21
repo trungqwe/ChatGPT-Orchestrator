@@ -1,10 +1,14 @@
-﻿# WO-V4-08A-R1: Generic Worker Adapter Boundary Design Seal (Corrected)
+# WO-V4-08A-R1: Generic Worker Adapter Boundary Design Seal (Corrected)
 
 ## 1. Document & Work Package Identity
 
 - **Work Package**: WP-V4-08 (Generic Worker Boundary)
 - **Phase**: Design Seal Revision 1 (WO-V4-08A-R1)
-- **Status**: DESIGN_COMPLETE / EXTERNAL_REVIEW_PENDING
+- **Status**: APPROVED_CLOSED
+- **Closure Note**:
+  - External review result: APPROVED_CLOSED
+  - Implementation authority: `31e9f9db3718556aa8f6561f78c37b0c9af093ea`
+  - Reviewed implementation tree: `8a1b9bdfad6b59f7d499f47a40c953b3f5a84aa9`
 - **Parent Commit**: `5915c2123bdf9b173980a9d174d03ef0f3f83b00`
 - **Canonical Branch**: `dev/v4-clean`
 - **Scope**: Documentation only (no production code, no test modifications, no registry modifications, no runtime execution)
