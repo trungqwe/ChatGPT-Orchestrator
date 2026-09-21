@@ -212,3 +212,74 @@ These two methods are the **ONLY** required WorkerPortV1 methods.
    - Each registration requires: plain object, non-empty `engine` string, `adapter` object with `dispatch` and `wait` functions.
    - Duplicate exact engine strings are rejected at construction.
    - Registration engine tokens with leading or trailing whitespace are rejected at construction.
+
+---
+
+## 9. Antigravity Dispatch Delivery Acknowledgement & Provenance (WO-V4-09C-D1)
+
+### 9.1 Core Delivery Authority Rule
+- `AO exit status 0 = transport-command acknowledgement only`.
+- Process exit 0 **MUST NOT** by itself authorize `DISPATCH_ACCEPTED`.
+- Authoritative delivery acknowledgement requires positive observation of the exact dispatch boundary in the Registry-resolved authoritative transcript.
+- Exact boundary requires:
+  - `record.source === "USER_EXPLICIT"`
+  - `record.type === "USER_INPUT"`
+  - Physical line 0: `[ORCHESTRATOR_DISPATCH_V1]`
+  - Physical line 1: JSON binding `worker_dispatch` schema v1 to current `project_id`, `work_order_id`, `dispatch_id`, and `expected_workspace_state_id`.
+
+### 9.2 Dispatch Sequence with Bounded Delivery Acknowledgement
+```text
+validate worker/session
+→ resolve authoritative transcript
+→ render exact envelope
+→ AO send ONCE
+→ if send outcome non-zero/timeout/exception:
+     existing non-definitive failure → broker persists DISPATCH_UNCERTAIN
+→ if AO exit 0:
+     enter bounded boundary-ack observation window:
+     ├── monotonic clock evaluation (default 30,000ms, clamped 1ms..30,000ms)
+     ├── re-resolve exact session and verify transcript mapping stability
+     ├── scan transcript for exact dispatch boundary
+     ├── exact boundary observed:
+     │    return { ok: true, state: "DISPATCH_ACCEPTED" }
+     └── boundary unproven by deadline / scan error / mapping drift / duplicate / contradiction:
+          return non-definitive failure → broker persists DISPATCH_UNCERTAIN
+```
+
+### 9.3 Invariants
+- **No AO resend**: `ao send` is invoked at most once per dispatch attempt.
+- **No second dispatch**: Unproven boundary produces non-definitive failure; the adapter never resends.
+- **No heuristic delivery inference**: Delivery cannot be assumed without exact transcript proof.
+- **Separation of Concerns**: Dispatch acknowledgement never emits `READY_FOR_REVIEW`.
+
+---
+
+## 10. Wait Contract Hardening & Retirement of WA-008
+
+1. **Precondition Hardening**:
+   Under the delivery acknowledgement contract, `DISPATCH_ACCEPTED` is only achieved after the exact boundary is verified on disk.
+2. **Retirement of WA-008**:
+   The legacy assumption that a missing boundary at wait deadline returns `DISPATCH_ACCEPTED` is formally **RETIRED**.
+3. **Provenance Ambiguity**:
+   If a subsequent `workerPort.wait()` invocation cannot observe the previously acknowledged dispatch boundary within its authoritative transcript snapshot, this constitutes a provenance violation.
+   The adapter returns:
+   ```js
+   {
+     ok: false,
+     code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
+     dispatch_id,
+     error: "Authoritative dispatch boundary previously acknowledged could not be found in transcript during wait"
+   }
+   ```
+   The broker transitions the dispatch to `PROVENANCE_AMBIGUOUS`.
+
+---
+
+## 11. Scope Invariants & Compatibility Boundaries
+
+1. **`contracts.js` Immutability**:
+   Zero changes to lifecycle states or error code definitions.
+2. **`broker.js` Immutability**:
+   Existing broker failure mapping (`ok: false, definitive: false` → `DISPATCH_UNCERTAIN`; `code: PROVENANCE_AMBIGUOUS` → `PROVENANCE_AMBIGUOUS`) is fully utilized without broker modification.
+3. **Public API Immutability**:
+   `WorkerPortV1.dispatch()` and `WorkerPortV1.wait()` public signatures remain unchanged. Acknowledgement timeouts are adapter-internal configuration.
