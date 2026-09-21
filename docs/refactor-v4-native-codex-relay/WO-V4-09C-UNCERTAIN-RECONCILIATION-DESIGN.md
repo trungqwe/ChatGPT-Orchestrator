@@ -3,11 +3,11 @@
 ## Document Metadata
 
 ```text
-Work Order:               WO-V4-09C-U1 (sealed via WO-V4-09C-U1-R1, WO-V4-09C-U1-R2)
+Work Order:               WO-V4-09C-U1 (sealed via WO-V4-09C-U1-R1, WO-V4-09C-U1-R2, WO-V4-09C-U1-R3)
 Status:                   DESIGN_SEALED (EXTERNAL_REVIEW_PENDING)
 Repository:               D:/TU_CODE/Orchestrator
 Branch:                   dev/v4-clean
-Parent Commit:            ab75f21de9a837c9dd2506411d0cfafead2563d7
+Parent Commit:            dd50bbd100941922c4b2577270771b62b7853fa8
 Scope:                    DESIGN ONLY (Zero Source / Zero Real Mutation / Zero P2 Reconciliation / Zero P3)
 Target Output File:       docs/refactor-v4-native-codex-relay/WO-V4-09C-UNCERTAIN-RECONCILIATION-DESIGN.md
 ```
@@ -146,7 +146,7 @@ Allowing `DISPATCH_UNCERTAIN → PROVENANCE_AMBIGUOUS` via generic `transition()
 
 ---
 
-## 5. Dedicated Lifecycle Store Reconciliation API & Plain Data Object Helper
+## 5. Dedicated Lifecycle Store Reconciliation API & Exact Validation Helpers
 
 Reconciliation must be exposed exclusively via a dedicated method on lifecycle store instances, separate from `transition()`, `beginDispatch()`, and broker operations.
 
@@ -184,12 +184,51 @@ function isPlainDataObject(value) {
 }
 ```
 
-This helper is authoritative for:
-- Reconciliation input `authority` object validation
-- Memory-store diagnostics validation
-- SQLite-store persisted diagnostics validation
-- Replay diagnostics validation
-- Replay history patch validation
+### Authoritative Exact-Enumerable-Data-Keys Helper
+To ensure exact bounding without invoking property getters or admitting Symbol/non-enumerable properties, exact-shape checks must use:
+
+```javascript
+function hasExactEnumerableDataKeys(value, expectedKeys) {
+  if (!isPlainDataObject(value)) {
+    return false;
+  }
+
+  const ownKeys = Reflect.ownKeys(value);
+
+  if (ownKeys.length !== expectedKeys.length) {
+    return false;
+  }
+
+  const expected = new Set(expectedKeys);
+
+  for (const key of ownKeys) {
+    if (typeof key !== 'string' || !expected.has(key)) {
+      return false;
+    }
+
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+
+    if (
+      !descriptor ||
+      descriptor.enumerable !== true ||
+      !Object.prototype.hasOwnProperty.call(descriptor, 'value')
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+```
+
+This helper guarantees:
+1. `value` is a plain data object (`Object.prototype` or `null` prototype).
+2. Exactly the expected keys exist as own properties (`Reflect.ownKeys` catches both strings and symbols).
+3. Zero Symbol properties are admitted.
+4. Zero extra string keys are admitted.
+5. Zero non-enumerable properties are admitted.
+6. Zero getter/setter accessor descriptors are admitted (only data descriptors with own `'value'` property).
+7. Validation **never invokes property getters**.
 
 ---
 
@@ -210,23 +249,25 @@ const authority = {
 ```
 
 ### Exact Authority Object Shape Constraints
-The authority argument must be a valid plain data object (`isPlainDataObject(authority)` with `Object.prototype` or `null` prototype).
-
-It must have **EXACTLY** the seven required own enumerable string keys:
-1. `dispatch_id`
-2. `project_id`
-3. `work_order_id`
-4. `expected_state`
-5. `target_state`
-6. `classification`
-7. `evidence_authority`
+The authority argument must satisfy:
+```javascript
+hasExactEnumerableDataKeys(authority, [
+  'dispatch_id',
+  'project_id',
+  'work_order_id',
+  'expected_state',
+  'target_state',
+  'classification',
+  'evidence_authority'
+])
+```
 
 The store must reject with `{ ok: false, code: ERROR_CODES.INVALID_REQUEST, error: "..." }` and perform **ZERO** mutation if:
-- `authority` is not a plain data object (`isPlainDataObject(authority)` is `false`).
+- `authority` is not a plain data object.
 - Any required key is missing.
-- Any unexpected extra key is present (`Object.keys(authority).length !== 7`).
-- Any Symbol property exists (`Object.getOwnPropertySymbols(authority).length > 0`).
-- Any property has a getter or setter accessor (`Object.getOwnPropertyDescriptors(authority)` contains accessors; validation must check descriptors without invoking getters).
+- Any unexpected extra key is present.
+- Any Symbol property exists.
+- Any property has a getter or setter accessor.
 - Any property is non-enumerable.
 
 ### Exact Field-Level Finite Validation Rules
@@ -363,8 +404,8 @@ Before reconciliation mutation, the store inspects `row.diagnostics`:
   - Pre-existing reconciliation metadata must never be silently overwritten.
 
 - **Under current state `PROVENANCE_AMBIGUOUS`**:
-  Idempotent replay is authorized **only** when durable history provenance is positively proven (see Section 13).
-  Otherwise: `ILLEGAL_STATE_TRANSITION`, zero mutation.
+  Idempotent replay is authorized **only** when both exact reconciliation metadata shape and durable history provenance are positively proven (see Section 13).
+  Otherwise: `ILLEGAL_STATE_TRANSITION` (or throw on structural corruption), zero mutation.
 
 ### Merge Semantics on Valid First Reconciliation
 ```javascript
@@ -466,10 +507,10 @@ The bound parameters are strictly:
    - row.work_order_id === authority.work_order_id (if not -> ROLLBACK, return INVALID_REQUEST)
 5. Evaluate current state:
    a. If row.state === DISPATCH_STATES.PROVENANCE_AMBIGUOUS:
-      - Evaluate idempotent replay with durable history provenance proof (Section 13)
+      - Evaluate idempotent replay with exact metadata shape and durable history provenance proof (Section 13)
       - If valid replay -> ROLLBACK transaction, return { ok: true, reconciled: false, idempotent_replay: true, dispatch: rowToDispatch(row) }
       - If invalid replay / different-path provenance -> ROLLBACK, return ILLEGAL_STATE_TRANSITION
-      - If history is corrupt -> ROLLBACK, throw Error
+      - If diagnostics or history is structurally corrupt -> ROLLBACK, throw Error
    b. If row.state !== DISPATCH_STATES.DISPATCH_UNCERTAIN:
       -> ROLLBACK
       -> Return { ok: false, code: ERROR_CODES.ILLEGAL_STATE_TRANSITION, currentState: row.state, expectedState: DISPATCH_UNCERTAIN }
@@ -542,15 +583,35 @@ When state is updated to `PROVENANCE_AMBIGUOUS`:
 
 Operator procedures may accidentally trigger a reconciliation script multiple times. However, current state `PROVENANCE_AMBIGUOUS` plus matching diagnostics alone is **NOT** sufficient to authorize an idempotent replay.
 
+An exact valid replay requires **BOTH**:
+1. Exact dispatch reconciliation metadata shape and values.
+2. Exact durable history provenance.
+
+### Exact Dispatch Reconciliation Metadata Shape
+Prior to inspecting values, `row.diagnostics.reconciliation` must satisfy:
+```javascript
+hasExactEnumerableDataKeys(row.diagnostics.reconciliation, [
+  'classification',
+  'evidence_authority',
+  'reconciled_at'
+])
+```
+
+If `row.diagnostics` is not a plain data object, or if `row.diagnostics.reconciliation` violates `hasExactEnumerableDataKeys` (e.g. contains extra keys, symbols, accessors, non-enumerable properties, or non-plain prototypes):
+- **FAIL CLOSED as structural persisted-authority corruption**:
+  - `ROLLBACK` active transaction.
+  - `throw new Error("Persisted authority corruption: dispatch reconciliation metadata shape is invalid")`.
+  - **ZERO mutation**, **ZERO history append**, **ZERO clock calls**.
+
 ### The Replay Provenance Invariant
 An idempotent replay is authorized **IF AND ONLY IF** all of the following hold:
 
 1. **Identity Matches**: `dispatch_id`, `project_id`, and `work_order_id` match exactly.
 2. **Current State**: Exactly `DISPATCH_STATES.PROVENANCE_AMBIGUOUS`.
-3. **Dispatch Diagnostics Plainness**:
-   - `row.diagnostics` is a valid plain data object (`isPlainDataObject(row.diagnostics)`).
-   - `row.diagnostics.reconciliation` is a valid plain data object (`isPlainDataObject(row.diagnostics.reconciliation)`).
-4. **Dispatch Diagnostics Exactness**:
+3. **Dispatch Diagnostics Exact Shape**:
+   - `isPlainDataObject(row.diagnostics)` is `true`.
+   - `hasExactEnumerableDataKeys(row.diagnostics.reconciliation, ['classification', 'evidence_authority', 'reconciled_at'])` is `true`.
+4. **Dispatch Diagnostics Exact Values**:
    - `row.diagnostics.reconciliation.classification === 'DELIVERY_UNPROVEN'`
    - `row.diagnostics.reconciliation.evidence_authority === authority.evidence_authority`
    - `typeof row.diagnostics.reconciliation.reconciled_at === 'string'`
@@ -567,34 +628,24 @@ An idempotent replay is authorized **IF AND ONLY IF** all of the following hold:
    - If no history row exists: **FAIL CLOSED** (`ROLLBACK`, throw persisted corruption error).
    - `latestHistory.previous_state` must strictly equal `DISPATCH_STATES.DISPATCH_UNCERTAIN`.
    - `latestHistory.next_state` must strictly equal `DISPATCH_STATES.PROVENANCE_AMBIGUOUS`.
-6. **Latest History Patch Exactness**:
-   - Deserialized patch must be a valid plain data object (`isPlainDataObject(patch)`).
-   - `patch` must have **EXACTLY** one own key: `'diagnostics'`.
-   - `patch.diagnostics` must be a valid plain data object with **EXACTLY** one own key: `'reconciliation'`.
-   - `patch.diagnostics.reconciliation` must be a valid plain data object with **EXACTLY** three own keys: `'classification'`, `'evidence_authority'`, `'reconciled_at'`.
+6. **Latest History Patch Exact Shape & Values**:
+   - Deserialized patch must satisfy `hasExactEnumerableDataKeys(patch, ['diagnostics'])`.
+   - `patch.diagnostics` must satisfy `hasExactEnumerableDataKeys(patch.diagnostics, ['reconciliation'])`.
+   - `patch.diagnostics.reconciliation` must satisfy `hasExactEnumerableDataKeys(patch.diagnostics.reconciliation, ['classification', 'evidence_authority', 'reconciled_at'])`.
+   - If any level violates `hasExactEnumerableDataKeys` or cannot be deserialized:
+     `ROLLBACK`, throw persisted corruption error.
    - The values must strictly match the dispatch diagnostics:
      ```text
      patch.diagnostics.reconciliation.classification === dispatch.diagnostics.reconciliation.classification
      patch.diagnostics.reconciliation.evidence_authority === dispatch.diagnostics.reconciliation.evidence_authority
      patch.diagnostics.reconciliation.reconciled_at === dispatch.diagnostics.reconciliation.reconciled_at
      ```
-   - No additional keys at any of these levels (`patch`, `patch.diagnostics`, `patch.diagnostics.reconciliation`).
 
-### Different-Path Provenance Must Fail Closed
-If a dispatch reached `PROVENANCE_AMBIGUOUS` from:
-- `DISPATCH_ACCEPTED → PROVENANCE_AMBIGUOUS` (e.g. wait timeout / missing boundary)
-- `RUNNING → PROVENANCE_AMBIGUOUS`
-
-Even if its diagnostics happen to contain `classification: 'DELIVERY_UNPROVEN'` and `evidence_authority: authority.evidence_authority`, `reconcileUncertainDispatch(authority)` **MUST NOT** classify the call as idempotent replay.
-Because the latest history transition was not `DISPATCH_UNCERTAIN → PROVENANCE_AMBIGUOUS`, it fails closed:
-```javascript
-{
-  ok: false,
-  code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
-  error: "Dispatch reached PROVENANCE_AMBIGUOUS through a different transition path; replay unauthorized"
-}
-```
-**ZERO** mutation. **ZERO** history append.
+### Failure Semantics Distinction
+- **Structural corruption** (malformed diagnostics, non-plain objects, extra/missing keys, symbol/accessor properties, corrupt history):
+  `ROLLBACK`, **THROW** persisted-authority corruption, zero mutation, zero history append, zero clock calls.
+- **Semantic replay mismatch** (exact valid shape, but `evidence_authority` differs, or latest history was `DISPATCH_ACCEPTED -> PROVENANCE_AMBIGUOUS` or `RUNNING -> PROVENANCE_AMBIGUOUS`):
+  `ROLLBACK`, return structured `{ ok: false, code: ERROR_CODES.ILLEGAL_STATE_TRANSITION, error: "..." }`, zero mutation, zero history append, zero clock calls.
 
 ### Replay Execution Semantics
 When all replay provenance checks pass:
@@ -676,7 +727,7 @@ Option 2: Dedicated reconciliation CLI with exact identity/evidence gates
 
 ---
 
-## 17. Deterministic Test Matrix (UR-001..UR-035)
+## 17. Deterministic Test Matrix (UR-001..UR-037)
 
 The subsequent implementation work order must implement and verify the following deterministic test cases across both memory and SQLite stores:
 
@@ -717,6 +768,8 @@ The subsequent implementation work order must implement and verify the following
 | **UR-033** | Replay latest history patch malformed / non-plain | Replay encountering malformed/non-plain patch triggers `ROLLBACK` and throws corruption error. Zero mutation. |
 | **UR-034** | Replay latest history patch mismatch with diagnostics | Replay where history patch does not exactly match dispatch reconciliation metadata rejected with `ILLEGAL_STATE_TRANSITION`. Zero mutation. |
 | **UR-035** | Valid identical replay with exact durable history proof | Replay satisfying full durable history provenance returns `idempotent_replay: true`, zero mutations, zero clock calls. |
+| **UR-036** | Replay dispatch metadata contains extra own key | `PROVENANCE_AMBIGUOUS` replay where `dispatch.diagnostics.reconciliation` contains correct values plus extra key triggers `ROLLBACK` and throws corruption error. Zero mutation, zero clock calls. |
+| **UR-037** | Replay proof object violates exact own-data-key semantics | Replay proof object containing symbol, accessor, or non-enumerable property fails closed as structural persisted corruption. Zero mutation, zero clock calls. |
 
 ---
 
@@ -725,7 +778,7 @@ The subsequent implementation work order must implement and verify the following
 Following formal review and approval of this design and its subsequent implementation:
 
 1. **Design Scope Constraint**:
-   Work Order `WO-V4-09C-U1` (including `WO-V4-09C-U1-R1` and `WO-V4-09C-U1-R2`) is strictly **DESIGN-ONLY**. It executes **ZERO** lifecycle mutations on `lifecycle.sqlite3`.
+   Work Order `WO-V4-09C-U1` (including `WO-V4-09C-U1-R1`, `WO-V4-09C-U1-R2`, and `WO-V4-09C-U1-R3`) is strictly **DESIGN-ONLY**. It executes **ZERO** lifecycle mutations on `lifecycle.sqlite3`.
 2. **Future Real Reconciliation Work Order**:
    A dedicated real-state reconciliation work order (e.g. `WO-V4-09C-P2-RC`) will be authorized to reconcile the stalled P2 dispatch:
    ```text
@@ -754,7 +807,7 @@ Real acceptance execution of **P3** remains strictly **FORBIDDEN** until all fou
                            ▼ (Approved only after external review)
 ┌────────────────────────────────────────────────────────┐
 │ Gate 2: Reconciliation Implementation                  │
-│ Status: PENDING (Dedicated Work Order + Matrix UR-035) │
+│ Status: PENDING (Dedicated Work Order + Matrix UR-037) │
 └──────────────────────────┬─────────────────────────────┘
                            │
                            ▼
@@ -797,7 +850,7 @@ Generic `transition()` is the automated runtime transition mechanism. Permitting
 `store.reconcileUncertainDispatch(authority)` implemented on both memory and SQLite stores, completely isolated from `transition()`, `beginDispatch()`, and `broker`.
 
 ### Decision E: Exact identity/evidence inputs
-A single bounded plain data object binding `dispatch_id`, `project_id`, `work_order_id`, `expected_state: 'DISPATCH_UNCERTAIN'`, `target_state: 'PROVENANCE_AMBIGUOUS'`, `classification: 'DELIVERY_UNPROVEN'`, and `evidence_authority: string`. Must have exactly 7 own enumerable string keys, no extra keys, no symbols, no accessors. Validated with finite bounds (`<= 512` UTF-8 bytes, no control chars/multiline, project regex). Fails closed with `INVALID_REQUEST` on invalid input or work order mismatch, `DISPATCH_NOT_FOUND` on missing dispatch, and `PROJECT_IDENTITY_MISMATCH` on project mismatch.
+A single bounded plain data object binding `dispatch_id`, `project_id`, `work_order_id`, `expected_state: 'DISPATCH_UNCERTAIN'`, `target_state: 'PROVENANCE_AMBIGUOUS'`, `classification: 'DELIVERY_UNPROVEN'`, and `evidence_authority: string`. Must satisfy `hasExactEnumerableDataKeys` for exactly these 7 keys (no extra keys, no symbols, no accessors). Validated with finite bounds (`<= 512` UTF-8 bytes, no control chars/multiline, project regex). Fails closed with `INVALID_REQUEST` on invalid input or work order mismatch, `DISPATCH_NOT_FOUND` on missing dispatch, and `PROJECT_IDENTITY_MISMATCH` on project mismatch.
 
 ### Decision F: SQLite atomic transaction semantics
 Executed within `BEGIN IMMEDIATE`. Re-reads row, validates identity, evaluates replay (rolling back on replay), updates state via parameterized SQL (`WHERE dispatch_id = ?`), verifies `changes === 1`, writes diagnostics, preserves error, appends exactly one history row, and commits. Rolls back and throws on persistence/integrity exceptions.
@@ -812,7 +865,7 @@ The `error` column containing `AGENT_EXITED` is left untouched byte-for-byte. Re
 Persisted in **BOTH** `dispatch.diagnostics` and `history.patch` using bounded structured JSON (`classification`, `evidence_authority`, `reconciled_at`). Dispatch diagnostics preserves unrelated plain keys; history patch records strictly the reconciliation delta. No raw transcripts or arbitrary prose.
 
 ### Decision J: Replay/idempotence behavior
-First call updates state and appends 1 history row. Second identical call requires proof of durable history provenance: verifies latest history row for dispatch is `DISPATCH_UNCERTAIN -> PROVENANCE_AMBIGUOUS` with matching deserialized patch. Rolls back the read-only transaction, and returns `{ ok: true, reconciled: false, idempotent_replay: true, dispatch }` with zero state mutation, zero history append, zero timestamp rewrites, and zero mutation clock calls. Different-path provenance fails closed with `ILLEGAL_STATE_TRANSITION`.
+First call updates state and appends 1 history row. Second identical call requires proof of durable history provenance and exact reconciliation metadata shape: verifies `dispatch.diagnostics.reconciliation` satisfies `hasExactEnumerableDataKeys` with matching values, and verifies latest history row for dispatch is `DISPATCH_UNCERTAIN -> PROVENANCE_AMBIGUOUS` with exact matching deserialized patch. Rolls back the read-only transaction, and returns `{ ok: true, reconciled: false, idempotent_replay: true, dispatch }` with zero state mutation, zero history append, zero timestamp rewrites, and zero mutation clock calls. Different-path provenance fails closed with `ILLEGAL_STATE_TRANSITION`. Structural shape corruption throws.
 
 ### Decision K: Race/state-drift behavior
 If state changes concurrently between preflight and transaction, transaction re-read detects the mismatch and rolls back with `ILLEGAL_STATE_TRANSITION`. Transaction-time database state is sole authority.
@@ -821,10 +874,10 @@ If state changes concurrently between preflight and transaction, transaction re-
 Option 1: Dedicated production lifecycle store API invoked by a bounded operator script. Bounded to audited Node.js execution, eliminating generic broker/CLI exposure.
 
 ### Decision M: Deterministic test matrix
-Cases UR-001 through UR-035 covering success, invariants, active lock release, generic seal, input validation bounds, error preservation, replay safety, durable history provenance proof, durability, store parity, and corruption handling.
+Cases UR-001 through UR-037 covering success, invariants, active lock release, generic seal, input validation bounds, error preservation, replay safety, exact metadata shape, durable history provenance proof, durability, store parity, and corruption handling.
 
 ### Decision N: P2 real reconciliation protocol
-A future dedicated work order will execute `reconcileUncertainDispatch` against P2 dispatch `D-4af7357f-d332-4e50-b64e-b716961f3424` using forensic authority `WP-V4-09C-P2-R1`. U1/U1-R1/U1-R2 performs zero mutation.
+A future dedicated work order will execute `reconcileUncertainDispatch` against P2 dispatch `D-4af7357f-d332-4e50-b64e-b716961f3424` using forensic authority `WP-V4-09C-P2-R1`. U1/U1-R1/U1-R2/U1-R3 performs zero mutation.
 
 ### Decision O: P3 gating
 P3 is strictly gated behind U1 design approval, reconciliation implementation, real P2 reconciliation, and separate proof of Antigravity transport readiness (`AGENT_EXITED` root cause resolution). Gate 1 is pending external review.
