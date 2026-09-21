@@ -2483,6 +2483,38 @@ async function runAllTests() {
     assert.strictEqual(res.definitive, false);
     assert.strictEqual(spawnCalls, 1);
     assert.ok(res.error.includes('not observed within acknowledgement deadline'));
+
+    // Sub-assertion (WO-V4-09C-D2-R1): postScanNow >= deadline must fail non-definitively even if boundary observed
+    {
+      const clock = createMockClock(1000);
+      const env = formatDispatchEnvelope({
+        project_id: 'ai-multi-task',
+        work_order_id: 'WO-001',
+        dispatch_id: 'D-TEST-1',
+        expected_workspace_state_id: 'sha256:ws-12345',
+        directive: 'Directive.'
+      });
+      const transcript = [{ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }];
+      const cs = createMockCompletionSource(transcript);
+      const origScan = cs.scanResolvedSession;
+      cs.scanResolvedSession = async (res, visitor, opts) => {
+        await origScan(res, visitor, opts);
+        clock.advance(1000); // Advances clock to 2000, exactly reaching deadline (1000 + 1000 = 2000)
+      };
+
+      const lateAdapter = createAntigravityWorkerPort({
+        clock,
+        dispatchAckTimeoutMs: 1000,
+        spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
+        completionSource: cs
+      });
+
+      const resLate = await lateAdapter.dispatch(createDispatchArgs());
+      assert.strictEqual(resLate.ok, false);
+      assert.strictEqual(resLate.definitive, false);
+      assert.ok(resLate.error.includes('not observed within acknowledgement deadline'));
+    }
+
     console.log('✓ ACK-002 PASSED: missing boundary through deadline yields non-definitive failure with no resend.');
   }
 
@@ -2873,6 +2905,56 @@ async function runAllTests() {
     assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
     assert.strictEqual(res.dispatch_id, 'D-ACK-12');
     assert.ok(res.error.includes('could not be found'));
+
+    // Sub-assertion (WO-V4-09C-D2-R1): earlier observation of boundary must NOT mask absence in final/current snapshot
+    {
+      const clock = createMockClock();
+      const env = formatDispatchEnvelope({
+        project_id: 'ai-multi-task',
+        work_order_id: 'WO-001',
+        dispatch_id: 'D-ACK-12-MASK',
+        expected_workspace_state_id: 'sha256:ws',
+        directive: 'Work.'
+      });
+      let pollCount = 0;
+      const cs = {
+        resolveSessionTranscript: () => ({
+          sessionId: 'test-sess',
+          transcriptPath: '/fake/transcript.jsonl',
+          agentSessionId: 'test-agent'
+        }),
+        scanResolvedSession: async (res, visitor, opts) => {
+          pollCount++;
+          if (pollCount === 1) {
+            // Poll 1: boundary is present
+            await visitor({ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }, 0);
+          } else {
+            // Poll 2 and subsequent (final snapshot at deadline): boundary absent!
+          }
+        }
+      };
+
+      const adapter = createAntigravityWorkerPort({
+        clock,
+        sleep: async (ms) => clock.advance(ms),
+        completionSource: cs
+      });
+
+      const res = await adapter.wait({
+        project: createBaseProject(),
+        project_id: 'ai-multi-task',
+        dispatch_id: 'D-ACK-12-MASK',
+        work_order_id: 'WO-001',
+        timeout_secs: 1
+      });
+
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+      assert.strictEqual(res.dispatch_id, 'D-ACK-12-MASK');
+      assert.notStrictEqual(res.state, DISPATCH_STATES.RUNNING);
+      assert.ok(res.error.includes('could not be found'));
+    }
+
     console.log('✓ ACK-012 PASSED: wait() missing previously proven boundary returns PROVENANCE_AMBIGUOUS.');
   }
 

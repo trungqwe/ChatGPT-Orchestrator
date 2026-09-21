@@ -367,7 +367,7 @@ function createAntigravityWorkerPort(options = {}) {
 
       if (exactCount === 1) {
         const postScanNow = clock.monotonic();
-        if (postScanNow > deadline) {
+        if (postScanNow >= deadline) {
           return {
             ok: false,
             definitive: false,
@@ -431,7 +431,6 @@ function createAntigravityWorkerPort(options = {}) {
     const deadline = startTime + (timeoutSecs * 1000);
 
     let initialTranscriptPath = null;
-    let everObservedBoundary = false;
 
     while (true) {
       // WAAUTH-07: Resolve exact session mapping at the start of EVERY polling iteration
@@ -485,7 +484,6 @@ function createAntigravityWorkerPort(options = {}) {
               return { stop: true };
             }
             boundaryIndex = index;
-            everObservedBoundary = true;
             return;
           }
 
@@ -604,9 +602,9 @@ function createAntigravityWorkerPort(options = {}) {
         };
 
         if (typeof completionSource.scanResolvedSession === 'function') {
-          await completionSource.scanResolvedSession(resolution, visitor, { deadline, clock });
+          await completionSource.scanResolvedSession(resolution, visitor, { clock });
         } else {
-          await completionSource.scanSession(sessionId, project, visitor, { deadline, clock });
+          await completionSource.scanSession(sessionId, project, visitor, { clock });
         }
       } catch (err) {
         if (err.code === COMPLETION_SOURCE_ERROR_CODES.COMPLETION_SOURCE_INTEGRITY_FAILURE) {
@@ -659,8 +657,8 @@ function createAntigravityWorkerPort(options = {}) {
       // No terminal completion yet
       const now = clock.monotonic();
       if (now >= deadline) {
-        // WA-008 is retired: absence of boundary at wait deadline fails closed (WO-V4-09C-D1 / D2)
-        if (boundaryIndex === -1 && !everObservedBoundary) {
+        // WA-008 is retired: absence of boundary at wait deadline fails closed (WO-V4-09C-D1 / D2 / D2-R1)
+        if (boundaryIndex === -1) {
           return {
             ok: false,
             code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
