@@ -621,8 +621,35 @@ rl.on('line', (line) => {
           }
         });
 
-        if (scenario === 'turn_with_token_usage' || scenario === 'repeated_token_usage' || scenario === 'token_usage_thread_mismatch' || scenario === 'malformed_token_usage') {
-          if (scenario === 'malformed_token_usage') {
+        if (scenario === 'turn_with_token_usage' || scenario === 'repeated_token_usage' || scenario === 'token_usage_thread_mismatch' || scenario === 'malformed_token_usage' || scenario === 'token_usage_missing_mcw') {
+          if (scenario === 'token_usage_missing_mcw') {
+            writeLine({
+              method: 'thread/tokenUsage/updated',
+              params: {
+                threadId: params.threadId || 'thr_fake_001',
+                turnId: turnId,
+                tokenUsage: {
+                  total: {
+                    totalTokens: 15650,
+                    inputTokens: 12000,
+                    cachedInputTokens: 8000,
+                    cacheWriteInputTokens: 0,
+                    outputTokens: 3650,
+                    reasoningOutputTokens: 1500
+                  },
+                  last: {
+                    totalTokens: 4632,
+                    inputTokens: 3200,
+                    cachedInputTokens: 2000,
+                    cacheWriteInputTokens: 0,
+                    outputTokens: 1432,
+                    reasoningOutputTokens: 500
+                  }
+                  // modelContextWindow intentionally omitted
+                }
+              }
+            });
+          } else if (scenario === 'malformed_token_usage') {
             writeLine({
               method: 'thread/tokenUsage/updated',
               params: {

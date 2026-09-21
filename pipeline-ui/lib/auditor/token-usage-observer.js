@@ -32,9 +32,6 @@ function deepDetach(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
 
-/**
- * Validate identifier string.
- */
 function validateId(id, fieldName) {
   if (typeof id !== 'string' || id.trim().length === 0) {
     throw createError(
@@ -42,10 +39,16 @@ function validateId(id, fieldName) {
       `Field '${fieldName}' must be a non-empty string`
     );
   }
-  if (id.length > MAX_ID_BYTES || CONTROL_CHAR_REGEX.test(id)) {
+  if (id.trim() !== id) {
     throw createError(
       'TOKEN_USAGE_INVALID_NOTIFICATION',
-      `Field '${fieldName}' exceeds maximum length of ${MAX_ID_BYTES} bytes or contains control characters`
+      `Field '${fieldName}' must not contain surrounding whitespace`
+    );
+  }
+  if (Buffer.byteLength(id, 'utf8') > MAX_ID_BYTES || CONTROL_CHAR_REGEX.test(id)) {
+    throw createError(
+      'TOKEN_USAGE_INVALID_NOTIFICATION',
+      `Field '${fieldName}' exceeds maximum length of ${MAX_ID_BYTES} UTF-8 bytes or contains control characters`
     );
   }
 }
@@ -121,8 +124,22 @@ function validateTokenUsageNotification(notif) {
   validateBreakdown(tokenUsage.total, 'total');
   validateBreakdown(tokenUsage.last, 'last');
 
+  if (!Object.prototype.hasOwnProperty.call(tokenUsage, 'modelContextWindow')) {
+    throw createError(
+      'TOKEN_USAGE_INVALID_NOTIFICATION',
+      "Missing required property 'modelContextWindow' on tokenUsage object"
+    );
+  }
+
   const mcw = tokenUsage.modelContextWindow;
-  if (mcw !== null && mcw !== undefined) {
+  if (mcw === undefined) {
+    throw createError(
+      'TOKEN_USAGE_INVALID_NOTIFICATION',
+      "'modelContextWindow' cannot be undefined"
+    );
+  }
+
+  if (mcw !== null) {
     if (typeof mcw !== 'number' || !Number.isSafeInteger(mcw) || mcw < 0) {
       throw createError(
         'TOKEN_USAGE_INVALID_COUNTER',
@@ -150,7 +167,7 @@ function validateTokenUsageNotification(notif) {
       outputTokens: tokenUsage.last.outputTokens,
       reasoningOutputTokens: tokenUsage.last.reasoningOutputTokens
     },
-    modelContextWindow: (mcw !== undefined && mcw !== null) ? mcw : null
+    modelContextWindow: mcw
   };
 }
 

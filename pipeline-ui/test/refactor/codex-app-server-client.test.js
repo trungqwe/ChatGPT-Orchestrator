@@ -2284,8 +2284,46 @@ async function runTests() {
     }
   }
 
+  // CAS-105: missing field does not poison adapter or interrupt audit
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=token_usage_missing_mcw'] });
+    try {
+      await adapter.initialize();
+      let errorEmitted = null;
+      adapter.on('token_usage_error', (err) => {
+        errorEmitted = err;
+      });
+
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      // Turn completes normally
+      const comp = await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+      assert.strictEqual(comp.status, 'completed');
+
+      // token_usage_error emitted with TOKEN_USAGE_INVALID_NOTIFICATION
+      assert.notStrictEqual(errorEmitted, null, 'token_usage_error event must be emitted');
+      assert.strictEqual(errorEmitted.code, 'TOKEN_USAGE_INVALID_NOTIFICATION');
+
+      // Getters return null (observability state clean)
+      assert.strictEqual(adapter.getLatestTokenUsageForThread(th.threadId), null);
+      assert.strictEqual(adapter.getLatestTokenUsageForTurn({ threadId: th.threadId, turnId: tu.turnId }), null);
+
+      // Transport remains usable for subsequent operations
+      const readResult = await adapter.readThread({ threadId: th.threadId });
+      assert.strictEqual(readResult.thread.id, th.threadId);
+      console.log('PASS: CAS-105 — missing field does not poison adapter');
+    } finally {
+      await adapter.close();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-104: 104/104 PASS)');
+  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-105: 105/105 PASS)');
   console.log('======================================================================');
 }
 

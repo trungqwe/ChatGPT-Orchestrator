@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Token Usage Observer Test Suite (TUO-001 .. TUO-023)
+ * Token Usage Observer Test Suite (TUO-001 .. TUO-027)
  * Validates pure bounded token-usage observation, exact counter preservation,
  * detachment immutability, bounded eviction, and rejection of malformed payloads.
  */
@@ -41,7 +41,7 @@ function createSampleNotification(overrides = {}) {
   return JSON.parse(JSON.stringify(Object.assign(base, overrides)));
 }
 
-console.log('Starting Token Usage Observer test suite (TUO-001 .. TUO-023)...');
+console.log('Starting Token Usage Observer test suite (TUO-001 .. TUO-027)...');
 
 // TUO-001: valid notification accepted
 {
@@ -453,6 +453,113 @@ console.log('Starting Token Usage Observer test suite (TUO-001 .. TUO-023)...');
   console.log('PASS: TUO-023 — invalid modelContextWindow rejected');
 }
 
+// TUO-024: missing modelContextWindow rejected fail-closed
+{
+  const observer = createTokenUsageObserver();
+  const notif = createSampleNotification();
+  delete notif.tokenUsage.modelContextWindow;
+  let caught = null;
+  try {
+    observer.record(notif);
+  } catch (err) {
+    caught = err;
+  }
+  assert.notStrictEqual(caught, null, 'missing modelContextWindow must throw');
+  assert.strictEqual(caught.code, 'TOKEN_USAGE_INVALID_NOTIFICATION');
+  assert.strictEqual(observer.getLatestForThread('thr_test_001'), null);
+  assert.strictEqual(observer.getLatestForTurn({ threadId: 'thr_test_001', turnId: 'turn_test_001' }), null);
+  console.log('PASS: TUO-024 — missing modelContextWindow rejected');
+}
+
+// TUO-025: explicit undefined modelContextWindow rejected
+{
+  const observer = createTokenUsageObserver();
+  const notif = createSampleNotification();
+  notif.tokenUsage.modelContextWindow = undefined;
+  let caught = null;
+  try {
+    observer.record(notif);
+  } catch (err) {
+    caught = err;
+  }
+  assert.notStrictEqual(caught, null, 'undefined modelContextWindow must throw');
+  assert.strictEqual(caught.code, 'TOKEN_USAGE_INVALID_NOTIFICATION');
+  assert.strictEqual(observer.getLatestForThread('thr_test_001'), null);
+  assert.strictEqual(observer.getLatestForTurn({ threadId: 'thr_test_001', turnId: 'turn_test_001' }), null);
+  console.log('PASS: TUO-025 — explicit undefined modelContextWindow rejected');
+}
+
+// TUO-026: UTF-8 ID byte bound enforced
+{
+  const observer = createTokenUsageObserver();
+  // 100 euro symbols = 100 chars, but 300 UTF-8 bytes (> 256 bytes bound)
+  const overByteId = '€'.repeat(100);
+  assert.strictEqual(overByteId.length <= 256, true);
+  assert.strictEqual(Buffer.byteLength(overByteId, 'utf8') > 256, true);
+
+  // Test threadId over byte bound
+  let caughtThread = null;
+  try {
+    observer.record(createSampleNotification({ threadId: overByteId }));
+  } catch (err) {
+    caughtThread = err;
+  }
+  assert.notStrictEqual(caughtThread, null);
+  assert.strictEqual(caughtThread.code, 'TOKEN_USAGE_INVALID_NOTIFICATION');
+
+  // Test turnId over byte bound
+  let caughtTurn = null;
+  try {
+    observer.record(createSampleNotification({ turnId: overByteId }));
+  } catch (err) {
+    caughtTurn = err;
+  }
+  assert.notStrictEqual(caughtTurn, null);
+  assert.strictEqual(caughtTurn.code, 'TOKEN_USAGE_INVALID_NOTIFICATION');
+
+  // Test valid UTF-8 ID within byte bound (50 euro symbols = 150 bytes <= 256)
+  const validByteId = '€'.repeat(50);
+  assert.strictEqual(Buffer.byteLength(validByteId, 'utf8') <= 256, true);
+  const validSnapshot = observer.record(createSampleNotification({
+    threadId: validByteId,
+    turnId: validByteId
+  }));
+  assert.strictEqual(validSnapshot.threadId, validByteId);
+  assert.strictEqual(validSnapshot.turnId, validByteId);
+  console.log('PASS: TUO-026 — UTF-8 ID byte bound enforced');
+}
+
+// TUO-027: surrounding whitespace in threadId or turnId rejected
+{
+  const observer = createTokenUsageObserver();
+  const whitespaceIds = [
+    ' thread-id',
+    'thread-id ',
+    '\tthread-id',
+    'turn-id\n'
+  ];
+  for (const wsId of whitespaceIds) {
+    let caughtThread = null;
+    try {
+      observer.record(createSampleNotification({ threadId: wsId }));
+    } catch (err) {
+      caughtThread = err;
+    }
+    assert.notStrictEqual(caughtThread, null, `threadId with whitespace '${JSON.stringify(wsId)}' must throw`);
+    assert.strictEqual(caughtThread.code, 'TOKEN_USAGE_INVALID_NOTIFICATION');
+
+    let caughtTurn = null;
+    try {
+      observer.record(createSampleNotification({ turnId: wsId }));
+    } catch (err) {
+      caughtTurn = err;
+    }
+    assert.notStrictEqual(caughtTurn, null, `turnId with whitespace '${JSON.stringify(wsId)}' must throw`);
+    assert.strictEqual(caughtTurn.code, 'TOKEN_USAGE_INVALID_NOTIFICATION');
+  }
+  console.log('PASS: TUO-027 — surrounding whitespace in IDs rejected');
+}
+
 console.log('======================================================================');
-console.log('ALL TOKEN USAGE OBSERVER TESTS PASSED (TUO-001 .. TUO-023: 23/23 PASS)');
+console.log('ALL TOKEN USAGE OBSERVER TESTS PASSED (TUO-001 .. TUO-027: 27/27 PASS)');
 console.log('======================================================================');

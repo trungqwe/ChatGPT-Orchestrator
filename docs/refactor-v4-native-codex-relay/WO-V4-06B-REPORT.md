@@ -1,17 +1,25 @@
-# WO-V4-06B COMPLETION REPORT
+# WO-V4-06B-R1 COMPLETION REPORT
 
 ## 1. Executive Summary
 
-- **Work Order**: WO-V4-06B (Provider Token-Usage Observability & Exact Turn Correlation)
+- **Work Order**: WO-V4-06B-R1-R3 (Fresh Worktree / Terminal-Proof Procedural Replay)
 - **Repository**: `https://github.com/trungqwe/ChatGPT-Orchestrator`
-- **Authoritative Parent**: `324a754685d6dfc1c4fc7759854a87ec84ff7586`
-- **Branch**: `impl/v4-wp06b-token-usage-observability`
+- **Authoritative Parent**: `2ad4a4b57bb004c973842983192e7cd264727d72`
+- **Reviewed R1 Commit**: `5b8c2a64574892c6304ff087825735a65010b7c0`
+- **Branch**: `fix/v4-wp06b-r1-strict-usage-validation-r3`
 - **Status**:
   - `WP-V4-06A`: `APPROVED_CLOSED`
-  - `WP-V4-06B`: `COMPLETE`
-  - `WP-V4-06`: `COMPLETE`
+  - `WP-V4-06B`: `BLOCKED_PENDING_R1_R3_EXTERNAL_REVIEW`
+  - `WP-V4-06`: `IN_PROGRESS`
   - `WP-V4-07`: `NOT_STARTED`
   - `WP-V4-12`: `PENDING` (Budget enforcement)
+
+### Procedural Replay Evidence
+A fresh Git worktree was created directly from `2ad4a4b57bb004c973842983192e7cd264727d72`.
+
+The pre-patch 15-suite regression printed terminal sentinel `{"completed":true,"status":0,"phase":"pre_patch"}` before reviewed R1 was applied.
+
+Production/test content remains identical to reviewed R1 `5b8c2a64574892c6304ff087825735a65010b7c0`.
 
 ---
 
@@ -19,15 +27,21 @@
 
 The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via `codex app-server generate-json-schema` and verified against the runtime protocol definition:
 - Method: `thread/tokenUsage/updated`
-- Required properties:
-  - `threadId`: string
-  - `turnId`: string
-  - `tokenUsage`:
-    - `total`: `{ totalTokens, inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens, reasoningOutputTokens }`
-    - `last`: `{ totalTokens, inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens, reasoningOutputTokens }`
-    - `modelContextWindow`: non-negative safe integer or `null`
+
+### 2.1. Provider Schema Authority
+- `threadId`: string
+- `turnId`: string
+- `tokenUsage`:
+  - `total`: `{ totalTokens, inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens, reasoningOutputTokens }`
+  - `last`: `{ totalTokens, inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens, reasoningOutputTokens }`
+  - `modelContextWindow`: required-but-nullable own-property (`missing != null`). Accepted values: `null` or non-negative safe integer.
+
+### 2.2. Local Orchestrator Validation Policy
+Enforced at the local consumer boundary (not attributed to the provider JSON schema):
+- IDs (`threadId`, `turnId`): non-empty string, <= 256 UTF-8 bytes (`Buffer.byteLength(id, 'utf8') <= 256`), no surrounding whitespace (`id.trim() === id`), no control characters.
 
 ---
+
 
 ## 3. Implementation Details
 
@@ -38,11 +52,17 @@ The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via 
   - `maxThreads = 1024`
   - `maxTurns = 4096`
 - **Validation**:
-  - Bounded non-empty strings for `threadId` and `turnId` (<= 256 bytes, no control characters).
+  - Bounded non-empty strings for `threadId` and `turnId`:
+    - Byte length enforced via UTF-8 bytes (`Buffer.byteLength(id, 'utf8') <= 256`).
+    - Surrounding whitespace strictly rejected fail-closed without trimming (`id.trim() === id`).
+    - No control characters.
   - All 6 token counters required in both `total` and `last`: `totalTokens`, `inputTokens`, `cachedInputTokens`, `cacheWriteInputTokens`, `outputTokens`, `reasoningOutputTokens`.
   - All counters must be non-negative safe integers (`Number.isSafeInteger(v) && v >= 0`).
-  - `modelContextWindow` must be `null` or non-negative safe integer.
-  - Rejects: missing objects, arrays where objects expected, NaN, Infinity, negative values, fractions, unsafe integers, missing counters, invalid IDs.
+  - `modelContextWindow` is **required-but-nullable** (`Object.prototype.hasOwnProperty.call(tokenUsage, 'modelContextWindow')`):
+    - Missing property (`delete tokenUsage.modelContextWindow`) or `undefined` throws `TOKEN_USAGE_INVALID_NOTIFICATION`. Missing is NOT fabricated as `null`.
+    - Explicit `null` is preserved as `null`.
+    - If not `null`, must be a non-negative safe integer (`Number.isSafeInteger(v) && v >= 0`), else throws `TOKEN_USAGE_INVALID_COUNTER`.
+  - Rejects: missing objects, arrays where objects expected, NaN, Infinity, negative values, fractions, unsafe integers, missing counters, invalid IDs, surrounding whitespace, IDs exceeding 256 UTF-8 bytes.
   - Stable errors: `TOKEN_USAGE_INVALID_NOTIFICATION`, `TOKEN_USAGE_INVALID_COUNTER`, `TOKEN_USAGE_THREAD_MISMATCH`.
 - **Storage & Eviction**:
   - Bounded map `_threads` (`threadId -> snapshot`, max 1024).
@@ -55,7 +75,7 @@ The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via 
   - Zero local tokenization, zero estimation, zero summation.
 
 ### 3.2. Adapter Integration & Exact Turn Correlation (`codex-auditor-adapter.js`)
-- **Location**: `pipeline-ui/lib/auditor/codex-auditor-adapter.js`
+- **Location**: `pipeline-ui/lib/auditor/codex-auditor-adapter.js` (unmodified in R1, proven correct in WP-V4-06B review)
 - Listens to transport client notification: `thread/tokenUsage/updated`.
 - **Exact Turn Correlation & Early Race Resolution**:
   - Bounded `_pendingTokenUsage` map (max 4096) buffers valid notifications arriving before local ownership is known.
@@ -74,7 +94,7 @@ The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via 
 - **Lifecycle Safety**:
   - Observability state is completely detached from audit decision and lifecycle logic.
   - Malformed usage notifications are rejected from observability state without poisoning audit authority.
-  - No lifecycle source modification required.
+  - Zero lifecycle source modification.
 
 ### 3.3. Test Fixture (`fake-codex-app-server.js`)
 - Added protocol-realistic emission of `thread/tokenUsage/updated`:
@@ -83,6 +103,7 @@ The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via 
   - `token_usage_thread_mismatch`: mismatched threadId.
   - `malformed_token_usage`: malformed counter payload.
   - `early_token_usage`: notification emitted before `turn/start` response is written (race test).
+  - `token_usage_missing_mcw`: valid counters with `modelContextWindow` intentionally omitted (CAS-105).
 
 ---
 
@@ -90,9 +111,13 @@ The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via 
 
 ### 4.1. Unit Test Suites
 - **TUO Suite** (`test/refactor/token-usage-observer.test.js`):
-  - **23/23 PASS** (`TUO-001` .. `TUO-023`)
+  - **27/27 PASS** (`TUO-001` .. `TUO-027`)
+  - TUO-024: missing `modelContextWindow` rejected fail-closed, state remains empty
+  - TUO-025: explicit `undefined` `modelContextWindow` rejected
+  - TUO-026: UTF-8 ID byte bound enforced (> 256 bytes rejected, <= 256 bytes accepted)
+  - TUO-027: surrounding whitespace in `threadId` / `turnId` rejected without trimming
 - **CAS Suite** (`test/refactor/codex-app-server-client.test.js`):
-  - **104/104 PASS** (`CAS-001` .. `CAS-104`)
+  - **105/105 PASS** (`CAS-001` .. `CAS-105`)
   - CAS-097: valid usage notification captured
   - CAS-098: exact thread lookup
   - CAS-099: exact turn lookup
@@ -101,11 +126,12 @@ The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via 
   - CAS-102: thread ownership mismatch rejected
   - CAS-103: valid early notification before local ownership reconciles correctly
   - CAS-104: getter result mutation does not alter cached state
+  - CAS-105: missing `modelContextWindow` does not poison adapter, turn completes normally, transport remains usable
 
 ### 4.2. Full Deterministic Regression (`npm test`)
 - 15 deterministic test suites pass (`exit 0`):
-  - `TUO`: 23
-  - `CAS`: 104
+  - `TUO`: 27
+  - `CAS`: 105
   - `MPR`: 21
   - `ATL`: 133
   - `AD`: 122
@@ -129,6 +155,12 @@ The installed runtime App Server binary (`codex-cli 0.154.0`) was inspected via 
 
 ## 5. Source Audit Proof
 
+- **Required modelContextWindow presence**: Enforced via `Object.prototype.hasOwnProperty.call(tokenUsage, 'modelContextWindow')`.
+- **Missing modelContextWindow**: Throws `TOKEN_USAGE_INVALID_NOTIFICATION`, not fabricated as `null`.
+- **Undefined modelContextWindow**: Throws `TOKEN_USAGE_INVALID_NOTIFICATION`.
+- **Explicit null preserved**: Validated and stored as `null`.
+- **UTF-8 byte bound enforced**: Checked via `Buffer.byteLength(id, 'utf8') <= 256`.
+- **Surrounding whitespace rejected**: Checked via `id.trim() === id`.
 - **No local tokenizer**: Confirmed zero local tokenizer libraries or token count estimators.
 - **No token estimation**: All usage values come strictly from authoritative provider notifications.
 - **No repeated-snapshot summation**: Snapshots replace previous values; never added or accumulated.

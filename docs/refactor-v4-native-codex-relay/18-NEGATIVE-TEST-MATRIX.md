@@ -179,14 +179,14 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 137. **ATL-GATEB-03** (Post-Resolution Registry Read Failure at Gate B): `getProject` tại Gate B ném lỗi bị từ chối trước `startTurn`, không ghi `FIRST_TURN_STARTING` hay `AUDIT_UNCERTAIN`, giữ `PROVISIONAL_THREAD`, đóng client 1 (ATL-132).
 138. **ATL-ORDER-02** (Exact End-to-End Success Order): Chứng minh thứ tự thực thi chuẩn: Gate A < `listModels` < Model Resolution < Gate B < `FIRST_TURN_STARTING` < `startTurn`, bảo đảm chuyển thành công sang `DURABLE_BOUND` với exact pinned model và effort (ATL-133).
 
-## Token Usage Observability & Turn Correlation Negative Matrix (WP-V4-06B: TUO-001..TUO-023, CAS-097..CAS-104)
+## Token Usage Observability & Turn Correlation Negative Matrix (WP-V4-06B & R1: TUO-001..TUO-027, CAS-097..CAS-105)
 
 139. **TUO-CNT-01** (Negative Counter Rejection): Bất kỳ counter nào trong `total` hoặc `last` có giá trị âm bị từ chối với `TOKEN_USAGE_INVALID_COUNTER` (TUO-006).
 140. **TUO-CNT-02** (Fractional / Non-Integer Counter Rejection): Counter dạng float / số thập phân bị từ chối với `TOKEN_USAGE_INVALID_COUNTER` (TUO-007).
 141. **TUO-CNT-03** (Unsafe Integer Counter Rejection): Counter vượt quá `Number.MAX_SAFE_INTEGER` bị từ chối fail-closed với `TOKEN_USAGE_INVALID_COUNTER` (TUO-008).
 142. **TUO-NOTIF-01** (Missing Breakdown or Counter Rejection): Thiếu breakdown `total` hoặc `last`, hoặc thiếu bất kỳ counter nào trong 6 counter chuẩn bị từ chối với `TOKEN_USAGE_INVALID_NOTIFICATION` (TUO-009, TUO-010).
-143. **TUO-ID-01** (Invalid ThreadId / TurnId Rejection): `threadId` hoặc `turnId` rỗng, whitespace, vượt quá 256 bytes, hoặc chứa control characters bị từ chối với `TOKEN_USAGE_INVALID_NOTIFICATION` (TUO-011, TUO-012).
-144. **TUO-MCW-01** (Invalid ModelContextWindow Rejection): `modelContextWindow` không phải `null` hoặc không phải số nguyên không âm an toàn bị từ chối với `TOKEN_USAGE_INVALID_COUNTER` (TUO-023).
+143. **TUO-ID-01** (Invalid ThreadId / TurnId Rejection & UTF-8 Byte Bound & Whitespace): `threadId` hoặc `turnId` không phải string, rỗng, chứa surrounding whitespace (`id.trim() !== id`), vượt quá 256 UTF-8 bytes (`Buffer.byteLength(id, 'utf8') > 256`), hoặc chứa control characters bị từ chối fail-closed với `TOKEN_USAGE_INVALID_NOTIFICATION` mà không tự động trim (TUO-011, TUO-012, TUO-026, TUO-027).
+144. **TUO-MCW-01** (Required-But-Nullable ModelContextWindow Rejection): `modelContextWindow` bắt buộc phải là own-property hiện diện; thiếu hoặc mang giá trị `undefined` ném `TOKEN_USAGE_INVALID_NOTIFICATION` (`missing != null`). Nếu có mặt, giá trị không phải `null` hoặc không phải số nguyên không âm an toàn bị từ chối với `TOKEN_USAGE_INVALID_COUNTER` (TUO-023, TUO-024, TUO-025).
 145. **TUO-IMMUT-01** (Input / Output Immutability & Detachment): Mutate object đầu vào sau `record()` hoặc mutate kết quả getter không làm biến dạng dữ liệu lưu trữ nội bộ của observer (TUO-013, TUO-014, CAS-104).
 146. **TUO-NOACCUM-01** (Snapshot Replacement Without Summation): Các notification lặp lại cho cùng một thread/turn thay thế snapshot cũ chứ tuyệt đối không cộng dồn (TUO-015, TUO-016, TUO-017, CAS-100).
 147. **TUO-BOUND-01** (Bounded Storage Eviction): Vượt quá bound `maxThreads` (1024) hoặc `maxTurns` (4096) thực hiện eviction tất định theo thứ tự insertion cũ nhất (TUO-018, TUO-019).
@@ -194,3 +194,4 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 149. **CAS-USAGE-01** (Malformed Usage Non-Poisoning): Notification usage malformed bị loại bỏ khỏi observability state mà không làm chết transport hoặc làm gián đoạn audit turn (CAS-101).
 150. **CAS-USAGE-02** (Thread Ownership Mismatch Rejection): Notification cho `turnId` có `threadId` sai lệch so với local turn ownership bị từ chối với `TOKEN_USAGE_THREAD_MISMATCH` và không ghi đè dữ liệu hợp lệ (CAS-102).
 151. **CAS-USAGE-03** (Early Notification Race Reconciliation): Notification đến trước khi response của `turn/start` thiết lập local ownership được lưu tạm vào pending cache và chỉ trở thành dữ liệu hợp lệ sau khi ownership được xác nhận khớp (CAS-103).
+152. **CAS-USAGE-04** (Missing ModelContextWindow Isolated Non-Poisoning): Notification usage chứa counters hợp lệ nhưng thiếu trường `modelContextWindow` bị từ chối fail-closed với `TOKEN_USAGE_INVALID_NOTIFICATION` và emit sự kiện `token_usage_error`, trong khi turn audit hoàn tất bình thường, getters trả về `null`, và transport vẫn hoàn toàn khả dụng cho các request kế tiếp (CAS-105).
