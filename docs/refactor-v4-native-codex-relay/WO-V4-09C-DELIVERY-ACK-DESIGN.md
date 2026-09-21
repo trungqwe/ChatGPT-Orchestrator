@@ -1,4 +1,4 @@
-﻿# Authoritative Antigravity Delivery Acknowledgement & Provenance Design (WO-V4-09C-D1)
+# Authoritative Antigravity Delivery Acknowledgement & Provenance Design (WO-V4-09C-D1)
 
 ## 1. Incident Authority & Context
 
@@ -47,6 +47,26 @@ An exit status of `0` from `ao.exe send` merely acknowledges that the CLI comman
      }
      ```
 
+4. **Broadened Contradictory Current-Dispatch Identity Rule**:
+   A transcript record is a **contradictory current-dispatch boundary** when:
+   - Physical line 0 is exactly `[ORCHESTRATOR_DISPATCH_V1]`
+   - Physical line 1 parses as a JSON object that claims the current `dispatch_id`
+   - Any of the required current-dispatch control fields contradicts current authority:
+     - `type !== "worker_dispatch"`
+     - `schema_version !== 1`
+     - `project_id !== <exact current project_id>`
+     - `work_order_id !== <exact current work_order_id>`
+     - `expected_workspace_state_id !== <exact current expected_workspace_state_id>`
+
+   When a transcript record claims the current `dispatch_id` but exhibits contradictory control fields:
+   ```text
+   same/current dispatch_id + contradiction
+   → non-definitive delivery/provenance failure
+   → broker durable state = DISPATCH_UNCERTAIN
+   → AO resend = NO
+   ```
+   The adapter **MUST NOT** silently treat such a record as an unrelated foreign boundary.
+
 ---
 
 ## 3. Dispatch Sequence Specification
@@ -59,18 +79,18 @@ The updated production dispatch sequence in `worker-adapter.js` is defined as:
 3. Snapshot canonical transcript path identity
 4. Render exact dispatch envelope
 5. Invoke AO send ONCE
-   â”œâ”€â”€ Non-zero exit code / timeout / spawn exception:
-   â”‚   â””â”€â”€ Return existing non-definitive failure -> broker transitions to DISPATCH_UNCERTAIN
-   â””â”€â”€ Exit status 0:
-       â””â”€â”€ Enter bounded boundary-acknowledgement observation window:
-           â”œâ”€â”€ Monotonic polling against authoritative transcript (pollIntervalMs default: 250ms)
-           â”œâ”€â”€ Re-verify session & transcript mapping stability
-           â”œâ”€â”€ Scan transcript for exact dispatch boundary
-           â”œâ”€â”€ Exact boundary observed:
-           â”‚   â””â”€â”€ Return { ok: true, state: "DISPATCH_ACCEPTED" }
-           â””â”€â”€ Boundary not observed by deadline / error / contradiction:
-               â””â”€â”€ Return { ok: false, definitive: false, error: "<diagnostic>" }
-                   â””â”€â”€ Broker persists DISPATCH_UNCERTAIN
+   ├── Non-zero exit code / timeout / spawn exception:
+   │   └── Return existing non-definitive failure -> broker transitions to DISPATCH_UNCERTAIN
+   └── Exit status 0:
+       └── Enter bounded boundary-acknowledgement observation window:
+           ├── Monotonic polling against authoritative transcript (pollIntervalMs default: 250ms)
+           ├── Re-verify session & transcript mapping stability
+           ├── Scan transcript for exact dispatch boundary
+           ├── Exact boundary observed:
+           │   └── Return { ok: true, state: "DISPATCH_ACCEPTED" }
+           └── Boundary not observed by deadline / error / contradiction:
+               └── Return { ok: false, definitive: false, error: "<diagnostic>" }
+                   └── Broker persists DISPATCH_UNCERTAIN
 ```
 
 ### Invariants
@@ -130,7 +150,7 @@ The updated production dispatch sequence in `worker-adapter.js` is defined as:
 | AO exit 0, transcript resolution unavailable / scan error / corrupt UTF-8 | `{ ok: false, definitive: false, error: "<diagnostic>" }` | Handles non-definitive dispatch failure | `DISPATCH_UNCERTAIN` |
 | AO exit 0, transcript mapping changed during ack | `{ ok: false, definitive: false, error: "Transcript mapping changed during dispatch acknowledgement" }` | Handles non-definitive dispatch failure | `DISPATCH_UNCERTAIN` |
 | AO exit 0, multiple exact boundaries observed | `{ ok: false, definitive: false, error: "Duplicate current dispatch boundary records observed" }` | Handles non-definitive dispatch failure | `DISPATCH_UNCERTAIN` |
-| AO exit 0, contradictory expected workspace state ID on matching dispatch | `{ ok: false, definitive: false, error: "Contradictory expected_workspace_state_id on matching dispatch identity" }` | Handles non-definitive dispatch failure | `DISPATCH_UNCERTAIN` |
+| AO exit 0, a boundary claims current `dispatch_id` but another required dispatch-control identity field (`type`/`schema_version`/`project_id`/`work_order_id`/`expected_workspace_state_id`) contradicts authority | `{ ok: false, definitive: false, error: "Contradictory current-dispatch control identity" }` | Handles non-definitive dispatch failure | `DISPATCH_UNCERTAIN` |
 
 In all failure paths following an AO send attempt, the failure is **non-definitive** because the command was executed and delivery might have succeeded without verifiable evidence. This correctly triggers the broker's established `DISPATCH_UNCERTAIN` lifecycle transition without introducing new lifecycle states.
 
@@ -191,18 +211,18 @@ Under the new delivery acknowledgement contract, `DISPATCH_ACCEPTED` is **only**
 
 The implementation work order must supply deterministic unit and integration test coverage:
 
-- **ACK-01**: AO exit 0 + exact authoritative boundary observed within deadline â†’ `{ ok: true, state: "DISPATCH_ACCEPTED" }`.
-- **ACK-02**: AO exit 0 + boundary absent through deadline â†’ `{ ok: false, definitive: false }`, AO send count = 1, no resend.
-- **ACK-03**: AO exit 0 + transcript scan throws / file unavailable after send â†’ non-definitive failure.
-- **ACK-04**: AO exit 0 + transcript mapping changes after send â†’ non-definitive failure.
-- **ACK-05**: AO exit 0 + duplicate exact current boundary observed â†’ non-definitive failure.
-- **ACK-06**: AO exit 0 + contradictory dispatch identity (mismatched workspace state ID) â†’ non-definitive failure.
+- **ACK-01**: AO exit 0 + exact authoritative boundary observed within deadline → `{ ok: true, state: "DISPATCH_ACCEPTED" }`.
+- **ACK-02**: AO exit 0 + boundary absent through deadline → `{ ok: false, definitive: false }`, AO send count = 1, no resend.
+- **ACK-03**: AO exit 0 + transcript scan throws / file unavailable after send → non-definitive failure.
+- **ACK-04**: AO exit 0 + transcript mapping changes after send → non-definitive failure.
+- **ACK-05**: AO exit 0 + duplicate exact current boundary observed → non-definitive failure.
+- **ACK-06**: AO exit 0 + a transcript boundary claims current `dispatch_id` + one or more of (`type`, `schema_version`, `project_id`, `work_order_id`, `expected_workspace_state_id`) contradicts current authority → `{ ok: false, definitive: false }`, AO sends = 1, no resend.
 - **ACK-07**: Single-send proof: in all post-send failure and uncertainty paths, `spawnSync` is invoked exactly once.
 - **ACK-08**: Acknowledgement timeout bounding (clamped between 1 ms and 30,000 ms, monotonic clock evaluation).
 - **ACK-09**: Exact boundary acknowledgement does NOT emit `READY_FOR_REVIEW`.
-- **ACK-10**: Wait with observed boundary + no completion envelope within timeout â†’ `{ ok: true, state: "RUNNING" }`.
-- **ACK-11**: Wait with observed boundary + valid matching completion envelope â†’ `{ ok: true, state: "READY_FOR_REVIEW" }`.
-- **ACK-12**: Wait with no authoritative boundary present in transcript â†’ returns `PROVENANCE_AMBIGUOUS` (retiring WA-008).
+- **ACK-10**: Wait with observed boundary + no completion envelope within timeout → `{ ok: true, state: "RUNNING" }`.
+- **ACK-11**: Wait with observed boundary + valid matching completion envelope → `{ ok: true, state: "READY_FOR_REVIEW" }`.
+- **ACK-12**: Wait with no authoritative boundary present in transcript → returns `PROVENANCE_AMBIGUOUS` (retiring WA-008).
 
 ### Broker Integration Proof
 - **ACK-INT-01**: Broker `dispatchWorker()` begins `DISPATCHING`. AO process exits 0. No dispatch boundary appears in transcript. Adapter returns non-definitive error. Broker transitions durable lifecycle to `DISPATCH_UNCERTAIN`. Total AO sends = 1, zero retries.
