@@ -1015,20 +1015,59 @@ function createSqliteLifecycleStore(options = {}) {
 
     /**
      * Evaluates idempotent replay inside an active SQLite transaction.
-     * History-first ordering: check history transition before diagnostics shape.
+     * Diagnostics-first ordering (WO-V4-09C-U2-R1):
+     * 1. Validate dispatch.diagnostics is a plain data object.
+     * 2. Validate dispatch.diagnostics.reconciliation exact shape.
+     * 3. Validate dispatch reconciliation values.
+     * 4. Query/find latest history for the exact dispatch.
+     * 5. Validate latest transition path.
+     * 6. Validate history patch exact shape.
+     * 7. Validate history patch values equal dispatch diagnostics.
+     * 8. Return idempotent replay only if every proof passes.
+     *
      * Caller is responsible for ROLLBACK after this function returns.
      * Throws on structural corruption; returns structured result on semantic mismatch or valid replay.
      */
     function _evaluateSqliteReplayInner(authority, row) {
       const dispatchId = authority.dispatch_id;
 
-      // Step 1: Find latest history row (history-first ordering)
+      // Step 1: Check dispatch diagnostics is a plain data object
+      const rawDiag = row.diagnostics;
+      if (rawDiag === null || rawDiag === undefined) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+      const rowDiag = typeof rawDiag === 'string' ? rawDiag : v8.deserialize(rawDiag);
+      if (!isPlainDataObject(rowDiag)) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+
+      // Step 2: Check dispatch.diagnostics.reconciliation exact shape
+      const recon = rowDiag.reconciliation;
+      if (!hasExactEnumerableDataKeys(recon, ['classification', 'evidence_authority', 'reconciled_at'])) {
+        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
+      }
+
+      // Step 3: Check diagnostics values (semantic mismatch -> ILLEGAL_STATE_TRANSITION)
+      if (
+        recon.classification !== 'DELIVERY_UNPROVEN' ||
+        recon.evidence_authority !== authority.evidence_authority ||
+        typeof recon.reconciled_at !== 'string' ||
+        recon.reconciled_at.length === 0
+      ) {
+        return {
+          ok: false,
+          code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
+          error: 'Reconciliation replay mismatch: diagnostics do not match the provided authority'
+        };
+      }
+
+      // Step 4: Find latest history row for dispatch_id
       const histRow = getLatestHistoryByDispatchStmt.get(dispatchId);
       if (!histRow) {
         throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
       }
 
-      // Semantic mismatch: wrong transition path -> ILLEGAL_STATE_TRANSITION
+      // Step 5: Validate latest transition path (semantic mismatch -> ILLEGAL_STATE_TRANSITION)
       if (
         histRow.previous_state !== DISPATCH_STATES.DISPATCH_UNCERTAIN ||
         histRow.next_state !== DISPATCH_STATES.PROVENANCE_AMBIGUOUS
@@ -1040,35 +1079,7 @@ function createSqliteLifecycleStore(options = {}) {
         };
       }
 
-      // Step 2: Check dispatch diagnostics shape
-      const rawDiag = row.diagnostics;
-      if (rawDiag === null || rawDiag === undefined) {
-        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
-      }
-      const rowDiag = typeof rawDiag === 'string' ? rawDiag : v8.deserialize(rawDiag);
-      if (!isPlainDataObject(rowDiag)) {
-        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
-      }
-
-      const recon = rowDiag.reconciliation;
-      if (!hasExactEnumerableDataKeys(recon, ['classification', 'evidence_authority', 'reconciled_at'])) {
-        throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
-      }
-
-      // Step 3: Check diagnostics values (semantic mismatch)
-      if (
-        recon.classification !== 'DELIVERY_UNPROVEN' ||
-        recon.evidence_authority !== authority.evidence_authority ||
-        typeof recon.reconciled_at !== 'string'
-      ) {
-        return {
-          ok: false,
-          code: ERROR_CODES.ILLEGAL_STATE_TRANSITION,
-          error: 'Reconciliation replay mismatch: diagnostics do not match the provided authority'
-        };
-      }
-
-      // Step 4: Check history patch shape (structural corruption)
+      // Step 6: Check history patch shape (structural corruption -> throw)
       if (histRow.patch === null || histRow.patch === undefined) {
         throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
       }
@@ -1081,7 +1092,7 @@ function createSqliteLifecycleStore(options = {}) {
         throw new Error('Persisted authority corruption: dispatch reconciliation metadata shape is invalid');
       }
 
-      // Step 5: Check patch values match diagnostics (semantic mismatch)
+      // Step 7: Check patch values match diagnostics (semantic mismatch -> ILLEGAL_STATE_TRANSITION)
       if (
         patch.diagnostics.reconciliation.classification !== recon.classification ||
         patch.diagnostics.reconciliation.evidence_authority !== recon.evidence_authority ||
@@ -1094,7 +1105,7 @@ function createSqliteLifecycleStore(options = {}) {
         };
       }
 
-      // All checks pass - idempotent replay
+      // Step 8: All checks pass — idempotent replay
       return {
         ok: true,
         reconciled: false,

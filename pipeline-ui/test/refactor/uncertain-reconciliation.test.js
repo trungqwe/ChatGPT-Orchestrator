@@ -303,6 +303,32 @@ runTest('UR-007-MEM', 'Reconciliation against DISPATCH_ACCEPTED/RUNNING/READY_FO
   }
 });
 
+runTest('UR-007-SQL', 'Reconciliation against DISPATCH_ACCEPTED/RUNNING/READY_FOR_REVIEW returns ILLEGAL_STATE_TRANSITION (sqlite)', () => {
+  const nonUncertainStates = [DISPATCH_STATES.DISPATCH_ACCEPTED, DISPATCH_STATES.RUNNING, DISPATCH_STATES.READY_FOR_REVIEW];
+  const transitions = {
+    [DISPATCH_STATES.DISPATCH_ACCEPTED]: [DISPATCH_STATES.DISPATCH_ACCEPTED],
+    [DISPATCH_STATES.RUNNING]: [DISPATCH_STATES.DISPATCH_ACCEPTED, DISPATCH_STATES.RUNNING],
+    [DISPATCH_STATES.READY_FOR_REVIEW]: [DISPATCH_STATES.DISPATCH_ACCEPTED, DISPATCH_STATES.RUNNING, DISPATCH_STATES.READY_FOR_REVIEW]
+  };
+  for (const targetState of nonUncertainStates) {
+    const store = createSqlStore(`ur007-${targetState}`);
+    try {
+      const record = makeRecord({ dispatch_id: `D-ur007-${targetState}` });
+      let r = store.beginDispatch(record.project_id, record);
+      assert(r.ok, `beginDispatch: ${r.error}`);
+      for (const s of transitions[targetState]) {
+        r = store.transition(record.dispatch_id, s);
+        assert(r.ok, `transition to ${s}: ${r.error}`);
+      }
+      const auth = { ...BASE_AUTHORITY, dispatch_id: record.dispatch_id };
+      const result = store.reconcileUncertainDispatch(auth);
+      assertEqual(result.ok, false, `ok for state ${targetState}`);
+      assertEqual(result.code, ERROR_CODES.ILLEGAL_STATE_TRANSITION, `code for state ${targetState}`);
+      assertEqual(store.getDispatch(record.dispatch_id).state, targetState, `state unchanged for ${targetState}`);
+    } finally { store.close(); }
+  }
+});
+
 // ─── UR-008: Unsupported target_state rejected ───────────────────────────────
 
 runTest('UR-008-MEM', 'Unsupported target_state rejected with ILLEGAL_STATE_TRANSITION (memory)', () => {
@@ -316,6 +342,19 @@ runTest('UR-008-MEM', 'Unsupported target_state rejected with ILLEGAL_STATE_TRAN
   assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
 });
 
+runTest('UR-008-SQL', 'Unsupported target_state rejected with ILLEGAL_STATE_TRANSITION (sqlite)', () => {
+  const store = createSqlStore('ur008');
+  try {
+    setupUncertain(store);
+    for (const ts of [DISPATCH_STATES.DISPATCH_FAILED, DISPATCH_STATES.RUNNING, DISPATCH_STATES.DISPATCH_ACCEPTED]) {
+      const result = store.reconcileUncertainDispatch({ ...BASE_AUTHORITY, target_state: ts });
+      assertEqual(result.ok, false, `ok for target_state=${ts}`);
+      assertEqual(result.code, ERROR_CODES.ILLEGAL_STATE_TRANSITION, `code for target_state=${ts}`);
+    }
+    assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
+  } finally { store.close(); }
+});
+
 // ─── UR-009: Unsupported classification rejected ─────────────────────────────
 
 runTest('UR-009-MEM', 'Unsupported classification rejected with INVALID_REQUEST (memory)', () => {
@@ -327,6 +366,19 @@ runTest('UR-009-MEM', 'Unsupported classification rejected with INVALID_REQUEST 
     assertEqual(result.code, ERROR_CODES.INVALID_REQUEST, `code for cls=${cls}`);
   }
   assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
+});
+
+runTest('UR-009-SQL', 'Unsupported classification rejected with INVALID_REQUEST (sqlite)', () => {
+  const store = createSqlStore('ur009');
+  try {
+    setupUncertain(store);
+    for (const cls of ['NOT_DELIVERED', 'AGENT_CRASH', 'TIMEOUT', '']) {
+      const result = store.reconcileUncertainDispatch({ ...BASE_AUTHORITY, classification: cls });
+      assertEqual(result.ok, false, `ok for cls=${cls}`);
+      assertEqual(result.code, ERROR_CODES.INVALID_REQUEST, `code for cls=${cls}`);
+    }
+    assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
+  } finally { store.close(); }
 });
 
 // ─── UR-010: Original transport error preserved ───────────────────────────────
@@ -540,6 +592,19 @@ runTest('UR-018-MEM', 'evidence_authority with newline/CR/control char rejected 
   assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
 });
 
+runTest('UR-018-SQL', 'evidence_authority with newline/CR/control char rejected (sqlite)', () => {
+  const store = createSqlStore('ur018');
+  try {
+    setupUncertain(store);
+    for (const bad of ['WP-R1\ninjected', 'WP-R1\rinjected', 'WP-R1\x01injected']) {
+      const result = store.reconcileUncertainDispatch({ ...BASE_AUTHORITY, evidence_authority: bad });
+      assertEqual(result.ok, false, `ok for [${JSON.stringify(bad)}]`);
+      assertEqual(result.code, ERROR_CODES.INVALID_REQUEST, `code for [${JSON.stringify(bad)}]`);
+    }
+    assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
+  } finally { store.close(); }
+});
+
 // ─── UR-019: Pre-existing diagnostics plain object preserved ──────────────────
 
 runTest('UR-019-MEM', 'Existing unrelated diagnostics keys preserved after reconciliation (memory)', () => {
@@ -636,15 +701,48 @@ runTest('UR-021-SQL', 'Pre-existing reconciliation key in DISPATCH_UNCERTAIN thr
   } finally { store.close(); }
 });
 
-// ─── UR-022: SQL UPDATE affected rows != 1 (defensive, documented) ────────────
+// ─── UR-022: SQL UPDATE affected rows != 1 (real trigger-based changes !== 1) ──
+runTest('UR-022-SQL', 'UPDATE changes !== 1 produces integrity error and clean rollback (sqlite)', () => {
+  const dbPath = makeTempDbPath('ur022');
+  const clock = makeClock();
+  const store1 = createSqliteLifecycleStore({ dbPath, clock });
+  try {
+    setupUncertain(store1, {}, 'error-msg');
+  } finally {
+    store1.close();
+  }
 
-runTest('UR-022-SQL', 'UPDATE changes !== 1 is a defensive invariant (documented; not directly triggerable in unit tests)', () => {
-  // This invariant is enforced in code but cannot be triggered in a single-connection
-  // synchronous unit test (SQLite BEGIN IMMEDIATE prevents concurrent modification
-  // between the re-read and UPDATE within the same connection's transaction).
-  // The code path: if (updateResult.changes !== 1) { ROLLBACK; throw integrity error }
-  // is verified by code review and the parameterized WHERE dispatch_id = ? predicate.
-  assert(true, 'documented-only test passes');
+  // Install BEFORE UPDATE trigger in temporary SQLite DB that ignores UPDATE, causing changes === 0
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TRIGGER test_block_update BEFORE UPDATE OF state, updated_at, diagnostics ON dispatches BEGIN SELECT RAISE(IGNORE); END;');
+  db.close();
+
+  const store2 = createSqliteLifecycleStore({ dbPath, clock });
+  try {
+    const dBefore = store2.getDispatch(BASE_AUTHORITY.dispatch_id);
+    assertEqual(dBefore.state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state before');
+    assertEqual(dBefore.error, 'error-msg', 'error before');
+    const histBefore = store2.getAllHistory().length;
+    assert(store2.getActiveDispatch('chatgpt-orchestrator') !== null, 'active lock held before');
+
+    let threw = false;
+    try {
+      store2.reconcileUncertainDispatch(BASE_AUTHORITY);
+    } catch (err) {
+      threw = true;
+      assert(err.message.includes('Integrity error: reconciliation UPDATE affected 0 rows'), `unexpected: ${err.message}`);
+    }
+    assert(threw, 'expected integrity error throw on changes !== 1');
+
+    const dAfter = store2.getDispatch(BASE_AUTHORITY.dispatch_id);
+    assertEqual(dAfter.state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state remains DISPATCH_UNCERTAIN');
+    assertEqual(dAfter.error, 'error-msg', 'error unchanged');
+    assertEqual(JSON.stringify(dAfter.diagnostics), JSON.stringify(dBefore.diagnostics), 'diagnostics unchanged');
+    assertEqual(store2.getAllHistory().length, histBefore, 'history count unchanged');
+    assert(store2.getActiveDispatch('chatgpt-orchestrator') !== null, 'active lock still held');
+  } finally {
+    store2.close();
+  }
 });
 
 // ─── UR-023: Identical replay immutability ────────────────────────────────────
@@ -694,6 +792,17 @@ runTest('UR-024-MEM', 'Non-DELIVERY_UNPROVEN classification rejected (contradict
   assertEqual(result.ok, false, 'ok');
   assertEqual(result.code, ERROR_CODES.INVALID_REQUEST, 'code');
   assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
+});
+
+runTest('UR-024-SQL', 'Non-DELIVERY_UNPROVEN classification rejected (contradictory boundary case) (sqlite)', () => {
+  const store = createSqlStore('ur024');
+  try {
+    setupUncertain(store);
+    const result = store.reconcileUncertainDispatch({ ...BASE_AUTHORITY, classification: 'NOT_DELIVERED' });
+    assertEqual(result.ok, false, 'ok');
+    assertEqual(result.code, ERROR_CODES.INVALID_REQUEST, 'code');
+    assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
+  } finally { store.close(); }
 });
 
 // ─── UR-025: Date diagnostics ─────────────────────────────────────────────────
@@ -750,6 +859,17 @@ runTest('UR-027-MEM', 'Set / custom-prototype diagnostics throws corruption erro
   try { store.reconcileUncertainDispatch(BASE_AUTHORITY); }
   catch (err) { threw = true; }
   assert(threw, 'expected throw for Set diagnostics');
+});
+
+runTest('UR-027-SQL', 'Set / custom-prototype diagnostics throws corruption error (sqlite)', () => {
+  const store = createSqlStore('ur027');
+  try {
+    setupUncertainWithDiag(store, new Set([1, 2]));
+    let threw = false;
+    try { store.reconcileUncertainDispatch(BASE_AUTHORITY); }
+    catch (err) { threw = true; }
+    assert(threw, 'expected throw for Set diagnostics');
+  } finally { store.close(); }
 });
 
 // ─── UR-028: null-prototype plain diagnostics ─────────────────────────────────
@@ -833,58 +953,166 @@ runTest('UR-030-MEM', 'Authority with accessor property rejected with INVALID_RE
   assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
 });
 
+runTest('UR-030-SQL', 'Authority with accessor property rejected with INVALID_REQUEST (sqlite)', () => {
+  const store = createSqlStore('ur030');
+  try {
+    setupUncertain(store);
+
+    // Accessor property
+    const authWithGetter = Object.defineProperties(
+      { dispatch_id: BASE_AUTHORITY.dispatch_id, project_id: BASE_AUTHORITY.project_id, work_order_id: BASE_AUTHORITY.work_order_id, expected_state: BASE_AUTHORITY.expected_state, target_state: BASE_AUTHORITY.target_state, classification: BASE_AUTHORITY.classification },
+      { evidence_authority: { get: () => 'WP-V4-09C-P2-R1', enumerable: true, configurable: true } }
+    );
+    const r1 = store.reconcileUncertainDispatch(authWithGetter);
+    assertEqual(r1.ok, false, 'accessor ok');
+    assertEqual(r1.code, ERROR_CODES.INVALID_REQUEST, 'accessor code');
+
+    // Non-enumerable property
+    const authNonEnum = Object.create(null);
+    Object.assign(authNonEnum, BASE_AUTHORITY);
+    Object.defineProperty(authNonEnum, 'extra', { value: 1, enumerable: false });
+    const r2 = store.reconcileUncertainDispatch(authNonEnum);
+    assertEqual(r2.ok, false, 'non-enum ok');
+    assertEqual(r2.code, ERROR_CODES.INVALID_REQUEST, 'non-enum code');
+
+    // Symbol key (adds to key count, fails length check)
+    const authSymbol = { ...BASE_AUTHORITY };
+    authSymbol[Symbol('hidden')] = 'value';
+    const r3 = store.reconcileUncertainDispatch(authSymbol);
+    assertEqual(r3.ok, false, 'symbol ok');
+    assertEqual(r3.code, ERROR_CODES.INVALID_REQUEST, 'symbol code');
+
+    assertEqual(store.getDispatch(BASE_AUTHORITY.dispatch_id).state, DISPATCH_STATES.DISPATCH_UNCERTAIN, 'state unchanged');
+  } finally { store.close(); }
+});
+
 // ─── UR-031: Replay mismatch: latest history is DISPATCH_ACCEPTED → PROVENANCE_AMBIGUOUS ─
 
-runTest('UR-031-MEM', 'PROVENANCE_AMBIGUOUS via DISPATCH_ACCEPTED path → ILLEGAL_STATE_TRANSITION on replay (memory)', () => {
-  const store = createMemStore();
+runTest('UR-031-MEM', 'PROVENANCE_AMBIGUOUS via DISPATCH_ACCEPTED path with valid diagnostics metadata → ILLEGAL_STATE_TRANSITION on replay (memory)', () => {
+  const clock = makeClock();
+  const store = createMemoryLifecycleStore({ clock });
   const record = makeRecord();
   store.beginDispatch(record.project_id, record);
   store.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_ACCEPTED);
-  store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS);
-  // Now dispatch is PROVENANCE_AMBIGUOUS but via DISPATCH_ACCEPTED path
+  const validReconDiag = {
+    reconciliation: {
+      classification: 'DELIVERY_UNPROVEN',
+      evidence_authority: BASE_AUTHORITY.evidence_authority,
+      reconciled_at: '2026-09-22T00:00:00.000Z'
+    }
+  };
+  store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, { diagnostics: validReconDiag });
+
+  const histBefore = store.getAllHistory().length;
+  const isoBefore = clock.isoCalls();
+  const nowBefore = clock.nowCalls();
+
   const result = store.reconcileUncertainDispatch(BASE_AUTHORITY);
   assertEqual(result.ok, false, 'ok');
   assertEqual(result.code, ERROR_CODES.ILLEGAL_STATE_TRANSITION, 'code');
+  assertEqual(store.getAllHistory().length, histBefore, 'zero new history');
+  assertEqual(clock.isoCalls(), isoBefore, 'zero clock.iso calls');
+  assertEqual(clock.nowCalls(), nowBefore, 'zero clock.now calls');
+  const d = store.getDispatch(record.dispatch_id);
+  assertEqual(d.state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, 'state unchanged');
+  assertEqual(d.diagnostics.reconciliation.evidence_authority, BASE_AUTHORITY.evidence_authority, 'diagnostics unchanged');
 });
 
-runTest('UR-031-SQL', 'PROVENANCE_AMBIGUOUS via DISPATCH_ACCEPTED path → ILLEGAL_STATE_TRANSITION on replay (sqlite)', () => {
-  const store = createSqlStore('ur031');
+runTest('UR-031-SQL', 'PROVENANCE_AMBIGUOUS via DISPATCH_ACCEPTED path with valid diagnostics metadata → ILLEGAL_STATE_TRANSITION on replay (sqlite)', () => {
+  const clock = makeClock();
+  const store = createSqlStore('ur031', clock);
   try {
     const record = makeRecord();
     store.beginDispatch(record.project_id, record);
     store.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_ACCEPTED);
-    store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS);
+    const validReconDiag = {
+      reconciliation: {
+        classification: 'DELIVERY_UNPROVEN',
+        evidence_authority: BASE_AUTHORITY.evidence_authority,
+        reconciled_at: '2026-09-22T00:00:00.000Z'
+      }
+    };
+    store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, { diagnostics: validReconDiag });
+
+    const histBefore = store.getAllHistory().length;
+    const isoBefore = clock.isoCalls();
+    const nowBefore = clock.nowCalls();
+
     const result = store.reconcileUncertainDispatch(BASE_AUTHORITY);
     assertEqual(result.ok, false, 'ok');
     assertEqual(result.code, ERROR_CODES.ILLEGAL_STATE_TRANSITION, 'code');
+    assertEqual(store.getAllHistory().length, histBefore, 'zero new history');
+    assertEqual(clock.isoCalls(), isoBefore, 'zero clock.iso calls');
+    assertEqual(clock.nowCalls(), nowBefore, 'zero clock.now calls');
+    const d = store.getDispatch(record.dispatch_id);
+    assertEqual(d.state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, 'state unchanged');
+    assertEqual(d.diagnostics.reconciliation.evidence_authority, BASE_AUTHORITY.evidence_authority, 'diagnostics unchanged');
   } finally { store.close(); }
 });
 
 // ─── UR-032: Replay mismatch: latest history is RUNNING → PROVENANCE_AMBIGUOUS ─
 
-runTest('UR-032-MEM', 'PROVENANCE_AMBIGUOUS via RUNNING path → ILLEGAL_STATE_TRANSITION on replay (memory)', () => {
-  const store = createMemStore();
+runTest('UR-032-MEM', 'PROVENANCE_AMBIGUOUS via RUNNING path with valid diagnostics metadata → ILLEGAL_STATE_TRANSITION on replay (memory)', () => {
+  const clock = makeClock();
+  const store = createMemoryLifecycleStore({ clock });
   const record = makeRecord();
   store.beginDispatch(record.project_id, record);
   store.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_ACCEPTED);
   store.transition(record.dispatch_id, DISPATCH_STATES.RUNNING);
-  store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS);
+  const validReconDiag = {
+    reconciliation: {
+      classification: 'DELIVERY_UNPROVEN',
+      evidence_authority: BASE_AUTHORITY.evidence_authority,
+      reconciled_at: '2026-09-22T00:00:00.000Z'
+    }
+  };
+  store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, { diagnostics: validReconDiag });
+
+  const histBefore = store.getAllHistory().length;
+  const isoBefore = clock.isoCalls();
+  const nowBefore = clock.nowCalls();
+
   const result = store.reconcileUncertainDispatch(BASE_AUTHORITY);
   assertEqual(result.ok, false, 'ok');
   assertEqual(result.code, ERROR_CODES.ILLEGAL_STATE_TRANSITION, 'code');
+  assertEqual(store.getAllHistory().length, histBefore, 'zero new history');
+  assertEqual(clock.isoCalls(), isoBefore, 'zero clock.iso calls');
+  assertEqual(clock.nowCalls(), nowBefore, 'zero clock.now calls');
+  const d = store.getDispatch(record.dispatch_id);
+  assertEqual(d.state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, 'state unchanged');
+  assertEqual(d.diagnostics.reconciliation.evidence_authority, BASE_AUTHORITY.evidence_authority, 'diagnostics unchanged');
 });
 
-runTest('UR-032-SQL', 'PROVENANCE_AMBIGUOUS via RUNNING path → ILLEGAL_STATE_TRANSITION on replay (sqlite)', () => {
-  const store = createSqlStore('ur032');
+runTest('UR-032-SQL', 'PROVENANCE_AMBIGUOUS via RUNNING path with valid diagnostics metadata → ILLEGAL_STATE_TRANSITION on replay (sqlite)', () => {
+  const clock = makeClock();
+  const store = createSqlStore('ur032', clock);
   try {
     const record = makeRecord();
     store.beginDispatch(record.project_id, record);
     store.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_ACCEPTED);
     store.transition(record.dispatch_id, DISPATCH_STATES.RUNNING);
-    store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS);
+    const validReconDiag = {
+      reconciliation: {
+        classification: 'DELIVERY_UNPROVEN',
+        evidence_authority: BASE_AUTHORITY.evidence_authority,
+        reconciled_at: '2026-09-22T00:00:00.000Z'
+      }
+    };
+    store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, { diagnostics: validReconDiag });
+
+    const histBefore = store.getAllHistory().length;
+    const isoBefore = clock.isoCalls();
+    const nowBefore = clock.nowCalls();
+
     const result = store.reconcileUncertainDispatch(BASE_AUTHORITY);
     assertEqual(result.ok, false, 'ok');
     assertEqual(result.code, ERROR_CODES.ILLEGAL_STATE_TRANSITION, 'code');
+    assertEqual(store.getAllHistory().length, histBefore, 'zero new history');
+    assertEqual(clock.isoCalls(), isoBefore, 'zero clock.iso calls');
+    assertEqual(clock.nowCalls(), nowBefore, 'zero clock.now calls');
+    const d = store.getDispatch(record.dispatch_id);
+    assertEqual(d.state, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, 'state unchanged');
+    assertEqual(d.diagnostics.reconciliation.evidence_authority, BASE_AUTHORITY.evidence_authority, 'diagnostics unchanged');
   } finally { store.close(); }
 });
 
@@ -1025,6 +1253,84 @@ runTest('UR-036-SQL', 'Replay: diagnostics.reconciliation with extra key → thr
       assert(threw, 'expected corruption throw');
     } finally { store2.close(); }
   }
+});
+
+runTest('UR-036-MEM', 'Replay: diagnostics.reconciliation with extra key → throws corruption (memory)', () => {
+  const store = createMemStore();
+  const record = makeRecord();
+  store.beginDispatch(record.project_id, record);
+  store.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_ACCEPTED);
+  store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, {
+    diagnostics: {
+      reconciliation: {
+        classification: 'DELIVERY_UNPROVEN',
+        evidence_authority: BASE_AUTHORITY.evidence_authority,
+        reconciled_at: '2026-09-22T00:00:00.000Z',
+        extra_key: 'injected'
+      }
+    }
+  });
+  let threw = false;
+  try {
+    store.reconcileUncertainDispatch(BASE_AUTHORITY);
+  } catch (err) {
+    threw = true;
+    assert(err.message.includes('corruption') || err.message.includes('metadata shape is invalid'), `unexpected error: ${err.message}`);
+  }
+  assert(threw, 'expected throw for extra key in reconciliation metadata');
+});
+
+runTest('UR-036-MEM-PRECEDENCE', 'Compound corruption precedence: structurally malformed reconciliation throws before different-path check (memory)', () => {
+  const store = createMemStore();
+  const record = makeRecord();
+  store.beginDispatch(record.project_id, record);
+  store.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_ACCEPTED);
+  // Different path (DISPATCH_ACCEPTED -> PROVENANCE_AMBIGUOUS) AND structurally malformed reconciliation (extra key)
+  const malformedDiag = {
+    reconciliation: {
+      classification: 'DELIVERY_UNPROVEN',
+      evidence_authority: BASE_AUTHORITY.evidence_authority,
+      reconciled_at: '2026-09-22T00:00:00.000Z',
+      extra_key: 'injected'
+    }
+  };
+  store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, { diagnostics: malformedDiag });
+
+  let threw = false;
+  try {
+    store.reconcileUncertainDispatch(BASE_AUTHORITY);
+  } catch (err) {
+    threw = true;
+    assert(err.message.includes('Persisted authority corruption') || err.message.includes('metadata shape is invalid'), `unexpected error: ${err.message}`);
+  }
+  assert(threw, 'expected throw for structurally malformed reconciliation even on different history path');
+});
+
+runTest('UR-036-SQL-PRECEDENCE', 'Compound corruption precedence: structurally malformed reconciliation throws before different-path check (sqlite)', () => {
+  const store = createSqlStore('ur036-prec');
+  try {
+    const record = makeRecord();
+    store.beginDispatch(record.project_id, record);
+    store.transition(record.dispatch_id, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    const malformedDiag = {
+      reconciliation: {
+        classification: 'DELIVERY_UNPROVEN',
+        evidence_authority: BASE_AUTHORITY.evidence_authority,
+        reconciled_at: '2026-09-22T00:00:00.000Z',
+        extra_key: 'injected'
+      }
+    };
+    store.transition(record.dispatch_id, DISPATCH_STATES.PROVENANCE_AMBIGUOUS, { diagnostics: malformedDiag });
+
+    let threw = false;
+    try {
+      store.reconcileUncertainDispatch(BASE_AUTHORITY);
+    } catch (err) {
+      threw = true;
+      assert(err.message.includes('Persisted authority corruption') || err.message.includes('metadata shape is invalid'), `unexpected error: ${err.message}`);
+    }
+    assert(threw, 'expected throw for structurally malformed reconciliation even on different history path');
+  } finally { store.close(); }
 });
 
 // ─── UR-037: Replay proof object violates exact own-data-key semantics ─────────
