@@ -4,6 +4,90 @@ const { spawnSync: defaultSpawnSync } = require('child_process');
 const { DISPATCH_STATES, ERROR_CODES, LIMITS } = require('./contracts');
 const { createAntigravityCompletionSource, COMPLETION_SOURCE_ERROR_CODES } = require('./antigravity-completion-source');
 
+const DEFAULT_DISPATCH_ACK_TIMEOUT_MS = 30000;
+const MIN_DISPATCH_ACK_TIMEOUT_MS = 1;
+const MAX_DISPATCH_ACK_TIMEOUT_MS = 30000;
+
+/**
+ * Classify a transcript record against expected current dispatch identity.
+ *
+ * Rules (WO-V4-09C-D1 / D2):
+ * - Must have BOTH source === 'USER_EXPLICIT' and type === 'USER_INPUT'
+ * - Line 0 must be exactly '[ORCHESTRATOR_DISPATCH_V1]' (no trimStart)
+ * - Line 1 must parse as a JSON object
+ * - If line 1 claims current dispatch_id:
+ *   must match type === 'worker_dispatch', schema_version === 1,
+ *   exact project_id, exact work_order_id, exact expected_workspace_state_id (if specified)
+ *   Any contradiction => isContradiction: true
+ *   All match => isExact: true
+ * - If line 1 claims another dispatch_id => isForeign: true (unrelated history)
+ */
+function classifyDispatchBoundaryRecord(record, expected) {
+  if (!record || typeof record !== 'object') {
+    return { isCandidate: false };
+  }
+  if (record.source !== 'USER_EXPLICIT' || record.type !== 'USER_INPUT') {
+    return { isCandidate: false };
+  }
+  if (typeof record.content !== 'string') {
+    return { isCandidate: false };
+  }
+
+  const rawLines = record.content.split(/\r?\n/);
+  if (rawLines[0] !== '[ORCHESTRATOR_DISPATCH_V1]' || !rawLines[1]) {
+    return { isCandidate: false };
+  }
+
+  let dObj;
+  try {
+    dObj = JSON.parse(rawLines[1]);
+  } catch (_) {
+    return { isCandidate: false };
+  }
+
+  if (!dObj || typeof dObj !== 'object' || Array.isArray(dObj)) {
+    return { isCandidate: false };
+  }
+
+  if (dObj.dispatch_id === expected.dispatch_id) {
+    const contradictions = [];
+    if (dObj.type !== 'worker_dispatch') {
+      contradictions.push(`type '${dObj.type}' !== 'worker_dispatch'`);
+    }
+    if (dObj.schema_version !== 1) {
+      contradictions.push(`schema_version '${dObj.schema_version}' !== 1`);
+    }
+    if (dObj.project_id !== expected.project_id) {
+      contradictions.push(`project_id '${dObj.project_id}' !== '${expected.project_id}'`);
+    }
+    if (dObj.work_order_id !== expected.work_order_id) {
+      contradictions.push(`work_order_id '${dObj.work_order_id}' !== '${expected.work_order_id}'`);
+    }
+    if (expected.expected_workspace_state_id !== undefined && dObj.expected_workspace_state_id !== expected.expected_workspace_state_id) {
+      contradictions.push(`expected_workspace_state_id '${dObj.expected_workspace_state_id}' !== '${expected.expected_workspace_state_id}'`);
+    }
+
+    if (contradictions.length > 0) {
+      return {
+        isCandidate: true,
+        isContradiction: true,
+        error: `Contradictory current-dispatch control identity on dispatch '${expected.dispatch_id}': ${contradictions.join(', ')}`
+      };
+    }
+
+    return {
+      isCandidate: true,
+      isExact: true,
+      dObj
+    };
+  }
+
+  return {
+    isCandidate: true,
+    isForeign: true
+  };
+}
+
 /**
  * Deterministic Dispatch Envelope Formatter (WO-V3-005 Section 24, A-09, WAAUTH-10)
  */
@@ -56,10 +140,11 @@ function formatDispatchEnvelope({ project_id, work_order_id, dispatch_id, expect
 }
 
 /**
- * Create Antigravity Worker Port (WP-V3-05 / WO-V3-005F)
+ * Create Antigravity Worker Port (WP-V3-05 / WO-V3-005F / WO-V4-09C-D1 / D2)
  *
  * Implements concrete broker workerPort:
- * - dispatch(args): Delivers directives to Antigravity via AO CLI, binds identity envelope.
+ * - dispatch(args): Delivers directives to Antigravity via AO CLI, binds identity envelope,
+ *                   and verifies authoritative delivery acknowledgement in transcript.
  * - wait(args): Bounded monotonic polling for exact machine completion envelope.
  */
 function createAntigravityWorkerPort(options = {}) {
@@ -72,6 +157,15 @@ function createAntigravityWorkerPort(options = {}) {
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const maxDiagnosticBytes = options.maxDiagnosticBytes || 8 * 1024; // 8 KiB
   const pollIntervalMs = options.pollIntervalMs || 250;
+
+  let dispatchAckTimeoutMs = options.dispatchAckTimeoutMs;
+  if (typeof dispatchAckTimeoutMs !== 'number' || !Number.isFinite(dispatchAckTimeoutMs)) {
+    dispatchAckTimeoutMs = DEFAULT_DISPATCH_ACK_TIMEOUT_MS;
+  } else if (dispatchAckTimeoutMs < MIN_DISPATCH_ACK_TIMEOUT_MS) {
+    dispatchAckTimeoutMs = MIN_DISPATCH_ACK_TIMEOUT_MS;
+  } else if (dispatchAckTimeoutMs > MAX_DISPATCH_ACK_TIMEOUT_MS) {
+    dispatchAckTimeoutMs = MAX_DISPATCH_ACK_TIMEOUT_MS;
+  }
 
   /**
    * dispatchWorker Port Entry
@@ -105,10 +199,15 @@ function createAntigravityWorkerPort(options = {}) {
 
     const sessionId = project.worker.session_id.trim();
 
-    // 2. Verify exact session mapping prior to send (A-02, A-06)
+    // 2. Verify exact session mapping prior to send (A-02, A-06, WO-V4-09C-D1 Section 5)
+    let preSendResolution = null;
+    let preSendTranscriptPath = null;
     try {
       if (completionSource && typeof completionSource.resolveSessionTranscript === 'function') {
-        completionSource.resolveSessionTranscript(sessionId, project);
+        preSendResolution = completionSource.resolveSessionTranscript(sessionId, project);
+        if (preSendResolution && typeof preSendResolution.transcriptPath === 'string') {
+          preSendTranscriptPath = preSendResolution.transcriptPath;
+        }
       }
     } catch (err) {
       // Definitive before-send failure: missing session row, conflict, etc.
@@ -156,7 +255,7 @@ function createAntigravityWorkerPort(options = {}) {
       return {
         ok: false,
         definitive: false,
-        error: `AO send invocation failed: ${err.message}`
+        error: `AO send invocation failed: ${err.message}`.slice(0, maxDiagnosticBytes)
       };
     }
 
@@ -165,28 +264,136 @@ function createAntigravityWorkerPort(options = {}) {
       return {
         ok: false,
         definitive: false,
-        error: `AO send failed: ${childRes.error.message}`
+        error: `AO send failed: ${childRes.error.message}`.slice(0, maxDiagnosticBytes)
       };
     }
 
-    if (childRes.status === 0) {
-      // Definitive acceptance (Section 21)
+    if (childRes.status !== 0) {
+      // Non-zero exit code:
+      // Per A-06: Once ao send has actually been attempted, nonzero result is ambiguous.
+      // Default safe behavior: NON-DEFINITIVE => broker DISPATCH_UNCERTAIN.
+      const stderrMsg = childRes.stderr ? childRes.stderr.slice(0, maxDiagnosticBytes).trim() : '';
+      const stdoutMsg = childRes.stdout ? childRes.stdout.slice(0, maxDiagnosticBytes).trim() : '';
       return {
-        ok: true,
-        state: DISPATCH_STATES.DISPATCH_ACCEPTED
+        ok: false,
+        definitive: false,
+        error: (stderrMsg || stdoutMsg || `AO send exited with status ${childRes.status}`).slice(0, maxDiagnosticBytes)
       };
     }
 
-    // Non-zero exit code:
-    // Per A-06: Once ao send has actually been attempted, nonzero result is ambiguous.
-    // Default safe behavior: NON-DEFINITIVE => broker DISPATCH_UNCERTAIN.
-    const stderrMsg = childRes.stderr ? childRes.stderr.slice(0, maxDiagnosticBytes).trim() : '';
-    const stdoutMsg = childRes.stdout ? childRes.stdout.slice(0, maxDiagnosticBytes).trim() : '';
-    return {
-      ok: false,
-      definitive: false,
-      error: stderrMsg || stdoutMsg || `AO send exited with status ${childRes.status}`
-    };
+    // 5. Bounded Delivery Acknowledgement Loop (WO-V4-09C-D1 / D2)
+    const startTime = clock.monotonic();
+    const deadline = startTime + dispatchAckTimeoutMs;
+
+    while (true) {
+      // Step 1: Re-resolve session transcript mapping
+      let resolution;
+      try {
+        if (completionSource && typeof completionSource.resolveSessionTranscript === 'function') {
+          resolution = completionSource.resolveSessionTranscript(sessionId, project);
+        }
+      } catch (resErr) {
+        return {
+          ok: false,
+          definitive: false,
+          error: `Post-send session resolution failed: ${resErr.message}`.slice(0, maxDiagnosticBytes)
+        };
+      }
+
+      // Step 2: Mapping stability check
+      if (preSendTranscriptPath && resolution && resolution.transcriptPath !== preSendTranscriptPath) {
+        return {
+          ok: false,
+          definitive: false,
+          error: 'Transcript mapping changed during dispatch acknowledgement'
+        };
+      }
+
+      // Step 3: Scan transcript for exact boundary evidence
+      let exactCount = 0;
+      let contradictionError = null;
+
+      const visitor = async (record, index) => {
+        const classification = classifyDispatchBoundaryRecord(record, {
+          project_id,
+          work_order_id,
+          dispatch_id,
+          expected_workspace_state_id
+        });
+
+        if (classification.isContradiction) {
+          contradictionError = classification.error;
+          return { stop: true };
+        }
+
+        if (classification.isExact) {
+          exactCount++;
+          if (exactCount > 1) {
+            return { stop: true };
+          }
+        }
+      };
+
+      try {
+        if (typeof completionSource.scanResolvedSession === 'function') {
+          await completionSource.scanResolvedSession(resolution, visitor, { deadline, clock });
+        } else if (typeof completionSource.scanSession === 'function') {
+          await completionSource.scanSession(sessionId, project, visitor, { deadline, clock });
+        }
+      } catch (scanErr) {
+        return {
+          ok: false,
+          definitive: false,
+          error: `Post-send transcript scan failed: ${scanErr.message}`.slice(0, maxDiagnosticBytes)
+        };
+      }
+
+      // Step 4: Classify results
+      if (contradictionError) {
+        return {
+          ok: false,
+          definitive: false,
+          error: contradictionError.slice(0, maxDiagnosticBytes)
+        };
+      }
+
+      if (exactCount > 1) {
+        return {
+          ok: false,
+          definitive: false,
+          error: 'Duplicate current dispatch boundary records observed'
+        };
+      }
+
+      if (exactCount === 1) {
+        const postScanNow = clock.monotonic();
+        if (postScanNow > deadline) {
+          return {
+            ok: false,
+            definitive: false,
+            error: 'Dispatch delivery boundary was not observed within acknowledgement deadline'
+          };
+        }
+        return {
+          ok: true,
+          state: DISPATCH_STATES.DISPATCH_ACCEPTED
+        };
+      }
+
+      // Step 5: Check deadline and sleep
+      const now = clock.monotonic();
+      if (now >= deadline) {
+        return {
+          ok: false,
+          definitive: false,
+          error: 'Dispatch delivery boundary was not observed within acknowledgement deadline'
+        };
+      }
+
+      const remainingMs = deadline - now;
+      const sleepTime = Math.min(pollIntervalMs, Math.max(1, remainingMs));
+      await sleep(sleepTime);
+    }
   }
 
   /**
@@ -224,7 +431,7 @@ function createAntigravityWorkerPort(options = {}) {
     const deadline = startTime + (timeoutSecs * 1000);
 
     let initialTranscriptPath = null;
-    let latestNonterminalState = DISPATCH_STATES.DISPATCH_ACCEPTED;
+    let everObservedBoundary = false;
 
     while (true) {
       // WAAUTH-07: Resolve exact session mapping at the start of EVERY polling iteration
@@ -259,44 +466,27 @@ function createAntigravityWorkerPort(options = {}) {
       try {
         const visitor = async (record, index) => {
           // 1. Boundary Detection (A-09, WAAUTH-03, WAAUTH-04, Section 10, 13, 26)
-          if (typeof record.content === 'string') {
-            // WAAUTH-03: Authoritative boundary requires BOTH source=USER_EXPLICIT and type=USER_INPUT
-            const isUserInput = record.source === 'USER_EXPLICIT' && record.type === 'USER_INPUT';
+          const classification = classifyDispatchBoundaryRecord(record, {
+            project_id,
+            work_order_id,
+            dispatch_id,
+            expected_workspace_state_id
+          });
 
-            if (isUserInput) {
-              // Section 10: Require physical line 0 to be exactly [ORCHESTRATOR_DISPATCH_V1] (no trimStart)
-              const rawLines = record.content.split(/\r?\n/);
-              if (rawLines[0] === '[ORCHESTRATOR_DISPATCH_V1]' && rawLines[1]) {
-                try {
-                  const dObj = JSON.parse(rawLines[1]);
-                  if (
-                    dObj &&
-                    dObj.type === 'worker_dispatch' &&
-                    dObj.schema_version === 1 &&
-                    dObj.project_id === project_id &&
-                    dObj.work_order_id === work_order_id &&
-                    dObj.dispatch_id === dispatch_id
-                  ) {
-                    // WAAUTH-04 / Section 13: Validate expected_workspace_state_id
-                    if (expected_workspace_state_id !== undefined && dObj.expected_workspace_state_id !== expected_workspace_state_id) {
-                      ambiguityError = `Contradictory expected_workspace_state_id on matching dispatch identity: expected '${expected_workspace_state_id}', got '${dObj.expected_workspace_state_id}'`;
-                      return { stop: true };
-                    }
+          if (classification.isContradiction) {
+            ambiguityError = classification.error;
+            return { stop: true };
+          }
 
-                    // Section 26: Duplicate exact dispatch boundary detection
-                    if (boundaryIndex !== -1) {
-                      ambiguityError = 'Duplicate current dispatch boundary records observed';
-                      return { stop: true };
-                    }
-
-                    boundaryIndex = index;
-                    return;
-                  }
-                } catch (_) {
-                  // Not valid JSON header, cannot be boundary
-                }
-              }
+          if (classification.isExact) {
+            // Section 26: Duplicate exact dispatch boundary detection
+            if (boundaryIndex !== -1) {
+              ambiguityError = 'Duplicate current dispatch boundary records observed';
+              return { stop: true };
             }
+            boundaryIndex = index;
+            everObservedBoundary = true;
+            return;
           }
 
           // 2. Completion Detection (A-10, A-11, A-21, A-22, A-23, WAAUTH-05, WAAUTH-06)
@@ -440,7 +630,7 @@ function createAntigravityWorkerPort(options = {}) {
           ok: false,
           code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
           dispatch_id,
-          error: ambiguityError
+          error: ambiguityError.slice(0, maxDiagnosticBytes)
         };
       }
 
@@ -467,16 +657,20 @@ function createAntigravityWorkerPort(options = {}) {
       }
 
       // No terminal completion yet
-      if (boundaryIndex !== -1) {
-        latestNonterminalState = DISPATCH_STATES.RUNNING;
-      }
-
       const now = clock.monotonic();
       if (now >= deadline) {
-        // Deadline reached (A-16): return latest observed nonterminal state
+        // WA-008 is retired: absence of boundary at wait deadline fails closed (WO-V4-09C-D1 / D2)
+        if (boundaryIndex === -1 && !everObservedBoundary) {
+          return {
+            ok: false,
+            code: ERROR_CODES.PROVENANCE_AMBIGUOUS,
+            dispatch_id,
+            error: 'Authoritative dispatch boundary previously acknowledged could not be found in transcript during wait'
+          };
+        }
         return {
           ok: true,
-          state: latestNonterminalState,
+          state: DISPATCH_STATES.RUNNING,
           dispatch_id,
           work_order_id
         };

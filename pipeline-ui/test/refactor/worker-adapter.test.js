@@ -157,12 +157,21 @@ async function runAllTests() {
   console.log('\n[WA-002] Testing no session guessing...');
   {
     const spawnArgs = [];
+    const transcript = [];
     const adapter = createAntigravityWorkerPort({
       spawnSync: (bin, args) => {
         spawnArgs.push({ bin, args });
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          transcript.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
         return { status: 0, stdout: '', stderr: '' };
       },
-      completionSource: createMockCompletionSource([])
+      completionSource: createMockCompletionSource(transcript)
     });
 
     const project = createBaseProject({
@@ -184,13 +193,21 @@ async function runAllTests() {
   console.log('\n[WA-003] Testing envelope identity binding...');
   {
     let sentMessage = null;
+    const transcript = [];
     const adapter = createAntigravityWorkerPort({
       spawnSync: (bin, args) => {
         const msgIdx = args.indexOf('--message');
         sentMessage = args[msgIdx + 1];
+        if (msgIdx !== -1) {
+          transcript.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: sentMessage
+          });
+        }
         return { status: 0, stdout: '', stderr: '' };
       },
-      completionSource: createMockCompletionSource([])
+      completionSource: createMockCompletionSource(transcript)
     });
 
     const dArgs = createDispatchArgs({
@@ -220,15 +237,23 @@ async function runAllTests() {
     let invocationOpts = null;
     let sentMessage = null;
     const dangerousDirective = 'rm -rf / & echo $HOME | cat > output.txt ; `whoami` "quoted" \'single\' < input';
+    const transcript = [];
 
     const adapter = createAntigravityWorkerPort({
       spawnSync: (bin, args, opts) => {
         invocationOpts = opts;
         const msgIdx = args.indexOf('--message');
         sentMessage = args[msgIdx + 1];
+        if (msgIdx !== -1) {
+          transcript.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: sentMessage
+          });
+        }
         return { status: 0, stdout: '', stderr: '' };
       },
-      completionSource: createMockCompletionSource([])
+      completionSource: createMockCompletionSource(transcript)
     });
 
     const res = await adapter.dispatch(createDispatchArgs({ directive: dangerousDirective }));
@@ -243,16 +268,27 @@ async function runAllTests() {
   // -----------------------------------------------------------------------
   console.log('\n[WA-005] Testing send exit 0 produces DISPATCH_ACCEPTED...');
   {
+    const transcript = [];
     const adapter = createAntigravityWorkerPort({
-      spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
-      completionSource: createMockCompletionSource([])
+      spawnSync: (bin, args) => {
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          transcript.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource(transcript)
     });
 
     const res = await adapter.dispatch(createDispatchArgs());
     assert.strictEqual(res.ok, true);
     assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
     assert.notStrictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
-    console.log('✓ WA-005 PASSED: ao send exit 0 produces DISPATCH_ACCEPTED, never READY.');
+    console.log('✓ WA-005 PASSED: ao send exit 0 produces DISPATCH_ACCEPTED when exact boundary observed.');
   }
 
   // -----------------------------------------------------------------------
@@ -290,9 +326,9 @@ async function runAllTests() {
   }
 
   // -----------------------------------------------------------------------
-  // WA-008: Boundary absent in completion source -> DISPATCH_ACCEPTED
+  // WA-008: Boundary absent in completion source -> PROVENANCE_AMBIGUOUS (retired WA-008)
   // -----------------------------------------------------------------------
-  console.log('\n[WA-008] Testing boundary absent produces DISPATCH_ACCEPTED...');
+  console.log('\n[WA-008] Testing boundary absent produces PROVENANCE_AMBIGUOUS...');
   {
     const clock = createMockClock();
     const adapter = createAntigravityWorkerPort({
@@ -309,10 +345,11 @@ async function runAllTests() {
       timeout_secs: 1
     });
 
-    assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
     assert.strictEqual(res.dispatch_id, 'D-ABSENT');
-    console.log('✓ WA-008 PASSED: absence of dispatch boundary returns DISPATCH_ACCEPTED at deadline.');
+    assert.ok(res.error.includes('could not be found'));
+    console.log('✓ WA-008 PASSED: absence of dispatch boundary returns PROVENANCE_AMBIGUOUS at deadline.');
   }
 
   // -----------------------------------------------------------------------
@@ -906,9 +943,9 @@ async function runAllTests() {
       timeout_secs: 1
     });
 
-    assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
-    console.log('✓ WA-021 PASSED: session A completion never bleeds into session B wait.');
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ WA-021 PASSED: session A completion never bleeds into session B wait (missing boundary -> PROVENANCE_AMBIGUOUS).');
   }
 
   // -----------------------------------------------------------------------
@@ -936,11 +973,11 @@ async function runAllTests() {
       timeout_secs: 50
     });
 
-    assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
     // Verified clamped to 30 seconds
     assert.ok(sleptTotal >= 30000 && sleptTotal <= 31000);
-    console.log('✓ WA-022 PASSED: timeout clamped to max 30s; nonterminal response returned within bound.');
+    console.log('✓ WA-022 PASSED: timeout clamped to max 30s; missing boundary returns PROVENANCE_AMBIGUOUS.');
   }
 
   // -----------------------------------------------------------------------
@@ -1178,9 +1215,21 @@ async function runAllTests() {
   console.log('\n[WA-029] Testing broker dispatch integration...');
   {
     let spawnCount = 0;
+    const transcript = [];
     const adapter = createAntigravityWorkerPort({
-      spawnSync: () => { spawnCount++; return { status: 0, stdout: '', stderr: '' }; },
-      completionSource: createMockCompletionSource([])
+      spawnSync: (bin, args) => {
+        spawnCount++;
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          transcript.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource(transcript)
     });
 
     const broker = createBroker({
@@ -1221,7 +1270,17 @@ async function runAllTests() {
     const adapter = createAntigravityWorkerPort({
       clock,
       sleep: async (ms) => clock.advance(ms),
-      spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
+      spawnSync: (bin, args) => {
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          events.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
       completionSource
     });
 
@@ -1246,18 +1305,7 @@ async function runAllTests() {
     assert.strictEqual(dispRes.ok, true);
     targetDispatchId = dispRes.dispatch_id;
 
-    // Push boundary and completion
-    events.push({
-      source: 'USER_EXPLICIT',
-      type: 'USER_INPUT',
-      content: formatDispatchEnvelope({
-        project_id: 'ai-multi-task',
-        work_order_id: 'WO-001',
-        dispatch_id: targetDispatchId,
-        expected_workspace_state_id: 'sha256:ws-123',
-        directive: 'Broker integration directive.'
-      })
-    });
+    // Push completion (boundary was already recorded during dispatch)
     events.push({
       source: 'MODEL',
       type: 'PLANNER_RESPONSE',
@@ -1286,7 +1334,17 @@ async function runAllTests() {
     const adapter = createAntigravityWorkerPort({
       clock,
       sleep: async (ms) => clock.advance(ms),
-      spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
+      spawnSync: (bin, args) => {
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          events.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
       completionSource: createMockCompletionSource(() => events)
     });
 
@@ -1311,18 +1369,7 @@ async function runAllTests() {
 
     const d2Id = dispRes.dispatch_id;
 
-    // Add D2 boundary, but only D1 completion
-    events.push({
-      source: 'USER_EXPLICIT',
-      type: 'USER_INPUT',
-      content: formatDispatchEnvelope({
-        project_id: 'ai-multi-task',
-        work_order_id: 'WO-D2',
-        dispatch_id: d2Id,
-        expected_workspace_state_id: 'sha256:ws-123',
-        directive: 'Directive D2.'
-      })
-    });
+    // D2 boundary was recorded during dispatch. Push only D1 completion:
     events.push({
       source: 'MODEL',
       type: 'PLANNER_RESPONSE',
@@ -1351,7 +1398,17 @@ async function runAllTests() {
     const adapter = createAntigravityWorkerPort({
       clock,
       sleep: async (ms) => clock.advance(ms),
-      spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
+      spawnSync: (bin, args) => {
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          events.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
       completionSource: createMockCompletionSource(() => events)
     });
 
@@ -1377,18 +1434,7 @@ async function runAllTests() {
 
     const d2Id = dispRes.dispatch_id;
 
-    // Add D2 boundary and malformed current completion
-    events.push({
-      source: 'USER_EXPLICIT',
-      type: 'USER_INPUT',
-      content: formatDispatchEnvelope({
-        project_id: 'ai-multi-task',
-        work_order_id: 'WO-D2',
-        dispatch_id: d2Id,
-        expected_workspace_state_id: 'sha256:ws-123',
-        directive: 'Directive D2.'
-      })
-    });
+    // D2 boundary was recorded during dispatch. Push malformed current completion:
     events.push({
       source: 'MODEL',
       type: 'PLANNER_RESPONSE',
@@ -1415,9 +1461,20 @@ async function runAllTests() {
   // -----------------------------------------------------------------------
   console.log('\n[WA-033] Testing accepted != completed regression...');
   {
+    const events = [];
     const adapter = createAntigravityWorkerPort({
-      spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
-      completionSource: createMockCompletionSource([])
+      spawnSync: (bin, args) => {
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          events.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource(events)
     });
 
     const dRes = await adapter.dispatch(createDispatchArgs());
@@ -1433,6 +1490,7 @@ async function runAllTests() {
     });
 
     assert.strictEqual(wRes.ok, true);
+    assert.strictEqual(wRes.state, DISPATCH_STATES.RUNNING);
     assert.notStrictEqual(wRes.state, DISPATCH_STATES.READY_FOR_REVIEW);
     console.log('✓ WA-033 PASSED: ao send exit 0 alone never yields READY.');
   }
@@ -1561,10 +1619,10 @@ async function runAllTests() {
       timeout_secs: 1
     });
 
-    // Boundary was not on line 0 -> boundary not recognized -> DISPATCH_ACCEPTED
-    assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
-    console.log('✓ WA-037 PASSED: fake dispatch marker not at line 0 rejected as boundary establishing.');
+    // Boundary was not on line 0 -> boundary not recognized -> PROVENANCE_AMBIGUOUS
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ WA-037 PASSED: fake dispatch marker not at line 0 rejected as boundary establishing (PROVENANCE_AMBIGUOUS).');
   }
 
   // -----------------------------------------------------------------------
@@ -1967,9 +2025,9 @@ async function runAllTests() {
       timeout_secs: 1
     });
 
-    assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED); // Neither event established boundary!
-    console.log('✓ WA-046 PASSED: boundary requires BOTH source=USER_EXPLICIT and type=USER_INPUT.');
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ WA-046 PASSED: boundary requires BOTH source=USER_EXPLICIT and type=USER_INPUT (missing boundary -> PROVENANCE_AMBIGUOUS).');
   }
 
   // -----------------------------------------------------------------------
@@ -2012,9 +2070,9 @@ async function runAllTests() {
       timeout_secs: 1
     });
 
-    assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
-    console.log('✓ WA-047 PASSED: leading prefix before dispatch marker does not establish boundary.');
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ WA-047 PASSED: leading prefix before dispatch marker does not establish boundary (PROVENANCE_AMBIGUOUS).');
   }
 
   // -----------------------------------------------------------------------
@@ -2364,8 +2422,513 @@ async function runAllTests() {
     console.log('✓ WA-055 PASSED: duplicate exact current dispatch boundaries fail closed with PROVENANCE_AMBIGUOUS.');
   }
 
+  // =======================================================================
+  // DELIVERY ACKNOWLEDGEMENT DETERMINISTIC MATRIX (ACK-001 .. ACK-012, ACK-INT-01)
+  // Authoritative Design: WO-V4-09C-DELIVERY-ACK-DESIGN.md
+  // =======================================================================
   console.log('\n======================================================================');
-  console.log('ALL WORKER ADAPTER TESTS PASSED (WA-001 .. WA-055: 55/55 PASS)');
+  console.log('RUNNING DELIVERY ACKNOWLEDGEMENT TEST SUITE (ACK-001 .. ACK-012, ACK-INT-01)');
+  console.log('======================================================================');
+
+  // -----------------------------------------------------------------------
+  // ACK-001: AO exit 0 + exact authoritative boundary observed within deadline
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-001] Testing AO exit 0 + exact boundary observed within deadline...');
+  {
+    let spawnCalls = 0;
+    const transcript = [];
+    const adapter = createAntigravityWorkerPort({
+      spawnSync: (bin, args) => {
+        spawnCalls++;
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          transcript.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: args[msgIdx + 1]
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource(transcript)
+    });
+
+    const res = await adapter.dispatch(createDispatchArgs());
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    assert.strictEqual(spawnCalls, 1);
+    console.log('✓ ACK-001 PASSED: exact authoritative boundary observed -> DISPATCH_ACCEPTED with 1 send.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-002: AO exit 0 + zero exact boundaries until acknowledgement deadline
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-002] Testing AO exit 0 + zero boundaries until deadline...');
+  {
+    let spawnCalls = 0;
+    const clock = createMockClock();
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      dispatchAckTimeoutMs: 1000,
+      spawnSync: () => {
+        spawnCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource([])
+    });
+
+    const res = await adapter.dispatch(createDispatchArgs());
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.strictEqual(spawnCalls, 1);
+    assert.ok(res.error.includes('not observed within acknowledgement deadline'));
+    console.log('✓ ACK-002 PASSED: missing boundary through deadline yields non-definitive failure with no resend.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-003: Post-send transcript scan throws/unavailable
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-003] Testing post-send transcript scan throws/unavailable...');
+  {
+    let spawnCalls = 0;
+    const adapter = createAntigravityWorkerPort({
+      spawnSync: () => {
+        spawnCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: {
+        resolveSessionTranscript: (sid) => ({
+          sessionId: sid,
+          transcriptPath: '/fake/transcript.jsonl',
+          agentSessionId: 'agent-1'
+        }),
+        scanResolvedSession: async () => {
+          throw new Error('Disk I/O failure during scan');
+        }
+      }
+    });
+
+    const res = await adapter.dispatch(createDispatchArgs());
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.strictEqual(spawnCalls, 1);
+    assert.ok(res.error.includes('Post-send transcript scan failed'));
+    console.log('✓ ACK-003 PASSED: post-send scan failure yields non-definitive failure with exactly 1 send.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-004: Post-send transcript mapping drift
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-004] Testing post-send transcript mapping drift...');
+  {
+    let spawnCalls = 0;
+    let resolveCalls = 0;
+    const adapter = createAntigravityWorkerPort({
+      spawnSync: () => {
+        spawnCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: {
+        resolveSessionTranscript: (sid) => {
+          resolveCalls++;
+          return {
+            sessionId: sid,
+            transcriptPath: resolveCalls === 1 ? '/fake/path_A.jsonl' : '/fake/path_B.jsonl',
+            agentSessionId: 'agent-1'
+          };
+        },
+        scanResolvedSession: async () => {}
+      }
+    });
+
+    const res = await adapter.dispatch(createDispatchArgs());
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.strictEqual(spawnCalls, 1);
+    assert.ok(res.error.includes('Transcript mapping changed'));
+    console.log('✓ ACK-004 PASSED: post-send transcript mapping drift yields non-definitive failure.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-005: Duplicate exact current boundaries
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-005] Testing duplicate exact current boundaries...');
+  {
+    let spawnCalls = 0;
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-TEST-1',
+      expected_workspace_state_id: 'sha256:ws-12345',
+      directive: 'Implement deterministic lifecycle adapter.'
+    });
+
+    const transcript = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env },
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      spawnSync: () => {
+        spawnCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource(transcript)
+    });
+
+    const res = await adapter.dispatch(createDispatchArgs());
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.strictEqual(spawnCalls, 1);
+    assert.ok(res.error.includes('Duplicate current dispatch boundary'));
+    console.log('✓ ACK-005 PASSED: duplicate exact current boundaries yield non-definitive failure with no resend.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-006: Contradictory current-dispatch identity
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-006] Testing contradictory current-dispatch identity fields...');
+  {
+    const fieldsToTest = [
+      { field: 'type', mutate: (o) => { o.type = 'worker_custom'; } },
+      { field: 'schema_version', mutate: (o) => { o.schema_version = 2; } },
+      { field: 'project_id', mutate: (o) => { o.project_id = 'different-project'; } },
+      { field: 'work_order_id', mutate: (o) => { o.work_order_id = 'WO-DIFFERENT'; } },
+      { field: 'expected_workspace_state_id', mutate: (o) => { o.expected_workspace_state_id = 'sha256:different-state'; } }
+    ];
+
+    for (const { field, mutate } of fieldsToTest) {
+      let spawnCalls = 0;
+      const baseObj = {
+        type: 'worker_dispatch',
+        schema_version: 1,
+        project_id: 'ai-multi-task',
+        work_order_id: 'WO-001',
+        dispatch_id: 'D-TEST-1',
+        expected_workspace_state_id: 'sha256:ws-12345'
+      };
+      mutate(baseObj);
+
+      const contradictoryEnvelope = `[ORCHESTRATOR_DISPATCH_V1]\n${JSON.stringify(baseObj)}\n\nDirective body`;
+      const transcript = [
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: contradictoryEnvelope }
+      ];
+
+      const adapter = createAntigravityWorkerPort({
+        spawnSync: () => {
+          spawnCalls++;
+          return { status: 0, stdout: '', stderr: '' };
+        },
+        completionSource: createMockCompletionSource(transcript)
+      });
+
+      const res = await adapter.dispatch(createDispatchArgs());
+      assert.strictEqual(res.ok, false, `Expected failure for contradiction on ${field}`);
+      assert.strictEqual(res.definitive, false, `Expected non-definitive for contradiction on ${field}`);
+      assert.strictEqual(spawnCalls, 1, `Expected exactly 1 spawn for contradiction on ${field}`);
+      assert.ok(res.error.includes('Contradictory current-dispatch control identity'), `Expected contradiction diagnostic for ${field}`);
+    }
+    console.log('✓ ACK-006 PASSED: all 5 contradictory control identity fields yield non-definitive failure.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-007: Single-send proof across all post-send uncertainty paths
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-007] Testing single-send proof across uncertainty paths...');
+  {
+    const scenarios = [
+      {
+        name: 'timeout',
+        setup: () => ({
+          clock: createMockClock(),
+          dispatchAckTimeoutMs: 100,
+          completionSource: createMockCompletionSource([])
+        })
+      },
+      {
+        name: 'scan_error',
+        setup: () => ({
+          completionSource: {
+            resolveSessionTranscript: (sid) => ({ sessionId: sid, transcriptPath: '/p.jsonl' }),
+            scanResolvedSession: async () => { throw new Error('I/O error'); }
+          }
+        })
+      },
+      {
+        name: 'mapping_drift',
+        setup: () => {
+          let count = 0;
+          return {
+            completionSource: {
+              resolveSessionTranscript: (sid) => {
+                count++;
+                return { sessionId: sid, transcriptPath: count === 1 ? '/p1.jsonl' : '/p2.jsonl' };
+              },
+              scanResolvedSession: async () => {}
+            }
+          };
+        }
+      }
+    ];
+
+    for (const sc of scenarios) {
+      let sends = 0;
+      const extra = sc.setup();
+      const adapter = createAntigravityWorkerPort({
+        ...extra,
+        sleep: async (ms) => { if (extra.clock) extra.clock.advance(ms); },
+        spawnSync: () => {
+          sends++;
+          return { status: 0, stdout: '', stderr: '' };
+        }
+      });
+
+      const res = await adapter.dispatch(createDispatchArgs());
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.definitive, false);
+      assert.strictEqual(sends, 1, `Scenario ${sc.name} must invoke spawnSync exactly once`);
+    }
+    console.log('✓ ACK-007 PASSED: spawnSync is invoked at most once across all post-send paths.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-008: Acknowledgement timeout normalization
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-008] Testing acknowledgement timeout normalization...');
+  {
+    const cases = [
+      { input: undefined, expectedTimeout: 30000 },
+      { input: null, expectedTimeout: 30000 },
+      { input: 'invalid', expectedTimeout: 30000 },
+      { input: NaN, expectedTimeout: 30000 },
+      { input: -100, expectedTimeout: 1 },
+      { input: 0, expectedTimeout: 1 },
+      { input: 500, expectedTimeout: 500 },
+      { input: 30000, expectedTimeout: 30000 },
+      { input: 60000, expectedTimeout: 30000 }
+    ];
+
+    for (const c of cases) {
+      let totalSlept = 0;
+      const clock = createMockClock();
+      const adapter = createAntigravityWorkerPort({
+        clock,
+        dispatchAckTimeoutMs: c.input,
+        sleep: async (ms) => {
+          totalSlept += ms;
+          clock.advance(ms);
+        },
+        spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
+        completionSource: createMockCompletionSource([])
+      });
+
+      const res = await adapter.dispatch(createDispatchArgs());
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.definitive, false);
+      assert.strictEqual(totalSlept, c.expectedTimeout, `Timeout ${c.input} normalized to ${c.expectedTimeout}ms (got ${totalSlept}ms)`);
+    }
+    console.log('✓ ACK-008 PASSED: acknowledgement timeout correctly normalized (default 30000, clamp 1..30000).');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-009: Exact boundary acknowledgement does NOT emit READY_FOR_REVIEW
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-009] Testing exact boundary does NOT emit READY_FOR_REVIEW during dispatch...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-TEST-1',
+      expected_workspace_state_id: 'sha256:ws-12345',
+      directive: 'Directive.'
+    });
+
+    const transcript = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env },
+      {
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-TEST-1","state":"READY_FOR_REVIEW"}'
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      spawnSync: () => ({ status: 0, stdout: '', stderr: '' }),
+      completionSource: createMockCompletionSource(transcript)
+    });
+
+    const res = await adapter.dispatch(createDispatchArgs());
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    assert.notStrictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    console.log('✓ ACK-009 PASSED: dispatch acknowledgement yields DISPATCH_ACCEPTED, never READY_FOR_REVIEW.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-010: wait() with observed boundary + no completion -> RUNNING
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-010] Testing wait() with observed boundary + no completion -> RUNNING...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACK-10',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+
+    const events = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACK-10',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.RUNNING);
+    assert.strictEqual(res.dispatch_id, 'D-ACK-10');
+    console.log('✓ ACK-010 PASSED: wait() with observed boundary and no completion returns RUNNING.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-011: wait() with observed boundary + exact valid completion -> READY_FOR_REVIEW
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-011] Testing wait() with observed boundary + valid completion -> READY_FOR_REVIEW...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACK-11',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+
+    const events = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env },
+      {
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACK-11","state":"READY_FOR_REVIEW"}'
+      }
+    ];
+
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACK-11',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    assert.strictEqual(res.dispatch_id, 'D-ACK-11');
+    assert.strictEqual(res.work_order_id, 'WO-001');
+    console.log('✓ ACK-011 PASSED: wait() with observed boundary and valid completion returns READY_FOR_REVIEW.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-012: wait() with no authoritative boundary -> PROVENANCE_AMBIGUOUS
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-012] Testing wait() with no authoritative boundary -> PROVENANCE_AMBIGUOUS...');
+  {
+    const clock = createMockClock();
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([])
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACK-12',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    assert.strictEqual(res.dispatch_id, 'D-ACK-12');
+    assert.ok(res.error.includes('could not be found'));
+    console.log('✓ ACK-012 PASSED: wait() missing previously proven boundary returns PROVENANCE_AMBIGUOUS.');
+  }
+
+  // -----------------------------------------------------------------------
+  // ACK-INT-01: Broker integration proof
+  // -----------------------------------------------------------------------
+  console.log('\n[ACK-INT-01] Testing broker dispatchWorker transitions to DISPATCH_UNCERTAIN on missing boundary...');
+  {
+    let spawnCalls = 0;
+    const clock = createMockClock();
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      dispatchAckTimeoutMs: 1000,
+      spawnSync: () => {
+        spawnCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource([])
+    });
+
+    const store = createMemoryLifecycleStore();
+    const broker = createBroker({
+      registryPort: {
+        getProject: async () => createBaseProject()
+      },
+      workspacePort: {
+        getWorkspaceState: async () => ({ workspace_state_id: 'sha256:ws-123' })
+      },
+      workerPort: adapter,
+      lifecycleStore: store
+    });
+
+    const dispRes = await broker.dispatchWorker({
+      schema_version: 1,
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-INT-01',
+      expected_workspace_state_id: 'sha256:ws-123',
+      directive: 'Broker delivery ack integration directive.'
+    });
+
+    assert.strictEqual(dispRes.ok, false);
+    assert.strictEqual(dispRes.code, ERROR_CODES.DISPATCH_UNCERTAIN);
+    assert.strictEqual(spawnCalls, 1);
+
+    const storedDispatch = store.getDispatch(dispRes.dispatch_id);
+    assert.strictEqual(storedDispatch.state, DISPATCH_STATES.DISPATCH_UNCERTAIN);
+    console.log('✓ ACK-INT-01 PASSED: broker dispatchWorker transitions to DISPATCH_UNCERTAIN with 1 send and 0 retries.');
+  }
+
+  console.log('\n======================================================================');
+  console.log('WORKER ADAPTER TEST SUMMARY');
+  console.log('WA-001 .. WA-055: 55/55 PASS (WA 55/55)');
+  console.log('ACK-001 .. ACK-012: 12/12 PASS (ACK 12/12)');
+  console.log('ACK-INT-01: 1/1 PASS (ACK-INT 1/1)');
+  console.log('WORKER ADAPTER TOTAL: 68/68 PASS (TOTAL 68/68)');
   console.log('======================================================================');
 }
 
