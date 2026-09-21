@@ -12,6 +12,16 @@ const path = require('path');
 
 const { runOneShotCycle } = require('../../lib/relay/one-shot-cycle');
 const { AUDIT_DECISIONS } = require('../../lib/relay/audit-decision');
+const { LIMITS: BROKER_LIMITS } = require('../../lib/broker/contracts');
+
+function textPrompt(text = 'deterministic prompt') {
+  return [
+    {
+      type: 'text',
+      text
+    }
+  ];
+}
 
 // Track temporary test directories to clean up
 const tempDirs = [];
@@ -160,6 +170,7 @@ function createMockAdapter({
   let startTurnCalls = 0;
   let closeCalls = 0;
   let turnCounter = 0;
+  let lastWaitForTurnCompletionParams = null;
 
   const adapter = {
     get initializeCalls() { return initializeCalls; },
@@ -167,6 +178,7 @@ function createMockAdapter({
     get listModelsCalls() { return listModelsCalls; },
     get startTurnCalls() { return startTurnCalls; },
     get closeCalls() { return closeCalls; },
+    get lastWaitForTurnCompletionParams() { return lastWaitForTurnCompletionParams; },
 
     async initialize() {
       initializeCalls++;
@@ -200,6 +212,7 @@ function createMockAdapter({
     },
 
     async waitForTurnCompletion(params) {
+      lastWaitForTurnCompletionParams = params;
       if (awaitDecisionError) {
         throw awaitDecisionError;
       }
@@ -233,7 +246,7 @@ function createMockAdapter({
 }
 
 async function runTests() {
-  console.log('Starting One-Shot Full-Cycle Coordinator test suite (OSC-001 .. OSC-072)...');
+  console.log('Starting One-Shot Full-Cycle Coordinator Deterministic Test Suite...');
 
   // OSC-001: Missing or invalid projectId
   {
@@ -258,7 +271,7 @@ async function runTests() {
   {
     const res1 = await runOneShotCycle({ projectId: 'p', auditSubjectId: 'sub', auditPrompt: [] });
     assert.strictEqual(res1.code, 'STARTING_STATE_INVALID');
-    const res2 = await runOneShotCycle({ projectId: 'p', auditSubjectId: 'sub', auditPrompt: ['prompt'], reviewPrompt: [] });
+    const res2 = await runOneShotCycle({ projectId: 'p', auditSubjectId: 'sub', auditPrompt: textPrompt('prompt'), reviewPrompt: [] });
     assert.strictEqual(res2.code, 'STARTING_STATE_INVALID');
     console.log('PASS: OSC-003 — Empty auditPrompt/reviewPrompt rejected');
   }
@@ -268,8 +281,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'p',
       auditSubjectId: 'sub',
-      auditPrompt: ['a'],
-      reviewPrompt: ['r']
+      auditPrompt: textPrompt('a'),
+      reviewPrompt: textPrompt('r')
       // missing ports
     });
     assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
@@ -281,8 +294,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['test prompt'],
-      reviewPrompt: ['review prompt'],
+      auditPrompt: textPrompt('test prompt'),
+      reviewPrompt: textPrompt('review prompt'),
       registryPort: { getProject: async () => null },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -305,8 +318,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -328,8 +341,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -351,8 +364,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -374,8 +387,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -397,8 +410,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -419,8 +432,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -442,8 +455,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -465,8 +478,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -488,8 +501,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -516,8 +529,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -539,8 +552,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -564,8 +577,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -587,8 +600,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -610,8 +623,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -646,8 +659,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -671,8 +684,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -696,8 +709,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -721,8 +734,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -745,8 +758,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -768,8 +781,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => ({}) },
       broker: {
@@ -798,8 +811,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['turn A prompt'],
-      reviewPrompt: ['turn B prompt'],
+      auditPrompt: textPrompt('turn A prompt'),
+      reviewPrompt: textPrompt('turn B prompt'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -829,8 +842,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: {
         getProject: async () => {
           getProjectCalls++;
@@ -861,8 +874,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: {
         getProject: async () => {
           getProjectCalls++;
@@ -890,8 +903,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: {
         getProject: async () => {
           getProjectCalls++;
@@ -919,8 +932,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => { throw new Error('Git failure'); } },
       broker: {
@@ -950,7 +963,7 @@ async function runTests() {
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
       auditPrompt: [{ type: 'text', text: 'turn A input content' }],
-      reviewPrompt: ['turn B input content'],
+      reviewPrompt: textPrompt('turn B input content'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -975,8 +988,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1005,8 +1018,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1032,8 +1045,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1058,8 +1071,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1084,8 +1097,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1111,8 +1124,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1137,8 +1150,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1163,8 +1176,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1189,8 +1202,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1215,8 +1228,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1250,8 +1263,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1278,8 +1291,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: {
         getProject: async () => {
           getProjectCalls++;
@@ -1316,8 +1329,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1342,8 +1355,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: {
         getWorkspaceState: async () => {
@@ -1373,8 +1386,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1408,8 +1421,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1436,8 +1449,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1462,8 +1475,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1487,8 +1500,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1511,8 +1524,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1535,8 +1548,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1562,8 +1575,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1587,8 +1600,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1611,8 +1624,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1637,8 +1650,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1664,8 +1677,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: {
         getProject: async () => {
           getProjectCalls++;
@@ -1700,8 +1713,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: {
         getWorkspaceState: async (p) => {
@@ -1736,8 +1749,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1769,7 +1782,7 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['turn A input'],
+      auditPrompt: textPrompt('turn A input'),
       reviewPrompt: [{ type: 'text', text: 'explicit review prompt' }],
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
@@ -1795,8 +1808,8 @@ async function runTests() {
       const res = await runOneShotCycle({
         projectId: 'test-proj',
         auditSubjectId: 'sub-01',
-        auditPrompt: ['p'],
-        reviewPrompt: ['r'],
+        auditPrompt: textPrompt('p'),
+        reviewPrompt: textPrompt('r'),
         registryPort: { getProject: async () => proj },
         workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
         broker: {
@@ -1825,8 +1838,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1856,8 +1869,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: {
         getProject: async () => {
           getProjectCalls++;
@@ -1885,8 +1898,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: {
         getWorkspaceState: async () => {
@@ -1914,8 +1927,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1937,8 +1950,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1960,8 +1973,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -1992,8 +2005,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2019,8 +2032,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2045,8 +2058,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2070,8 +2083,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2177,8 +2190,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['run audit'],
-      reviewPrompt: ['run review'],
+      auditPrompt: textPrompt('run audit'),
+      reviewPrompt: textPrompt('run review'),
       registryPort,
       workspacePort,
       broker,
@@ -2233,10 +2246,10 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       turnTimeoutMs: 45000,
-      workerWaitTimeoutSecs: 180,
+      workerWaitTimeoutSecs: 25,
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2249,7 +2262,7 @@ async function runTests() {
       },
       auditorFactory: async () => adapter
     });
-    assert.strictEqual(waitTimeoutPassed, 180);
+    assert.strictEqual(waitTimeoutPassed, 25);
     console.log('PASS: OSC-046 — Bounded timeout parameters respected');
   }
 
@@ -2261,8 +2274,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2285,8 +2298,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2332,8 +2345,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: {
         getWorkspaceState: async () => {
@@ -2362,8 +2375,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: {
         getWorkspaceState: async () => {
@@ -2393,8 +2406,8 @@ async function runTests() {
     const res = await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker: {
@@ -2423,8 +2436,8 @@ async function runTests() {
     await runOneShotCycle({
       projectId: 'test-proj',
       auditSubjectId: 'sub-01',
-      auditPrompt: ['p'],
-      reviewPrompt: ['r'],
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
       registryPort: { getProject: async () => proj },
       workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
       broker,
@@ -2434,8 +2447,493 @@ async function runTests() {
     console.log('PASS: OSC-054 — Exactly zero worker transcript reads performed by coordinator');
   }
 
+
+  // OSC-SUBJ-01: auditSubjectId exceeding 512 UTF-8 bytes rejected with STARTING_STATE_INVALID
+  {
+    let registryReads = 0;
+    const hugeSubjectId = 'a'.repeat(513);
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: hugeSubjectId,
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { registryReads++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(registryReads, 0);
+    console.log('PASS: OSC-SUBJ-01 — auditSubjectId exceeding 512 bytes rejected with 0 registry reads');
+  }
+
+  // OSC-PROMPT-01: empty auditPrompt rejected before any authority calls
+  {
+    let factoryCalls = 0;
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: [],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } },
+      auditorFactory: async () => { factoryCalls++; }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    assert.strictEqual(factoryCalls, 0);
+    console.log('PASS: OSC-PROMPT-01 — empty auditPrompt rejected with 0 authority calls');
+  }
+
+  // OSC-PROMPT-02: empty reviewPrompt rejected before any authority calls
+  {
+    let factoryCalls = 0;
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: [],
+      registryPort: { getProject: async () => { regCalls++; } },
+      auditorFactory: async () => { factoryCalls++; }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    assert.strictEqual(factoryCalls, 0);
+    console.log('PASS: OSC-PROMPT-02 — empty reviewPrompt rejected with 0 authority calls');
+  }
+
+  // OSC-PROMPT-03: auditPrompt containing string item rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: ['raw string'],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-03 — auditPrompt containing string item rejected');
+  }
+
+  // OSC-PROMPT-04: reviewPrompt containing string item rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: ['raw string'],
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-04 — reviewPrompt containing string item rejected');
+  }
+
+  // OSC-PROMPT-05: null item in auditPrompt rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: [null],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-05 — null item in auditPrompt rejected');
+  }
+
+  // OSC-PROMPT-06: array item in auditPrompt rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: [['nested array']],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-06 — array item in auditPrompt rejected');
+  }
+
+  // OSC-PROMPT-07: wrong type token in auditPrompt rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: [{ type: 'image', text: 'hi' }],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-07 — wrong type token in auditPrompt rejected');
+  }
+
+  // OSC-PROMPT-08: missing text in auditPrompt rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: [{ type: 'text' }],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-08 — missing text in auditPrompt rejected');
+  }
+
+  // OSC-PROMPT-09: non-string text in auditPrompt rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: [{ type: 'text', text: 12345 }],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-09 — non-string text in auditPrompt rejected');
+  }
+
+  // OSC-PROMPT-10: auditPrompt aggregate text > 1 MiB rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: [{ type: 'text', text: 'x'.repeat(1024 * 1024 + 1) }],
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-10 — auditPrompt aggregate text > 1 MiB rejected');
+  }
+
+  // OSC-PROMPT-11: reviewPrompt aggregate text > 1 MiB rejected
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: [{ type: 'text', text: 'x'.repeat(1024 * 1024 + 1) }],
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-PROMPT-11 — reviewPrompt aggregate text > 1 MiB rejected');
+  }
+
+  // OSC-TIME-01: turnTimeoutMs omitted defaults to 60000 at awaitAuditDecisionV1
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-1', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async () => ({ ok: true, state: 'READY_FOR_REVIEW', dispatch_id: 'd-1', work_order_id: 'wo-001' })
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(adapter.lastWaitForTurnCompletionParams.timeoutMs, 60000);
+    console.log('PASS: OSC-TIME-01 — turnTimeoutMs omitted defaults to 60000 at wait path');
+  }
+
+  // OSC-TIME-02: turnTimeoutMs = Infinity rejected pre-authority
+  {
+    let regCalls = 0;
+    let factoryCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      turnTimeoutMs: Infinity,
+      registryPort: { getProject: async () => { regCalls++; } },
+      auditorFactory: async () => { factoryCalls++; }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    assert.strictEqual(factoryCalls, 0);
+    console.log('PASS: OSC-TIME-02 — turnTimeoutMs = Infinity rejected with 0 authority calls');
+  }
+
+  // OSC-TIME-03: turnTimeoutMs = NaN rejected pre-authority
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      turnTimeoutMs: NaN,
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-TIME-03 — turnTimeoutMs = NaN rejected pre-authority');
+  }
+
+  // OSC-TIME-04: turnTimeoutMs = 0 rejected pre-authority
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      turnTimeoutMs: 0,
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-TIME-04 — turnTimeoutMs = 0 rejected pre-authority');
+  }
+
+  // OSC-TIME-05: turnTimeoutMs > 2147483647 rejected pre-authority
+  {
+    let regCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      turnTimeoutMs: 2147483648,
+      registryPort: { getProject: async () => { regCalls++; } }
+    });
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    console.log('PASS: OSC-TIME-05 — turnTimeoutMs > 2147483647 rejected pre-authority');
+  }
+
+  // OSC-TIME-06: workerWaitTimeoutSecs omitted defaults to broker default bound
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let waitTimeoutPassed = null;
+    await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-1', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async (p) => {
+          waitTimeoutPassed = p.timeout_secs;
+          return { ok: true, state: 'READY_FOR_REVIEW', dispatch_id: 'd-1', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(waitTimeoutPassed, BROKER_LIMITS.DEFAULT_TIMEOUT_SECS);
+    console.log('PASS: OSC-TIME-06 — workerWaitTimeoutSecs omitted defaults to broker default bound');
+  }
+
+  // OSC-TIME-07: workerWaitTimeoutSecs = Infinity rejected pre-authority
+  {
+    let regCalls = 0;
+    let factoryCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      workerWaitTimeoutSecs: Infinity,
+      registryPort: { getProject: async () => { regCalls++; } },
+      auditorFactory: async () => { factoryCalls++; }
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'STARTING_STATE_INVALID');
+    assert.strictEqual(regCalls, 0);
+    assert.strictEqual(factoryCalls, 0);
+    console.log('PASS: OSC-TIME-07 — workerWaitTimeoutSecs = Infinity rejected pre-authority');
+  }
+
+  // OSC-TIME-08: workerWaitTimeoutSecs above broker max normalized to broker max
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let waitTimeoutPassed = null;
+    await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      workerWaitTimeoutSecs: 500,
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-1', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async (p) => {
+          waitTimeoutPassed = p.timeout_secs;
+          return { ok: true, state: 'READY_FOR_REVIEW', dispatch_id: 'd-1', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(waitTimeoutPassed, BROKER_LIMITS.MAX_TIMEOUT_SECS);
+    console.log('PASS: OSC-TIME-08 — workerWaitTimeoutSecs above broker max normalized to broker max');
+  }
+
+  // OSC-TIME-09: workerWaitTimeoutSecs below broker min normalized to broker min
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let waitTimeoutPassed = null;
+    await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      workerWaitTimeoutSecs: -10,
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-1', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async (p) => {
+          waitTimeoutPassed = p.timeout_secs;
+          return { ok: true, state: 'READY_FOR_REVIEW', dispatch_id: 'd-1', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(waitTimeoutPassed, BROKER_LIMITS.MIN_TIMEOUT_SECS);
+    console.log('PASS: OSC-TIME-09 — workerWaitTimeoutSecs below broker min normalized to broker min');
+  }
+
+  // OSC-BOUND-01: Huge broker error code falls back to stage fallback code
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    const hugeCode = 'E'.repeat(200);
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: false, code: hugeCode }),
+        waitWorker: async () => ({ ok: true })
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'DISPATCH_RESULT_INVALID');
+    console.log('PASS: OSC-BOUND-01 — Huge broker error code falls back to DISPATCH_RESULT_INVALID');
+  }
+
+  // OSC-BOUND-02: Control-character error code falls back to stage fallback code
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: false, code: 'DISPATCH\nFAILED' }),
+        waitWorker: async () => ({ ok: true })
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'DISPATCH_RESULT_INVALID');
+    console.log('PASS: OSC-BOUND-02 — Control-character error code falls back to DISPATCH_RESULT_INVALID');
+  }
+
+  // OSC-BOUND-03: Whitespace-padded error code falls back to stage fallback code
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: false, code: ' DISPATCH_FAILED ' }),
+        waitWorker: async () => ({ ok: true })
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(res.status, 'FAILED');
+    assert.strictEqual(res.code, 'DISPATCH_RESULT_INVALID');
+    console.log('PASS: OSC-BOUND-03 — Whitespace-padded error code falls back to DISPATCH_RESULT_INVALID');
+  }
+
+  // Footer dynamic count
+  const testFileSrc = fs.readFileSync(__filename, 'utf8');
+  const caseMatches = testFileSrc.match(/^\s*\/\/\s+(OSC[^\r\n:]*):/gm) || [];
+  const totalCases = caseMatches.length;
   console.log('======================================================================');
-  console.log('ALL ONE-SHOT CYCLE TESTS PASSED (OSC-001 .. OSC-054: 54/54 PASS)');
+  console.log(`ALL ONE-SHOT CYCLE TESTS PASSED (OSC ${totalCases}/${totalCases} PASS)`);
   console.log('======================================================================');
 }
 

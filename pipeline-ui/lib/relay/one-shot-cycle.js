@@ -7,6 +7,58 @@ const {
   awaitAuditDecisionV1
 } = require('./audit-decision');
 const { resolveAuditorModelPolicy } = require('../auditor/model-policy-resolver');
+const { LIMITS: BROKER_LIMITS } = require('../broker/contracts');
+
+const MAX_AUDIT_SUBJECT_ID_BYTES = 512;
+const MAX_PROMPT_TEXT_BYTES = 1024 * 1024;
+const DEFAULT_TURN_TIMEOUT_MS = 60000;
+const MIN_TURN_TIMEOUT_MS = 1;
+const MAX_TURN_TIMEOUT_MS = 2147483647;
+const MAX_RESULT_CODE_BYTES = 128;
+
+/**
+ * Validate and bound external / propagated result code.
+ */
+function sanitizePropagatedCode(code, fallbackCode) {
+  if (
+    typeof code === 'string' &&
+    code.length > 0 &&
+    code.trim() === code &&
+    // eslint-disable-next-line no-control-regex
+    !/[\x00-\x1f\x7f]/.test(code) &&
+    Buffer.byteLength(code, 'utf8') <= MAX_RESULT_CODE_BYTES
+  ) {
+    return code;
+  }
+  return fallbackCode;
+}
+
+/**
+ * Validate that prompt items conform to production adapter text-input contract.
+ */
+function validatePrompt(prompt) {
+  if (!Array.isArray(prompt) || prompt.length === 0) {
+    return false;
+  }
+  let totalBytes = 0;
+  for (let i = 0; i < prompt.length; i++) {
+    const item = prompt[i];
+    if (
+      !item ||
+      typeof item !== 'object' ||
+      Array.isArray(item) ||
+      item.type !== 'text' ||
+      typeof item.text !== 'string'
+    ) {
+      return false;
+    }
+    totalBytes += Buffer.byteLength(item.text, 'utf8');
+    if (totalBytes > MAX_PROMPT_TEXT_BYTES) {
+      return false;
+    }
+  }
+  return true;
+}
 
 /**
  * Deep equality helper for bounded configuration comparison.
@@ -138,7 +190,7 @@ function buildEnvelope({
   return {
     ok: status !== 'FAILED',
     status,
-    code: status === 'FAILED' ? code : null,
+    code: status === 'FAILED' ? (typeof code === 'string' ? sanitizePropagatedCode(code, 'FAILED') : null) : null,
     project_id: projectId,
     audit_subject_id: auditSubjectId,
     auditor_thread_id: auditorThreadId,
@@ -176,13 +228,6 @@ async function runOneShotCycle(options = {}) {
     workerWaitTimeoutSecs: rawWorkerWaitTimeoutSecs
   } = options || {};
 
-  const turnTimeoutMs = (typeof rawTurnTimeoutMs === 'number' && rawTurnTimeoutMs > 0)
-    ? rawTurnTimeoutMs
-    : 60000;
-  const workerWaitTimeoutSecs = (typeof rawWorkerWaitTimeoutSecs === 'number' && rawWorkerWaitTimeoutSecs > 0)
-    ? rawWorkerWaitTimeoutSecs
-    : 300;
-
   // Validate semantic inputs before any side effect
   if (typeof projectId !== 'string' || projectId.trim().length === 0) {
     return buildEnvelope({
@@ -198,7 +243,8 @@ async function runOneShotCycle(options = {}) {
     auditSubjectId.length === 0 ||
     auditSubjectId.trim() !== auditSubjectId ||
     // eslint-disable-next-line no-control-regex
-    /[\x00-\x1f\x7f]/.test(auditSubjectId)
+    /[\x00-\x1f\x7f]/.test(auditSubjectId) ||
+    Buffer.byteLength(auditSubjectId, 'utf8') > MAX_AUDIT_SUBJECT_ID_BYTES
   ) {
     return buildEnvelope({
       status: 'FAILED',
@@ -208,7 +254,7 @@ async function runOneShotCycle(options = {}) {
     });
   }
 
-  if (!Array.isArray(auditPrompt) || auditPrompt.length === 0) {
+  if (!validatePrompt(auditPrompt)) {
     return buildEnvelope({
       status: 'FAILED',
       code: 'STARTING_STATE_INVALID',
@@ -217,7 +263,7 @@ async function runOneShotCycle(options = {}) {
     });
   }
 
-  if (!Array.isArray(reviewPrompt) || reviewPrompt.length === 0) {
+  if (!validatePrompt(reviewPrompt)) {
     return buildEnvelope({
       status: 'FAILED',
       code: 'STARTING_STATE_INVALID',
@@ -243,6 +289,41 @@ async function runOneShotCycle(options = {}) {
       projectId,
       auditSubjectId
     });
+  }
+
+  let turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS;
+  if (rawTurnTimeoutMs !== undefined) {
+    if (
+      typeof rawTurnTimeoutMs !== 'number' ||
+      !Number.isFinite(rawTurnTimeoutMs) ||
+      !Number.isInteger(rawTurnTimeoutMs) ||
+      rawTurnTimeoutMs < MIN_TURN_TIMEOUT_MS ||
+      rawTurnTimeoutMs > MAX_TURN_TIMEOUT_MS
+    ) {
+      return buildEnvelope({
+        status: 'FAILED',
+        code: 'STARTING_STATE_INVALID',
+        projectId,
+        auditSubjectId
+      });
+    }
+    turnTimeoutMs = rawTurnTimeoutMs;
+  }
+
+  let workerWaitTimeoutSecs = BROKER_LIMITS.DEFAULT_TIMEOUT_SECS;
+  if (rawWorkerWaitTimeoutSecs !== undefined) {
+    if (typeof rawWorkerWaitTimeoutSecs !== 'number' || !Number.isFinite(rawWorkerWaitTimeoutSecs)) {
+      return buildEnvelope({
+        status: 'FAILED',
+        code: 'STARTING_STATE_INVALID',
+        projectId,
+        auditSubjectId
+      });
+    }
+    workerWaitTimeoutSecs = Math.min(
+      BROKER_LIMITS.MAX_TIMEOUT_SECS,
+      Math.max(BROKER_LIMITS.MIN_TIMEOUT_SECS, rawWorkerWaitTimeoutSecs)
+    );
   }
 
   // Gate A: Fresh Registry authority
@@ -409,7 +490,7 @@ async function runOneShotCycle(options = {}) {
   } catch (err) {
     return buildEnvelope({
       status: 'FAILED',
-      code: (err && typeof err.code === 'string' && err.code.length > 0) ? err.code : 'WORKER_BUSY',
+      code: sanitizePropagatedCode(err?.code, 'WORKER_BUSY'),
       projectId,
       auditSubjectId,
       auditorThreadId: exactThreadId
@@ -425,9 +506,7 @@ async function runOneShotCycle(options = {}) {
   ) {
     return buildEnvelope({
       status: 'FAILED',
-      code: (workerStatus && typeof workerStatus.code === 'string' && workerStatus.code.length > 0)
-        ? workerStatus.code
-        : 'WORKER_BUSY',
+      code: sanitizePropagatedCode(workerStatus?.code, 'WORKER_BUSY'),
       projectId,
       auditSubjectId,
       auditorThreadId: exactThreadId
@@ -684,9 +763,7 @@ async function runOneShotCycle(options = {}) {
     } catch (err) {
       candidateResult = {
         status: 'FAILED',
-        code: (err && typeof err.code === 'string' && err.code.length > 0)
-          ? err.code
-          : 'DISPATCH_RESULT_INVALID'
+        code: sanitizePropagatedCode(err?.code, 'DISPATCH_RESULT_INVALID')
       };
       return assembleFinal();
     }
@@ -699,9 +776,7 @@ async function runOneShotCycle(options = {}) {
     if (dispatchResult.ok === false) {
       candidateResult = {
         status: 'FAILED',
-        code: (typeof dispatchResult.code === 'string' && dispatchResult.code.length > 0)
-          ? dispatchResult.code
-          : 'DISPATCH_RESULT_INVALID'
+        code: sanitizePropagatedCode(dispatchResult.code, 'DISPATCH_RESULT_INVALID')
       };
       return assembleFinal();
     }
@@ -738,9 +813,7 @@ async function runOneShotCycle(options = {}) {
     } catch (err) {
       candidateResult = {
         status: 'FAILED',
-        code: (err && typeof err.code === 'string' && err.code.length > 0)
-          ? err.code
-          : 'DISPATCH_RESULT_INVALID'
+        code: sanitizePropagatedCode(err?.code, 'DISPATCH_RESULT_INVALID')
       };
       return assembleFinal();
     }
@@ -753,9 +826,7 @@ async function runOneShotCycle(options = {}) {
     if (waitResult.ok === false) {
       candidateResult = {
         status: 'FAILED',
-        code: (typeof waitResult.code === 'string' && waitResult.code.length > 0)
-          ? waitResult.code
-          : 'DISPATCH_RESULT_INVALID'
+        code: sanitizePropagatedCode(waitResult.code, 'DISPATCH_RESULT_INVALID')
       };
       return assembleFinal();
     }
@@ -922,9 +993,7 @@ async function runOneShotCycle(options = {}) {
     if (!candidateResult) {
       candidateResult = {
         status: 'FAILED',
-        code: (unexpectedErr && typeof unexpectedErr.code === 'string' && unexpectedErr.code.length > 0)
-          ? unexpectedErr.code
-          : 'STARTING_STATE_INVALID'
+        code: sanitizePropagatedCode(unexpectedErr?.code, 'STARTING_STATE_INVALID')
       };
     }
     return assembleFinal();
