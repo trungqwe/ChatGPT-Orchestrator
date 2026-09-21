@@ -1,18 +1,18 @@
-# WO-V4-07A CLI DESIGN — Audit / Recover CLI Contract (Revision 1)
+# WO-V4-07A CLI DESIGN — Audit / Recover CLI Contract (Revision 2)
 
-- **Work Order**: WO-V4-07A-R1 (runtime composition / exact error semantics / mutation-matrix correction)
-- **Correction Parent**: `07b2604497c31e2480f172f3aed6f09bc6383109`
+- **Work Order**: WO-V4-07A-R2 (adapter factory signature / authority cwd / source-exact error inventory)
+- **Correction Parent**: `0d401207334e2412caf62c642ee5cd52203c048e`
 - **Authoritative Implementation Source Baseline**: `119e93f96b8e5eddaf81b8ddefba4b485c76f554`
 - **Status**: DESIGN / CONTRACT ONLY — No production code modified
 - **WP-V4-06**: `COMPLETE`
-- **WP-V4-07A**: `BLOCKED_PENDING_R1_EXTERNAL_REVIEW`
+- **WP-V4-07A**: `BLOCKED_PENDING_R2_EXTERNAL_REVIEW`
 - **WP-V4-07B**: `NOT_STARTED`
 
 ---
 
 ## Source-Alignment Gate Results
 
-The following architectural and semantic corrections are established in Revision 1:
+The following architectural and semantic invariants are established across Revisions 1 and 2:
 
 **Gate A — CLI outputs are projections, never raw lifecycle results**: CLI commands project strictly defined allowlists. Never use `{ ...lifecycleResult }`. Raw lifecycle return fields such as `registry_project`, `decision_json`, `validated_decision`, and `decision` (AuditDecisionV1) are NEVER emitted in any output channel. `worker.session_id` is never emitted.
 
@@ -32,11 +32,30 @@ The three lifecycle commands do NOT share identical no-active behavior:
 
 **Gate G — Direct auditor recovery runtime composition**: `createBrokerRuntime` (`pipeline-ui/lib/broker/runtime.js`) is NOT the auditor recovery runtime. Its `lifecycleStore` is the worker/broker lifecycle store, not `sqlite-auditor-recovery-store`. WP-V4-07B composes the runtime directly via `createAuditorRecoveryCliRuntime(options)` using `createProjectRegistry()`, `createSqliteAuditorRecoveryStore()`, and `CodexAuditorAdapter`.
 
-**Gate H — Exit matrix alignment & unmapped error fallback**:
+**Gate H — Exit matrix alignment & operational error fallback**:
 - Exits `3`, `4`, and `7` are `RESERVED_NOT_CURRENTLY_EMITTED` because current lifecycle code produces no structured error codes mapping to them at the CLI boundary.
-- An unmapped structured error fallback is established at **exit 12** (`CLI_RUNTIME_FAILURE`). Safe machine-readable `code` is preserved in JSON output, raw stack traces are never exposed, and fallback is never derived from message text.
+- Operational unmapped structured errors fall back to **exit 12** (`CLI_RUNTIME_FAILURE`). Safe machine-readable `code` is preserved in JSON output, raw stack traces are never exposed, and fallback is never derived from message text.
 
 **Gate I — Correct mutation matrix**: Bind-capable recover paths (`DECISION_VALIDATED`, `RESUME_VERIFYING`, `RESUME_VERIFIED`, `REGISTRY_BINDING`) have `Registry YES, CONDITIONAL` — `bindAuditorThread` executes if the Registry is not already bound to the exact same thread; if already bound, Registry write is skipped idempotently while active recovery is cleared.
+
+**Gate J (R2) — Adapter factory signature & lifecycle authority cwd**:
+Lifecycle invokes `adapterFactory({ phase, cwd })`. The factory accepts this exact signature. In the factory construction:
+```javascript
+new CodexAuditorAdapter({
+  ...adapterOptions,
+  cwd
+})
+```
+The lifecycle-supplied `cwd` strictly overrides any programmatic `adapterOptions.cwd`. `phase` provides context for diagnostics and test assertions, but cannot alter cwd authority, thread identity, model, or effort.
+
+**Gate K (R2) — Source-exact recovery error inventory**:
+The error code inventory in §1.2 strictly mirrors `RECOVERY_ERROR_CODES` from `pipeline-ui/lib/relay/sqlite-auditor-recovery-store.js`. Non-existent codes like `AUDITOR_RECOVERY_DB_ERROR` are removed.
+
+**Gate L (R2) — Runtime initialization phase authority**:
+Runtime construction is a distinct phase. Any error thrown during `createAuditorRecoveryCliRuntime()` maps unconditionally to **exit 11** (`CLI_RUNTIME_INITIALIZATION_FAILURE`), preserving the safe machine-readable code in JSON. Initialization errors are never routed through operational fallback (exit 12).
+
+**Gate M (R2) — Top-level unexpected failure boundary**:
+To enforce the invariant of exactly one JSON stdout object and zero raw stack traces, process-entry uncaught exceptions are trapped by a top-level error boundary. This boundary emits a bounded JSON error and sets `process.exitCode = 1` (`TOP_LEVEL_UNEXPECTED_FAILURE`).
 
 ---
 
@@ -145,15 +164,17 @@ REGISTRY_BINDING         AUDIT_UNCERTAIN          AUDIT_TERMINAL_NO_DECISION
 LEGACY_AUTHORITY_RETIRED
 ```
 
-Error codes (`RECOVERY_ERROR_CODES`):
+Source-exact error codes (`RECOVERY_ERROR_CODES`):
 ```
-AUDITOR_RECOVERY_NOT_FOUND
-AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT
-AUDITOR_RECOVERY_INVALID_REQUEST
 AUDITOR_RECOVERY_CORRUPT
+AUDITOR_RECOVERY_SCHEMA_INVALID
+AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT
+AUDITOR_RECOVERY_NOT_FOUND
+AUDITOR_RECOVERY_INVALID_TRANSITION
+AUDITOR_RECOVERY_INVALID_REQUEST
 AUDITOR_RECOVERY_CLOSED
-AUDITOR_RECOVERY_DB_ERROR
 ```
+*(Note: `AUDITOR_RECOVERY_DB_ERROR` does NOT exist in source and is not part of this inventory).*
 
 Allowed transitions (from -> to):
 ```
@@ -192,7 +213,7 @@ Lifecycle wrapper (`inspectAuditorBootstrap`) additions:
 
 `bindAuditorThread` is the sole Registry mutation in any recovery path. It is guarded by drift validation (`assertBootstrapAuthorityMatchesRegistry`) immediately prior to execution.
 
-### 1.4. Runtime composition authority (Corrected for R1)
+### 1.4. Runtime composition & phase authority (Revision 2)
 
 **Correction**: `createBrokerRuntime` (`pipeline-ui/lib/broker/runtime.js`) is NOT the auditor recovery runtime. It creates and exposes:
 ```javascript
@@ -219,8 +240,27 @@ Authority defaults:
 - Registry: `createProjectRegistry()` -> defaults to `~/.orchestrator/projects.json`
 - Recovery store: `createSqliteAuditorRecoveryStore()` -> defaults to `~/.orchestrator/auditor-recovery.sqlite3`
 
-**CLI Runtime Factory**:
-A CLI-local factory `createAuditorRecoveryCliRuntime(options)` shall be defined in `pipeline-ui/auditor-recover-cli.js`. It exposes at minimum:
+**Runtime Initialization Phase Authority**:
+Runtime initialization is a distinct lifecycle phase. Any error thrown during runtime construction maps unconditionally to **exit 11**:
+```javascript
+let runtime;
+try {
+  runtime = await createAuditorRecoveryCliRuntime(options);
+} catch (err) {
+  return {
+    exitCode: 11,
+    response: {
+      ok: false,
+      operation: options.operation || 'init',
+      code: err.code || 'CLI_RUNTIME_INITIALIZATION_FAILURE',
+      error: err.message
+    }
+  };
+}
+```
+This applies whether the error code is `REGISTRY_CORRUPT`, `REGISTRY_SCHEMA_INVALID`, `REGISTRY_MIGRATION_REQUIRED`, `AUDITOR_RECOVERY_CORRUPT`, `AUDITOR_RECOVERY_SCHEMA_INVALID`, `AUDITOR_RECOVERY_CLOSED`, or any other initialization failure. Initialization errors are NEVER sent to the operational fallback (exit 12).
+
+The CLI runtime factory exposes at minimum:
 ```javascript
 {
   registryPort,
@@ -236,23 +276,43 @@ Contract:
 - Does NOT instantiate the generic broker.
 - Test-only dependency injection is accepted through the programmatic `options` object.
 
-### 1.5. Adapter factory contract
+### 1.5. Adapter factory contract (Revision 2)
 
-The production adapter factory creates a fresh `CodexAuditorAdapter` for provider operations:
+The lifecycle authority calls `adapterFactory` with an object containing `phase` and canonical `cwd`:
+```javascript
+adapterFactory({
+  phase: 'resume_verify', // or 'uncertainty_inspect'
+  cwd: verifiedAuthority.canonicalProjectRoot
+})
+```
+
+Production factory implementation:
 ```javascript
 function createAuditorAdapterFactory(options = {}) {
-  return (canonicalCwd) => {
+  const adapterOptions = {
+    ...(options.adapterOptions || {})
+  };
+
+  return async ({ phase, cwd } = {}) => {
+    if (typeof cwd !== 'string' || !cwd.trim()) {
+      const err = new Error('Lifecycle canonical cwd is required');
+      err.code = 'AUDITOR_CLI_RUNTIME_INVALID_CWD';
+      throw err;
+    }
+
     return new CodexAuditorAdapter({
-      cwd: canonicalCwd,
-      ...options.adapterOptions
+      ...adapterOptions,
+      cwd
     });
   };
 }
 ```
-Contract:
-- Lifecycle-supplied canonical `cwd` is passed into adapter/client construction.
-- Default transport: `codex app-server --listen stdio://`. `CodexAppServerClient` already defaults to these App Server arguments.
-- No CLI flag may override: `codex` binary, `cwd`, `thread_id`, `turn_id`, `model`, or `effort`.
+
+Contract rules:
+1. Ordering: `...adapterOptions` THEN `cwd`. The lifecycle-provided canonical `cwd` strictly takes precedence over any `adapterOptions.cwd` passed in programmatic/test options.
+2. `phase` may be logged or inspected in test assertions, but must NOT alter thread identity, cwd, model, or effort.
+3. Transport: `codex app-server --listen stdio://` (default `CodexAppServerClient` construction).
+4. No CLI flag may override: `codex` binary, `cwd`, `thread_id`, `turn_id`, `model`, or `effort`.
 
 ### 1.6. Existing broker CLI patterns
 
@@ -262,7 +322,7 @@ Establishes patterns replicated in `auditor-recover-cli.js`:
 - Strict argument parser rejecting unknown commands, unknown flags, duplicates, and positional arguments.
 - Machine-readable JSON stdout for all output including errors.
 - `FORBIDDEN_FLAGS` set blocking routing/execution overrides.
-- Error mapping driven by `err.code`, never by regex matching on `err.message`.
+- Operational error mapping driven by `err.code`, never by regex matching on `err.message`.
 - Stderr for diagnostics only.
 - Guaranteed runtime cleanup in `finally` blocks.
 
@@ -296,7 +356,7 @@ Forbidden:   --thread-id --turn-id --decision --turn-status --project-root
              --cwd --model --effort --operation-id
 JSON stdout: see §3.1
 Stderr:      diagnostic only (no secrets)
-Exits:       0, 2, 6, 8, 11, 12
+Exits:       0, 1, 2, 6, 8, 11, 12
 Mutates:     NO
 Operator intent required: NO
 ```
@@ -313,7 +373,7 @@ Forbidden:   --thread-id --turn-id --decision --turn-status --project-root
              --cwd --model --effort --operation-id
 JSON stdout: see §3.2
 Stderr:      diagnostic only (no secrets)
-Exits:       0, 2, 5, 6, 8, 9, 10, 11, 12
+Exits:       0, 1, 2, 5, 6, 8, 9, 10, 11, 12
 Mutates:     YES (recovery store; conditionally binds Registry in validated/verified/binding states)
 Operator intent required: YES (caller must understand this may bind Registry)
 ```
@@ -332,7 +392,7 @@ Forbidden:   --thread-id --turn-id --decision --turn-status --project-root
              --cwd --model --effort --operation-id
 JSON stdout: see §3.3
 Stderr:      diagnostic only (no secrets)
-Exits:       0, 2, 5, 6, 8, 11, 12
+Exits:       0, 1, 2, 5, 6, 8, 11, 12
 Mutates:     YES (0 or 1 transition depending on provider response)
 Operator intent required: YES (spawns provider connection)
 ```
@@ -351,7 +411,7 @@ Forbidden:   --thread-id --turn-id --decision --operation-id
              --project-root --cwd --model --effort
 JSON stdout: see §3.4
 Stderr:      diagnostic only
-Exits:       0, 2, 6, 8, 11, 12
+Exits:       0, 1, 2, 6, 8, 11, 12
 Mutates:     YES (appends LEGACY_AUTHORITY_RETIRED history + deletes active row)
 Operator intent required: YES (--confirm presence flag required)
 ```
@@ -544,7 +604,19 @@ The `decision` object (AuditDecisionV1) is NEVER emitted. Only `decision_sha256`
 
 ### 3.5. Error schemas (all commands)
 
-**Standard Structured Error (exits 2, 6, 8, 9, 10, 11)**:
+**Top-Level Process Error (exit 1 — TOP_LEVEL_UNEXPECTED_FAILURE)**:
+Trapped by the process entry boundary for uncaught exceptions:
+```json
+{
+  "ok": false,
+  "operation": "cli",
+  "code": "TOP_LEVEL_UNEXPECTED_FAILURE",
+  "error": "An unexpected process failure occurred"
+}
+```
+Rules: sets `process.exitCode = 1`, emits one JSON object to stdout, no raw stack trace.
+
+**Standard Structured Error (exits 2, 6, 8, 9, 10)**:
 ```json
 {
   "ok": false,
@@ -555,8 +627,19 @@ The `decision` object (AuditDecisionV1) is NEVER emitted. Only `decision_sha256`
 }
 ```
 
-**Unmapped Structured Error Fallback (exit 12 — CLI_RUNTIME_FAILURE)**:
-When an error carries a machine-readable `.code` that is not explicitly in the exit map:
+**Runtime Initialization Error (exit 11 — CLI_RUNTIME_INITIALIZATION_FAILURE)**:
+Emitted when runtime creation fails in the init phase:
+```json
+{
+  "ok": false,
+  "operation": "init",
+  "code": "AUDITOR_RECOVERY_SCHEMA_INVALID",
+  "error": "Recovery store schema version mismatch"
+}
+```
+
+**Operational Unmapped Structured Error Fallback (exit 12 — CLI_RUNTIME_FAILURE)**:
+When an operational error (after successful init) carries a machine-readable `.code` that is not explicitly in the exit map:
 ```json
 {
   "ok": false,
@@ -611,23 +694,23 @@ Any token not starting with `--` (positional arguments) is forbidden after the c
 
 ## 5. Exit-Code Matrix
 
-Exit codes are derived exclusively from `result.status` or `err.code`. Exit codes are NEVER derived by parsing `reason`, `error`, or `message` string content.
+Exit codes are derived exclusively from lifecycle phase, `result.status`, or structured `err.code`. Exit codes are NEVER derived by parsing `reason`, `error`, or `message` string content.
 
 | Exit | Classification | Semantic | Trigger Condition |
 |---|---|---|---|
 | `0` | Success | Command completed successfully | Success outcome; `recover` returns `NO_ACTIVE_BOOTSTRAP` |
-| `1` | Reserved | Unhandled Node.js process exception | Intentionally unused by CLI logic (signals uncaught crash) |
+| `1` | Process error | Top-level unexpected failure | Uncaught exception caught at process boundary (`TOP_LEVEL_UNEXPECTED_FAILURE`), JSON stdout, no stack trace |
 | `2` | CLI/process error | Invalid CLI request | Unknown command, unknown/duplicate/forbidden flag, bounds failure |
 | `3` | **RESERVED** | `RESERVED_NOT_CURRENTLY_EMITTED` | No lifecycle path emits structured code at CLI boundary (wrapped as PRECONDITION_FAILED exit 6) |
 | `4` | **RESERVED** | `RESERVED_NOT_CURRENTLY_EMITTED` | No lifecycle path emits structured code at CLI boundary (resolve/retire throw PRECONDITION_FAILED exit 6; recover returns exit 0) |
 | `5` | **Semantic uncertain** | Semantic hold — AUDIT_UNCERTAIN | Result status `AUDIT_UNCERTAIN` (including provider inspection failure) |
 | `6` | Lifecycle error | Precondition failure | `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (no active bootstrap in resolve/retire; project missing in recover/resolve/retire; drift/unbound mismatch) |
 | `7` | **RESERVED** | `RESERVED_NOT_CURRENTLY_EMITTED` | Provider readThread failure returns status `AUDIT_UNCERTAIN` (exit 5), not thrown error |
-| `8` | Lifecycle error | Recovery corrupt | `AUDITOR_RECOVERY_CORRUPT` |
+| `8` | Lifecycle error | Recovery corrupt | `AUDITOR_RECOVERY_CORRUPT` (during command execution) |
 | `9` | Lifecycle error | Resume verification failure | `AUDITOR_LIFECYCLE_RESUME_VERIFY_FAILED` |
 | `10` | Lifecycle error | Registry bind failure | `AUDITOR_LIFECYCLE_REGISTRY_BIND_FAILED` |
-| `11` | Lifecycle error | Runtime initialization failure | CLI cannot initialize SQLite recovery store or Registry |
-| `12` | **Runtime fallback** | Unmapped structured error (`CLI_RUNTIME_FAILURE`) | Unmapped `.code` (e.g. `AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT`) |
+| `11` | **Runtime init error** | Runtime initialization failure | Any error during `createAuditorRecoveryCliRuntime()` construction (e.g. `REGISTRY_CORRUPT`, `AUDITOR_RECOVERY_SCHEMA_INVALID`) |
+| `12` | **Runtime fallback** | Operational unmapped structured error (`CLI_RUNTIME_FAILURE`) | Unmapped operational `.code` during command execution (e.g. `AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT`) |
 
 **Clarifications on Reserved Exits**:
 - **Exit 3 & 4**: Neither the recovery store nor the lifecycle module exposes distinct machine-readable error codes `PROJECT_NOT_FOUND` or `NO_ACTIVE_BOOTSTRAP` as thrown exceptions across the CLI boundary. In `resolve-uncertainty` and `retire-legacy`, missing active records throw `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (exit 6). In `recover`, missing active records return `{ ok: true, status: 'NO_ACTIVE_BOOTSTRAP' }` (exit 0). In `recover`, `resolve-uncertainty`, and `retire-legacy`, missing projects throw `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (exit 6). Exits 3 and 4 are therefore designated `RESERVED_NOT_CURRENTLY_EMITTED`.
@@ -678,7 +761,7 @@ Exit codes are derived exclusively from `result.status` or `err.code`. Exit code
 11. `decision` (the AuditDecisionV1 object) is NEVER emitted.
 12. `registry_project` (the raw Registry project record) is NEVER forwarded to JSON output.
 13. Only `has_decision` (bool derived from `decision_json !== null`) and `decision_sha256` (hex string) describe decision presence in inspect output.
-14. Exit codes are derived from `result.status` or `err.code` — never from parsing `reason`, `error`, or `message` text.
+14. Exit codes are derived from lifecycle phase, `result.status`, or `err.code` — never from parsing `reason`, `error`, or `message` text.
 15. No secrets (API tokens, environment variables, registry `worker.session_id`) appear in any output.
 
 ### 7.3. Execution surface & runtime composition
@@ -689,6 +772,7 @@ Exit codes are derived exclusively from `result.status` or `err.code`. Exit code
 20. No replacement thread creation.
 21. No automatic legacy retirement from `recover`. `retire-legacy` is always an explicit operator action.
 22. Runtime is composed directly from `createProjectRegistry()`, `createSqliteAuditorRecoveryStore()`, and `CodexAuditorAdapter`. `createBrokerRuntime` is NOT used.
+23. Lifecycle-supplied canonical `cwd` takes absolute precedence in `adapterFactory`, overriding any caller/test options.
 
 ---
 
@@ -700,7 +784,7 @@ All tests are deterministic. No real model turns, no real provider connections, 
 
 `pipeline-ui/test/refactor/auditor-recover-cli.test.js`
 
-### 8.2. Test matrix (ARC-001..ARC-054)
+### 8.2. Test matrix (ARC-001..ARC-058)
 
 | Test ID | Scenario | Expected Exit | Expected Status / Code / Assertion |
 |---|---|---|---|
@@ -757,28 +841,32 @@ All tests are deterministic. No real model turns, no real provider connections, 
 | ARC-051 | Unknown command | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-052 | No command at all | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-053 | inspect — no `decision_json` field in `history` entries | 0 | verified by output key inspection |
-| ARC-054 | unmapped structured error fallback | 12 | `code: AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT` preserved, no stack trace, classification `CLI_RUNTIME_FAILURE` |
+| ARC-054 | unmapped operational structured error fallback | 12 | `code: AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT` preserved, no stack trace, classification `CLI_RUNTIME_FAILURE` |
+| ARC-055 | adapterFactory receives `{ phase, cwd }` signature | 0 | created adapter receives exact `cwd = '/canonical/project'`, not object or undefined |
+| ARC-056 | adapterFactory authority cwd overrides injected `adapterOptions.cwd` | 0 | created adapter `cwd` matches lifecycle canonical root, not `/attacker/override` |
+| ARC-057 | runtime factory throws `AUDITOR_RECOVERY_SCHEMA_INVALID` | 11 | `code: AUDITOR_RECOVERY_SCHEMA_INVALID`, one JSON object, no stack trace |
+| ARC-058 | runtime factory throws `REGISTRY_CORRUPT` | 11 | `code: REGISTRY_CORRUPT`, one JSON object, no stack trace |
 
-Total planned count: **54 tests** (ARC-001 .. ARC-054).
+Total planned count: **58 tests** (ARC-001 .. ARC-058).
 
 ### 8.3. Test infrastructure requirements
 
 - Lifecycle functions injected via programmatic `options` object pattern.
-- `adapterFactory` is a controlled stub returning mock provider clients.
+- `adapterFactory` is a controlled stub returning mock provider clients, validating call signature `{ phase, cwd }`.
 - `registryPort` is a controlled stub with configurable project fixtures and call recording.
 - `recoveryStore` uses `createSqliteAuditorRecoveryStore` with temporary directory file backing.
-- Each test suite run emits `ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-054: 54/54 PASS)` on success.
+- Each test suite run emits `ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-058: 58/58 PASS)` on success.
 
 ---
 
 ## 9. Implementation File Plan
 
-No production code is modified in WO-V4-07A-R1. The following files will be created or modified in WO-V4-07B:
+No production code is modified in WO-V4-07A-R2. The following files will be created or modified in WO-V4-07B:
 
 | File | Action | Purpose |
 |---|---|---|
-| `pipeline-ui/auditor-recover-cli.js` | NEW | CLI entry point: strict parser, runtime composition (`createAuditorRecoveryCliRuntime`), adapter factory, explicit output projection, exit mapping, command dispatch, guaranteed runtime close |
-| `pipeline-ui/test/refactor/auditor-recover-cli.test.js` | NEW | Deterministic test suite ARC-001..ARC-054 |
+| `pipeline-ui/auditor-recover-cli.js` | NEW | CLI entry point: strict parser, runtime composition (`createAuditorRecoveryCliRuntime`), adapter factory, explicit output projection, exit mapping, command dispatch, top-level error boundary, guaranteed runtime close |
+| `pipeline-ui/test/refactor/auditor-recover-cli.test.js` | NEW | Deterministic test suite ARC-001..ARC-058 |
 | `pipeline-ui/package.json` | MODIFY `scripts.test` | Append `auditor-recover-cli.test.js` to the test chain |
 | `docs/.../15-IMPLEMENTATION-PLAN.md` | MODIFY | Update to reflect WP-V4-07B scope |
 
@@ -797,19 +885,16 @@ If implementation in 07B requires changes to any of the above files, STOP immedi
 
 All questions are classified as `RESOLVED_FOR_07B`.
 
-### Q1 — Auditor recovery runtime composition and adapterFactory in production
+### Q1 — Auditor recovery runtime composition, phase authority, and adapterFactory signature
 
 **Status**: `RESOLVED_FOR_07B`
 
 **Resolution**:
-`createBrokerRuntime` (`pipeline-ui/lib/broker/runtime.js`) is NOT used as the auditor recovery runtime. Its `lifecycleStore` is the worker/broker lifecycle store, not `sqlite-auditor-recovery-store`.
-
-Instead, the recovery CLI directly composes:
-1. `createProjectRegistry()` (default `~/.orchestrator/projects.json`)
-2. `createSqliteAuditorRecoveryStore()` (default `~/.orchestrator/auditor-recovery.sqlite3`)
-3. `createAuditorAdapterFactory()`: creates fresh `CodexAuditorAdapter` instances passing lifecycle-supplied canonical `cwd`. Default command: `codex app-server --listen stdio://`.
-
-Factory `createAuditorRecoveryCliRuntime(options)` will live in `pipeline-ui/auditor-recover-cli.js`. Its `close()` method closes the recovery store. The generic broker and worker lifecycle store are not instantiated. Test-only dependency injection is supported via the `options` argument.
+1. `createBrokerRuntime` (`pipeline-ui/lib/broker/runtime.js`) is NOT used as the auditor recovery runtime. Its `lifecycleStore` is the worker/broker lifecycle store, not `sqlite-auditor-recovery-store`.
+2. The recovery CLI directly composes `createProjectRegistry()`, `createSqliteAuditorRecoveryStore()`, and `createAuditorAdapterFactory()`.
+3. Runtime initialization is an explicit phase: any construction error maps to **exit 11**.
+4. `createAuditorAdapterFactory` accepts `{ phase, cwd } = {}` as invoked by lifecycle authority. Construction enforces `...adapterOptions` THEN `cwd` so lifecycle canonical `cwd` authority cannot be overridden.
+5. Top-level unexpected process failure is caught by an entry boundary emitting exit 1 with bounded JSON and no stack trace.
 
 ### Q2 — registry_binding_state vocabulary
 
