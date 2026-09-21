@@ -1,28 +1,42 @@
-# WO-V4-07A CLI DESIGN — Audit / Recover CLI Contract
+# WO-V4-07A CLI DESIGN — Audit / Recover CLI Contract (Revision 1)
 
-- **Work Order**: WO-V4-07A-PUB (publication gate revision)
-- **Parent Commit**: `119e93f96b8e5eddaf81b8ddefba4b485c76f554`
+- **Work Order**: WO-V4-07A-R1 (runtime composition / exact error semantics / mutation-matrix correction)
+- **Correction Parent**: `07b2604497c31e2480f172f3aed6f09bc6383109`
+- **Authoritative Implementation Source Baseline**: `119e93f96b8e5eddaf81b8ddefba4b485c76f554`
 - **Status**: DESIGN / CONTRACT ONLY — No production code modified
 - **WP-V4-06**: `COMPLETE`
-- **WP-V4-07**: `DESIGN_IN_REVIEW`
+- **WP-V4-07A**: `BLOCKED_PENDING_R1_EXTERNAL_REVIEW`
+- **WP-V4-07B**: `NOT_STARTED`
 
 ---
 
 ## Source-Alignment Gate Results
 
-The following defects were identified and corrected before publication:
+The following architectural and semantic corrections are established in Revision 1:
 
-**Gate A — CLI outputs are projections**: `registry_project` is a raw return field of `inspectAuditorBootstrap()` but is explicitly NOT forwarded to CLI JSON output. Only an approved projected field set is emitted. `decision_json`, `validated_decision`, and `decision` are never emitted in any path. `worker.session_id` is not emitted. Corrected in §3.1 with explicit allowlist documentation.
+**Gate A — CLI outputs are projections, never raw lifecycle results**: CLI commands project strictly defined allowlists. Never use `{ ...lifecycleResult }`. Raw lifecycle return fields such as `registry_project`, `decision_json`, `validated_decision`, and `decision` (AuditDecisionV1) are NEVER emitted in any output channel. `worker.session_id` is never emitted.
 
-**Gate B — inspect Registry limitation**: `inspectAuditorBootstrap()` silences Registry read exceptions and maps both "Registry unavailable" and "project not found" to `registry_binding_state: PROJECT_NOT_FOUND`. The CLI cannot and does not distinguish `REGISTRY_UNAVAILABLE` from `PROJECT_NOT_FOUND`. The exit-code matrix does not assign a distinct code for Registry unavailability in the inspect path. Documented explicitly in §3.1 and §5.
+**Gate B — inspect Registry limitation**: `inspectAuditorBootstrap()` silences Registry read exceptions and maps both Registry unavailability and missing project to `registry_binding_state: PROJECT_NOT_FOUND` (exit 0). The CLI does not invent a distinct `REGISTRY_UNAVAILABLE` exit or state.
 
-**Gate C — provider inspection failure remains AUDIT_UNCERTAIN**: `resolveAuditorBootstrapUncertainty()` on provider `readThread` failure returns `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: '...' }` — it does NOT throw a distinct provider-unavailable error. Therefore, provider inspection failure belongs at **exit 5** (AUDIT_UNCERTAIN semantic hold), not at a separate provider exit. Exit 7 has been removed from the matrix. The `reason` string prefix is NOT parsed to derive exit authority.
+**Gate C — provider inspection failure remains AUDIT_UNCERTAIN**: `resolveAuditorBootstrapUncertainty()` on provider `readThread` failure returns `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: '...' }` — it does NOT throw a distinct error. Therefore, provider inspection failure maps to **exit 5** (semantic AUDIT_UNCERTAIN hold). Reason string prefixes are NOT parsed to derive exit authority.
 
-**Gate D — NO_ACTIVE_BOOTSTRAP is successful/idempotent**: `recover` and `retire-legacy` return `ok: true, status: 'NO_ACTIVE_BOOTSTRAP'` when no active bootstrap exists. This is exit 0.
+**Gate D — Source-exact no-active semantics**:
+The three lifecycle commands do NOT share identical no-active behavior:
+1. `recover`: `recoverAuditorBootstrap()` returns `{ ok: true, status: 'NO_ACTIVE_BOOTSTRAP' }`. The CLI emits `status: 'NO_ACTIVE_BOOTSTRAP'` and exits **0** (idempotent success, ARC-013).
+2. `resolve-uncertainty`: throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` when no active bootstrap exists. The CLI exits **6** with `code: 'AUDITOR_LIFECYCLE_PRECONDITION_FAILED'` (ARC-031). It is NOT transformed into `NO_ACTIVE_BOOTSTRAP` / exit 4.
+3. `retire-legacy`: throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` when no active bootstrap exists. The CLI exits **6** with `code: 'AUDITOR_LIFECYCLE_PRECONDITION_FAILED'` (ARC-045). Gate-D claims of successful `NO_ACTIVE_BOOTSTRAP` return for retire-legacy are deleted.
 
-**Gate E — legacy retirement is explicit only**: `retire-legacy` requires `--confirm`. It delegates exclusively to `retireLegacyAuditorBootstrapWithoutAuthority`. `recover` never auto-retires legacy authority.
+**Gate E — No preflight authority duplication**: The CLI never performs an out-of-band `recoveryStore.getActiveBootstrap()` or pre-reads Registry prior to invoking lifecycle functions solely to manufacture custom error classifications. Doing so would introduce Time-Of-Check-To-Time-Of-Use (TOCTOU) hazards. Lifecycle API remains the sole authority.
 
-**Open Questions**: All four resolved in §10.
+**Gate F — Correct project-not-found semantics**: In `recover`, `resolve-uncertainty`, and `retire-legacy`, missing or unreadable Registry projects are wrapped by the lifecycle as `AUDITOR_LIFECYCLE_PRECONDITION_FAILED`. The CLI does not examine error message text to manufacture `PROJECT_NOT_FOUND`. Missing project in these paths exits **6** (`AUDITOR_LIFECYCLE_PRECONDITION_FAILED`). `inspect` remains the sole exception because the lifecycle returns `registry_binding_state: 'PROJECT_NOT_FOUND'` at exit 0.
+
+**Gate G — Direct auditor recovery runtime composition**: `createBrokerRuntime` (`pipeline-ui/lib/broker/runtime.js`) is NOT the auditor recovery runtime. Its `lifecycleStore` is the worker/broker lifecycle store, not `sqlite-auditor-recovery-store`. WP-V4-07B composes the runtime directly via `createAuditorRecoveryCliRuntime(options)` using `createProjectRegistry()`, `createSqliteAuditorRecoveryStore()`, and `CodexAuditorAdapter`.
+
+**Gate H — Exit matrix alignment & unmapped error fallback**:
+- Exits `3`, `4`, and `7` are `RESERVED_NOT_CURRENTLY_EMITTED` because current lifecycle code produces no structured error codes mapping to them at the CLI boundary.
+- An unmapped structured error fallback is established at **exit 12** (`CLI_RUNTIME_FAILURE`). Safe machine-readable `code` is preserved in JSON output, raw stack traces are never exposed, and fallback is never derived from message text.
+
+**Gate I — Correct mutation matrix**: Bind-capable recover paths (`DECISION_VALIDATED`, `RESUME_VERIFYING`, `RESUME_VERIFIED`, `REGISTRY_BINDING`) have `Registry YES, CONDITIONAL` — `bindAuditorThread` executes if the Registry is not already bound to the exact same thread; if already bound, Registry write is skipped idempotently while active recovery is cleared.
 
 ---
 
@@ -36,15 +50,14 @@ Exports four externally callable lifecycle APIs:
 
 | Function | Sync/Async | Provider calls | Recovery-store mutations | Registry reads | Registry mutations |
 |---|---|---|---|---|---|
-| `inspectAuditorBootstrap` | async | none | none | 1 read (optional, best-effort) | none |
-| `recoverAuditorBootstrap` | async | 1 x adapterFactory + resumeThread (cases 3-5 only) | deleteActiveBootstrap / transitionBootstrap | 1-2 reads (cases 1b, 3-5) | 1 x bindAuditorThread (case 5 only) |
-| `resolveAuditorBootstrapUncertainty` | async | 1 x adapterFactory + readThread (non-mutating provider read) | 0 or 1 x transitionBootstrap | 1 read | none |
+| `inspectAuditorBootstrap` | async | none | none | 1 read (best-effort) | none |
+| `recoverAuditorBootstrap` | async | 1 x adapterFactory + resumeThread (cases 3-4) | deleteActiveBootstrap / transitionBootstrap | 1-2 reads (cases 1b, 3-5) | 1 x bindAuditorThread (conditional, cases 3-5) |
+| `resolveAuditorBootstrapUncertainty` | async | 1 x adapterFactory + readThread (non-mutating read) | 0 or 1 x transitionBootstrap | 1 read | none |
 | `retireLegacyAuditorBootstrapWithoutAuthority` | async | none | 1 x retireLegacyBootstrap | 1 read | none |
 
 #### API classification detail
 
 **`inspectAuditorBootstrap(options)`**
-
 ```
 read-only:               YES
 recovery-store mutation: NO
@@ -53,41 +66,32 @@ provider read:           NO
 provider side effect:    NO
 model turn:              NO
 ```
-
-Reads `recoveryStore.getActiveBootstrap(projectId)` and `recoveryStore.getBootstrapHistory(projectId)`, then optionally reads the Registry project to classify `registry_binding_state`. Raw return shape from lifecycle:
-```
-{ project_id, active_bootstrap, history, registry_binding_state, registry_project }
-```
-
-The CLI projects ONLY an approved field subset into JSON output. `registry_project` is never forwarded. See §3.1 for the exact output allowlist.
-
-Registry read behavior: Failures in the Registry read (including exceptions and project-not-found) are both silenced by the lifecycle function and mapped to `registry_binding_state = 'PROJECT_NOT_FOUND'`. The CLI cannot distinguish `REGISTRY_UNAVAILABLE` from `PROJECT_NOT_FOUND` via this API. No CLI exit code claims this distinction. If the distinction is needed in a future implementation, it requires a separate lifecycle API enhancement with a machine-readable classification field.
+Reads `recoveryStore.getActiveBootstrap(projectId)` and `recoveryStore.getBootstrapHistory(projectId)`, then optionally reads the Registry project to classify `registry_binding_state`.
+- Missing active bootstrap: returns `{ project_id, active_bootstrap: null, history, registry_binding_state }`.
+- Missing or failing Registry read: silently caught and mapped to `registry_binding_state: 'PROJECT_NOT_FOUND'`.
+- Raw lifecycle return includes `registry_project`, which is NEVER forwarded to CLI output.
 
 **`recoverAuditorBootstrap(options)`**
-
 ```
-read-only:               NO (cases PROVISIONAL, FIRST_TURN_*, DECISION_VALIDATED..REGISTRY_BINDING mutate recovery store)
-recovery-store mutation: YES — deleteActiveBootstrap or transitionBootstrap (state-dependent)
-Registry mutation:       YES — bindAuditorThread (REGISTRY_BINDING case only)
-provider read:           YES — resumeThread (RESUME_VERIFYING case, non-model)
+read-only:               NO (mutates recovery store; conditionally mutates Registry)
+recovery-store mutation: YES — deleteActiveBootstrap or transitionBootstrap
+Registry mutation:       YES, CONDITIONAL — bindAuditorThread (DECISION_VALIDATED..REGISTRY_BINDING)
+provider read:           YES — resumeThread (non-model)
 provider side effect:    NO (no turn/start)
 model turn:              NO
 ```
-
 State to action mapping:
-- `PROVISIONAL_THREAD` -> deleteActiveBootstrap (no provider calls, no Registry reads)
-- `FIRST_TURN_STARTING`, `FIRST_TURN_IN_FLIGHT` -> transitionBootstrap(..., AUDIT_UNCERTAIN) (no provider calls, no Registry reads)
-- `AUDIT_UNCERTAIN` (already) -> return AUDIT_UNCERTAIN status (no mutation)
-- `AUDIT_TERMINAL_NO_DECISION` -> verifies Registry unbound, then deleteActiveBootstrap
-- `DECISION_VALIDATED` -> transitionBootstrap(RESUME_VERIFYING) + provider resumeThread + transitionBootstrap(RESUME_VERIFIED) + proceeds to REGISTRY_BINDING
-- `RESUME_VERIFYING` -> provider resumeThread + transitionBootstrap(RESUME_VERIFIED) + proceeds to REGISTRY_BINDING
-- `RESUME_VERIFIED` -> transitionBootstrap(REGISTRY_BINDING) + REGISTRY_BINDING
-- `REGISTRY_BINDING` -> drift check, then bindAuditorThread + deleteActiveBootstrap
-
-Requires `authority_version === 1` for states `DECISION_VALIDATED..REGISTRY_BINDING`; throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` for `authority_version === 0`.
+- No active bootstrap: returns `{ ok: true, status: 'NO_ACTIVE_BOOTSTRAP', project_id }`. No throw. Exit 0.
+- `PROVISIONAL_THREAD`: calls `deleteActiveBootstrap`. Returns `status: 'RECOVERED_CLEARED'`. Exit 0.
+- `FIRST_TURN_STARTING`, `FIRST_TURN_IN_FLIGHT`: calls `transitionBootstrap(..., AUDIT_UNCERTAIN)`. Returns `status: 'AUDIT_UNCERTAIN'`. Exit 5.
+- `AUDIT_UNCERTAIN`: returns `status: 'AUDIT_UNCERTAIN'`. No mutation. Exit 5.
+- `AUDIT_TERMINAL_NO_DECISION`: reads Registry project; if missing, throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (exit 6). Verifies auditor is unbound; calls `deleteActiveBootstrap`. Returns `status: 'RECOVERED_TERMINAL_NO_DECISION_CLEARED'`. Exit 0.
+- `DECISION_VALIDATED`: requires `authority_version === 1`. Transitions to `RESUME_VERIFYING`, calls provider `resumeThread`, transitions to `RESUME_VERIFIED`, transitions to `REGISTRY_BINDING`, verifies drift, calls `bindAuditorThread` if Registry is not already bound to exact same thread, calls `deleteActiveBootstrap`. Returns `status: 'DURABLE_BOUND'`. Exit 0.
+- `RESUME_VERIFYING`: resumes from verification step; calls provider `resumeThread`, transitions to `RESUME_VERIFIED`, transitions to `REGISTRY_BINDING`, conditional `bindAuditorThread`, `deleteActiveBootstrap`. Returns `status: 'DURABLE_BOUND'`. Exit 0.
+- `RESUME_VERIFIED`: transitions to `REGISTRY_BINDING`, conditional `bindAuditorThread`, `deleteActiveBootstrap`. Returns `status: 'DURABLE_BOUND'`. Exit 0.
+- `REGISTRY_BINDING`: drift check, conditional `bindAuditorThread` (skipped if already bound to same thread), `deleteActiveBootstrap`. Returns `status: 'DURABLE_BOUND'`. Exit 0.
 
 **`resolveAuditorBootstrapUncertainty(options)`**
-
 ```
 read-only:               NO (may write DECISION_VALIDATED or AUDIT_TERMINAL_NO_DECISION)
 recovery-store mutation: YES — 0 or 1 x transitionBootstrap
@@ -96,21 +100,24 @@ provider read:           YES — readThread (non-model read-only provider call)
 provider side effect:    NO
 model turn:              NO
 ```
+Preconditions enforced by lifecycle (all throw `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` / exit 6):
+- Registry project exists (if missing or read fails: throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED`).
+- Project auditor is unbound (`thread_id === null`, `enabled === false`).
+- Active bootstrap exists (if missing: throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` with `'No active bootstrap record found...'`).
+- Active bootstrap state is `AUDIT_UNCERTAIN`.
+- `authority_version === 1`.
+- Expected project root matches Registry.
 
-Preconditions: active bootstrap in `AUDIT_UNCERTAIN`, Registry project exists, auditor unbound, `authority_version === 1`. Spawns a fresh provider client, calls `readThread({ includeTurns: true })`, closes client unconditionally in `finally`. Caller-supplied `threadId`, `turnId`, `turnStatus`, or `decision` are explicitly forbidden.
-
-Outcome classification (all returned as structured result objects, never thrown):
-- Provider `readThread` fails -> `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'PROVIDER_INSPECTION_FAILED: ...' }` — no recovery-store mutation. Maps to exit 5.
-- Thread ID mismatch -> `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'THREAD_ID_MISMATCH: ...' }` — no mutation. Exit 5.
-- Turn history invalid -> `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'TURN_HISTORY_INVALID: ...' }` — no mutation. Exit 5.
-- `interrupted`/`failed` turn -> AUDIT_TERMINAL_NO_DECISION (recovery-store mutation). Exit 0.
-- `completed` turn with valid decision -> DECISION_VALIDATED (recovery-store mutation). Exit 0.
-- non-terminal / unrecognized status -> `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'TURN_NONTERMINAL: ...' }` — no mutation. Exit 5.
-
-The CLI reads `status` from the returned object to determine exit code. The `reason` string prefix is NOT parsed to derive exit authority.
+Outcomes returned as structured objects:
+- `turn_id` missing / empty -> returns `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'TURN_HISTORY_INVALID: ...' }`. Exit 5.
+- Provider `readThread` fails -> returns `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'PROVIDER_INSPECTION_FAILED: ...' }`. Exit 5.
+- Thread ID mismatch -> returns `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'THREAD_ID_MISMATCH: ...' }`. Exit 5.
+- Turn count != 1 -> returns `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'TURN_HISTORY_INVALID: ...' }`. Exit 5.
+- `interrupted` or `failed` turn -> transitions to `AUDIT_TERMINAL_NO_DECISION`. Returns `ok: true, status: 'AUDIT_TERMINAL_NO_DECISION'`. Exit 0.
+- `completed` turn + valid decision -> transitions to `DECISION_VALIDATED`. Returns `ok: true, status: 'DECISION_VALIDATED'`. Exit 0.
+- Non-terminal / unrecognized turn status -> returns `{ ok: false, status: 'AUDIT_UNCERTAIN', reason: 'TURN_NONTERMINAL: ...' }`. Exit 5.
 
 **`retireLegacyAuditorBootstrapWithoutAuthority(options)`**
-
 ```
 read-only:               NO
 recovery-store mutation: YES — retireLegacyBootstrap (appends history -> LEGACY_AUTHORITY_RETIRED, deletes active row)
@@ -119,8 +126,12 @@ provider read:           NO
 provider side effect:    NO
 model turn:              NO
 ```
-
-Preconditions: active bootstrap with `authority_version === 0`, Registry project exists and auditor is unbound (`thread_id === null`, `enabled === false`). The `operation_id` is read internally from `recoveryStore.getActiveBootstrap`; no caller supply permitted.
+Preconditions enforced by lifecycle (all throw `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` / exit 6):
+- Active bootstrap exists (if missing: throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` with `'No active bootstrap found...'`).
+- `authority_version === 0` (if not 0: throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED`).
+- Registry project exists (if missing or read fails: throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED`).
+- Auditor is unbound in Registry (`thread_id === null`, `enabled === false`).
+- Operation ID is derived internally from active record; caller supply is forbidden.
 
 ### 1.2. Recovery store
 
@@ -130,8 +141,18 @@ Key state constants:
 ```
 PROVISIONAL_THREAD       FIRST_TURN_STARTING      FIRST_TURN_IN_FLIGHT
 DECISION_VALIDATED       RESUME_VERIFYING         RESUME_VERIFIED
-REGISTRY_BINDING         AUDIT_UNCERTAIN           AUDIT_TERMINAL_NO_DECISION
+REGISTRY_BINDING         AUDIT_UNCERTAIN          AUDIT_TERMINAL_NO_DECISION
 LEGACY_AUTHORITY_RETIRED
+```
+
+Error codes (`RECOVERY_ERROR_CODES`):
+```
+AUDITOR_RECOVERY_NOT_FOUND
+AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT
+AUDITOR_RECOVERY_INVALID_REQUEST
+AUDITOR_RECOVERY_CORRUPT
+AUDITOR_RECOVERY_CLOSED
+AUDITOR_RECOVERY_DB_ERROR
 ```
 
 Allowed transitions (from -> to):
@@ -148,7 +169,7 @@ AUDIT_TERMINAL_NO_DECISION -> (terminal)
 LEGACY_AUTHORITY_RETIRED   -> (terminal, history only - no active row)
 ```
 
-Schema version: `2`. Active bootstrap table: `auditor_bootstrap` (1 row per project). History table: `auditor_bootstrap_history`.
+Schema version: `2`. Tables: `auditor_bootstrap` (1 active row per project), `auditor_bootstrap_history`.
 
 ### 1.3. Registry
 
@@ -162,27 +183,90 @@ Schema version: `2`. Active bootstrap table: `auditor_bootstrap` (1 row per proj
 | `AUDITOR_BOUND_READY` | `auditor.thread_id !== null && auditor.enabled === true` |
 | `AUDITOR_BOUND_DISABLED` | `auditor.thread_id !== null && auditor.enabled !== true` |
 
-Plus two values added by the `inspectAuditorBootstrap` lifecycle wrapper:
+Lifecycle wrapper (`inspectAuditorBootstrap`) additions:
 
 | Return value | Condition |
 |---|---|
 | `PROJECT_NOT_FOUND` | Registry read exception or project missing |
 | `UNKNOWN` | `registryPort` not provided to inspect |
 
-`bindAuditorThread` is the only Registry mutation in any lifecycle path. It is guarded by drift validation (`assertBootstrapAuthorityMatchesRegistry`) immediately before invocation.
+`bindAuditorThread` is the sole Registry mutation in any recovery path. It is guarded by drift validation (`assertBootstrapAuthorityMatchesRegistry`) immediately prior to execution.
 
-### 1.4. Existing broker CLI
+### 1.4. Runtime composition authority (Corrected for R1)
+
+**Correction**: `createBrokerRuntime` (`pipeline-ui/lib/broker/runtime.js`) is NOT the auditor recovery runtime. It creates and exposes:
+```javascript
+{
+  broker,
+  registryPort,
+  workspacePort,
+  workerPort,
+  lifecycleStore, // Worker/broker lifecycle store — NOT auditor recovery store!
+  close
+}
+```
+`createBrokerRuntime` does NOT create or expose `sqlite-auditor-recovery-store`. It must NEVER be used to back the auditor recovery CLI.
+
+**Production Runtime Composition**:
+WP-V4-07B composes the auditor recovery runtime directly from root authorities:
+```javascript
+const { createProjectRegistry } = require('./lib/broker/registry');
+const { createSqliteAuditorRecoveryStore } = require('./lib/relay/sqlite-auditor-recovery-store');
+const { CodexAuditorAdapter } = require('./lib/auditor/codex-auditor-adapter');
+```
+
+Authority defaults:
+- Registry: `createProjectRegistry()` -> defaults to `~/.orchestrator/projects.json`
+- Recovery store: `createSqliteAuditorRecoveryStore()` -> defaults to `~/.orchestrator/auditor-recovery.sqlite3`
+
+**CLI Runtime Factory**:
+A CLI-local factory `createAuditorRecoveryCliRuntime(options)` shall be defined in `pipeline-ui/auditor-recover-cli.js`. It exposes at minimum:
+```javascript
+{
+  registryPort,
+  recoveryStore,
+  adapterFactory,
+  close: async () => { ... }
+}
+```
+Contract:
+- `close()` must close `recoveryStore`.
+- Does NOT instantiate the worker lifecycle store.
+- Does NOT instantiate worker adapters.
+- Does NOT instantiate the generic broker.
+- Test-only dependency injection is accepted through the programmatic `options` object.
+
+### 1.5. Adapter factory contract
+
+The production adapter factory creates a fresh `CodexAuditorAdapter` for provider operations:
+```javascript
+function createAuditorAdapterFactory(options = {}) {
+  return (canonicalCwd) => {
+    return new CodexAuditorAdapter({
+      cwd: canonicalCwd,
+      ...options.adapterOptions
+    });
+  };
+}
+```
+Contract:
+- Lifecycle-supplied canonical `cwd` is passed into adapter/client construction.
+- Default transport: `codex app-server --listen stdio://`. `CodexAppServerClient` already defaults to these App Server arguments.
+- No CLI flag may override: `codex` binary, `cwd`, `thread_id`, `turn_id`, `model`, or `effort`.
+
+### 1.6. Existing broker CLI patterns
 
 **File**: `pipeline-ui/agent-broker-cli.js`
 
-Commands: `snapshot`, `worker-status`, `worker-dispatch`, `worker-wait`. Does not include any auditor recovery surface. Establishes the following patterns to replicate:
-- Strict argument parser rejecting unknown commands, unknown flags, duplicates, and positional args.
+Establishes patterns replicated in `auditor-recover-cli.js`:
+- Strict argument parser rejecting unknown commands, unknown flags, duplicates, and positional arguments.
 - Machine-readable JSON stdout for all output including errors.
 - `FORBIDDEN_FLAGS` set blocking routing/execution overrides.
-- `mapErrorCodeToExitCode` table driven by `err.code`, not `err.message`.
-- `writeStderr` for diagnostics only.
+- Error mapping driven by `err.code`, never by regex matching on `err.message`.
+- Stderr for diagnostics only.
+- Guaranteed runtime cleanup in `finally` blocks.
 
-### 1.5. Real-state freeze (WO-V4-07A)
+### 1.7. Real-state freeze (WO-V4-07A)
 
 ```
 auditor.thread_id:       01a0be36-97bb-7831-8adb-02e1c1e70be0
@@ -190,16 +274,15 @@ auditor.enabled:         true
 recovery schema:         2
 active recovery:         NONE
 ```
-
 Zero real thread/start, turn/start, model turns, Registry mutation, or recovery mutation during WO-V4-07A.
 
 ---
 
 ## 2. Proposed Command Surface
 
-The WP-V4-07 CLI is a separate entry point from `agent-broker-cli.js`. Proposed file: `pipeline-ui/auditor-recover-cli.js`.
+The WP-V4-07 CLI is a separate entry point: `pipeline-ui/auditor-recover-cli.js`.
 
-Four commands are defined. Legacy retirement is a distinct explicit operator command; it is never invoked automatically by `recover`.
+Four explicit commands are defined. Legacy retirement is a distinct operator command; it is never invoked automatically by `recover`.
 
 ### 2.1. `inspect`
 
@@ -213,7 +296,7 @@ Forbidden:   --thread-id --turn-id --decision --turn-status --project-root
              --cwd --model --effort --operation-id
 JSON stdout: see §3.1
 Stderr:      diagnostic only (no secrets)
-Exits:       see §5
+Exits:       0, 2, 6, 8, 11, 12
 Mutates:     NO
 Operator intent required: NO
 ```
@@ -230,12 +313,12 @@ Forbidden:   --thread-id --turn-id --decision --turn-status --project-root
              --cwd --model --effort --operation-id
 JSON stdout: see §3.2
 Stderr:      diagnostic only (no secrets)
-Exits:       see §5
-Mutates:     YES (state-dependent - see §6)
+Exits:       0, 2, 5, 6, 8, 9, 10, 11, 12
+Mutates:     YES (recovery store; conditionally binds Registry in validated/verified/binding states)
 Operator intent required: YES (caller must understand this may bind Registry)
 ```
 
-`recover` does not permit specifying a target state. The lifecycle function drives the state machine from its observed position.
+No target state flag is accepted. The lifecycle function drives the state machine from its observed position.
 
 ### 2.3. `resolve-uncertainty`
 
@@ -249,10 +332,12 @@ Forbidden:   --thread-id --turn-id --decision --turn-status --project-root
              --cwd --model --effort --operation-id
 JSON stdout: see §3.3
 Stderr:      diagnostic only (no secrets)
-Exits:       see §5
+Exits:       0, 2, 5, 6, 8, 11, 12
 Mutates:     YES (0 or 1 transition depending on provider response)
 Operator intent required: YES (spawns provider connection)
 ```
+
+Preconditions are verified by the lifecycle function. If no active bootstrap exists, lifecycle throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (exit 6).
 
 ### 2.4. `retire-legacy`
 
@@ -266,37 +351,31 @@ Forbidden:   --thread-id --turn-id --decision --operation-id
              --project-root --cwd --model --effort
 JSON stdout: see §3.4
 Stderr:      diagnostic only
-Exits:       see §5
-Mutates:     YES - LEGACY_AUTHORITY_RETIRED history + deletes active row
-Operator intent required: YES (--confirm required)
+Exits:       0, 2, 6, 8, 11, 12
+Mutates:     YES (appends LEGACY_AUTHORITY_RETIRED history + deletes active row)
+Operator intent required: YES (--confirm presence flag required)
 ```
 
-Preconditions enforced by lifecycle (not duplicated in CLI):
-- active bootstrap exists
-- `authority_version === 0`
-- fresh Registry project exists
-- `auditor.thread_id === null`
-- `auditor.enabled === false`
+Preconditions are verified by the lifecycle function. If no active bootstrap exists, lifecycle throws `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (exit 6).
 
 ---
 
 ## 3. JSON Output Schemas
 
-All commands emit exactly one JSON object to stdout followed by `\n`. No partial output. No pretty-printing. All fields emitted are explicitly enumerated below — no spread of raw lifecycle return objects.
-
-Stderr is for diagnostics only. No secrets in any output channel.
+All commands emit exactly one JSON object to stdout followed by `\n`. No partial output. No pretty-printing. All emitted fields are strictly projected from explicit allowlists — never using object spreads (`...lifecycleResult`).
 
 ### 3.1. `inspect` response
 
-The CLI projects the following explicit allowlist from the lifecycle result. `registry_project` from the lifecycle return is NOT forwarded. `decision_json` and `validated_decision` are NOT forwarded. `expected_project_root_identity` is NOT forwarded (internal identity key).
+The CLI projects the following explicit allowlist. `registry_project` is NOT forwarded. `decision_json` and `validated_decision` are NOT forwarded. `expected_project_root_identity` is NOT forwarded.
 
 **Permitted `active_bootstrap` fields (allowlist)**:
-`project_id`, `operation_id`, `audit_subject_id`, `thread_id`, `turn_id`, `workspace_state_observed`, `state`, `has_decision` (derived: `decision_json !== null`), `decision_sha256`, `authority_version`, `expected_project_root`, `expected_auditor_model_policy`, `created_at`, `updated_at`
+`project_id`, `operation_id`, `audit_subject_id`, `thread_id`, `turn_id`, `workspace_state_observed`, `state`, `has_decision` (derived boolean: `decision_json !== null`), `decision_sha256`, `authority_version`, `expected_project_root`, `expected_auditor_model_policy`, `created_at`, `updated_at`
 
 **Permitted `history` entry fields (allowlist)**:
 `history_seq`, `operation_id`, `previous_state`, `next_state`, `iso`
 
-Note: `registry_binding_state` uses the exhaustive vocabulary from §1.3: `AUDITOR_REGISTRATION_REQUIRED`, `AUDITOR_BOUND_READY`, `AUDITOR_BOUND_DISABLED`, `PROJECT_NOT_FOUND`, `UNKNOWN`. `REGISTRY_UNAVAILABLE` is not a distinct value — both Registry exceptions and missing project map to `PROJECT_NOT_FOUND`.
+**Permitted `registry_binding_state` values**:
+`AUDITOR_REGISTRATION_REQUIRED`, `AUDITOR_BOUND_READY`, `AUDITOR_BOUND_DISABLED`, `PROJECT_NOT_FOUND`, `UNKNOWN`.
 
 **Success — no active bootstrap**:
 ```json
@@ -319,15 +398,15 @@ Note: `registry_binding_state` uses the exhaustive vocabulary from §1.3: `AUDIT
   "active_bootstrap": {
     "project_id": "chatgpt-orchestrator",
     "operation_id": "op-abc123",
-    "audit_subject_id": "string",
-    "thread_id": "string",
+    "audit_subject_id": "subj-xyz",
+    "thread_id": "th-001",
     "turn_id": null,
-    "workspace_state_observed": "string",
+    "workspace_state_observed": "clean",
     "state": "PROVISIONAL_THREAD",
     "has_decision": false,
     "decision_sha256": null,
     "authority_version": 1,
-    "expected_project_root": "/path/to/root",
+    "expected_project_root": "/canonical/root",
     "expected_auditor_model_policy": "standard",
     "created_at": "2026-09-21T05:00:00.000Z",
     "updated_at": "2026-09-21T05:00:00.000Z"
@@ -345,85 +424,64 @@ Note: `registry_binding_state` uses the exhaustive vocabulary from §1.3: `AUDIT
 }
 ```
 
-**Error**:
-```json
-{
-  "ok": false,
-  "operation": "inspect",
-  "code": "INVALID_CLI_REQUEST",
-  "error": "string"
-}
-```
-
 ### 3.2. `recover` response
 
-**Success — no active bootstrap (idempotent)**:
+**Success — no active bootstrap (idempotent, exit 0)**:
 ```json
 {
   "ok": true,
   "operation": "recover",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "NO_ACTIVE_BOOTSTRAP"
 }
 ```
 
-**Success — bootstrap cleared**:
+**Success — bootstrap cleared (exit 0)**:
 ```json
 {
   "ok": true,
   "operation": "recover",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "RECOVERED_CLEARED",
   "previous_state": "PROVISIONAL_THREAD",
-  "thread_id": "string"
+  "thread_id": "th-001"
 }
 ```
 
-**Success — terminal no-decision cleared**:
+**Success — terminal no-decision cleared (exit 0)**:
 ```json
 {
   "ok": true,
   "operation": "recover",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "RECOVERED_TERMINAL_NO_DECISION_CLEARED",
   "previous_state": "AUDIT_TERMINAL_NO_DECISION",
-  "thread_id": "string"
+  "thread_id": "th-001"
 }
 ```
 
-**Success — DURABLE_BOUND**:
+**Success — DURABLE_BOUND (exit 0)**:
 ```json
 {
   "ok": true,
   "operation": "recover",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "DURABLE_BOUND",
-  "thread_id": "string",
+  "thread_id": "th-001",
   "reconciled": true
 }
 ```
 
-**Semantic halt — AUDIT_UNCERTAIN preserved** (exit 5):
+**Semantic hold — AUDIT_UNCERTAIN preserved (exit 5)**:
 ```json
 {
   "ok": false,
   "operation": "recover",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "AUDIT_UNCERTAIN",
-  "thread_id": "string",
+  "thread_id": "th-001",
   "code": "AUDIT_UNCERTAIN",
-  "message": "string"
-}
-```
-
-**Error**:
-```json
-{
-  "ok": false,
-  "operation": "recover",
-  "project_id": "string",
-  "code": "string",
-  "error": "string"
+  "message": "Audit execution status uncertain; intervention required"
 }
 ```
 
@@ -431,80 +489,89 @@ Note: `registry_binding_state` uses the exhaustive vocabulary from §1.3: `AUDIT
 
 The `decision` object (AuditDecisionV1) is NEVER emitted. Only `decision_sha256` is emitted when a decision is validated.
 
-**Success — resolved to DECISION_VALIDATED**:
+**Success — resolved to DECISION_VALIDATED (exit 0)**:
 ```json
 {
   "ok": true,
   "operation": "resolve-uncertainty",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "DECISION_VALIDATED",
-  "thread_id": "string",
-  "turn_id": "string",
-  "decision_sha256": "string"
+  "thread_id": "th-001",
+  "turn_id": "turn-001",
+  "decision_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 }
 ```
 
-**Success — resolved to AUDIT_TERMINAL_NO_DECISION**:
+**Success — resolved to AUDIT_TERMINAL_NO_DECISION (exit 0)**:
 ```json
 {
   "ok": true,
   "operation": "resolve-uncertainty",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "AUDIT_TERMINAL_NO_DECISION",
-  "thread_id": "string",
-  "turn_id": "string",
+  "thread_id": "th-001",
+  "turn_id": "turn-001",
   "turn_status": "interrupted"
 }
 ```
 
-**Semantic hold — AUDIT_UNCERTAIN preserved** (exit 5). Includes provider failure, thread mismatch, history invalid, non-terminal, or decision validation failure. The `reason` field is bounded to 1024 UTF-8 bytes and is informational only — not parsed by callers to determine exit authority:
+**Semantic hold — AUDIT_UNCERTAIN preserved (exit 5)**:
 ```json
 {
   "ok": false,
   "operation": "resolve-uncertainty",
-  "project_id": "string",
+  "project_id": "chatgpt-orchestrator",
   "status": "AUDIT_UNCERTAIN",
-  "thread_id": "string",
+  "thread_id": "th-001",
   "turn_id": null,
   "code": "AUDIT_UNCERTAIN",
-  "reason": "PROVIDER_INSPECTION_FAILED: ..."
-}
-```
-
-**Error**:
-```json
-{
-  "ok": false,
-  "operation": "resolve-uncertainty",
-  "project_id": "string",
-  "code": "string",
-  "error": "string"
+  "reason": "PROVIDER_INSPECTION_FAILED: connection refused"
 }
 ```
 
 ### 3.4. `retire-legacy` response
 
-**Success**:
+**Success (exit 0)**:
 ```json
 {
   "ok": true,
   "operation": "retire-legacy",
-  "project_id": "string",
-  "operation_id": "string",
+  "project_id": "chatgpt-orchestrator",
+  "operation_id": "op-legacy-001",
   "status": "RETIRED_LEGACY_AUTHORITY_UNAVAILABLE"
 }
 ```
 
-**Error**:
+### 3.5. Error schemas (all commands)
+
+**Standard Structured Error (exits 2, 6, 8, 9, 10, 11)**:
 ```json
 {
   "ok": false,
-  "operation": "retire-legacy",
-  "project_id": "string",
-  "code": "string",
-  "error": "string"
+  "operation": "recover",
+  "project_id": "chatgpt-orchestrator",
+  "code": "AUDITOR_LIFECYCLE_PRECONDITION_FAILED",
+  "error": "No active bootstrap record found for project 'chatgpt-orchestrator'"
 }
 ```
+
+**Unmapped Structured Error Fallback (exit 12 — CLI_RUNTIME_FAILURE)**:
+When an error carries a machine-readable `.code` that is not explicitly in the exit map:
+```json
+{
+  "ok": false,
+  "operation": "recover",
+  "project_id": "chatgpt-orchestrator",
+  "code": "AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT",
+  "error": "operation_id mismatch on active bootstrap"
+}
+```
+Rules:
+- Exit code is strictly **12**.
+- Machine-readable code is preserved in `.code`.
+- Diagnostic message is safely bounded (max 1024 UTF-8 bytes).
+- Raw stack traces are NEVER exposed.
+- Never derived from matching text in `error.message`.
 
 ---
 
@@ -512,8 +579,7 @@ The `decision` object (AuditDecisionV1) is NEVER emitted. Only `decision_sha256`
 
 ### 4.1. Forbidden flags (all commands)
 
-The following are forbidden on all commands and must produce `INVALID_CLI_REQUEST` / exit 2:
-
+The following are forbidden on all commands and produce `INVALID_CLI_REQUEST` / exit 2:
 ```
 --thread-id           --turn-id              --decision
 --turn-status         --project-root         --cwd
@@ -523,77 +589,80 @@ The following are forbidden on all commands and must produce `INVALID_CLI_REQUES
 --powershell          --bash                 --cmd
 --argv
 ```
+Any token not starting with `--` (positional arguments) is forbidden after the command name.
 
-Any token not starting with `--` (positional arguments) is also forbidden after the command name.
+### 4.2. Flag parsing rules
 
-### 4.2. Flag parsing rules (inherited from agent-broker-cli.js pattern)
-
-- `--flag value` and `--flag=value` are both accepted.
-- Duplicate singleton flags: reject with `INVALID_CLI_REQUEST`.
-- Missing value for a flag requiring value: reject.
-- Unknown flag for a given command: reject.
-- Unexpected positional argument after command: reject.
-- `--help` / `-h` / `help`: emit help JSON listing all allowed commands, exit 0.
+- Both `--flag value` and `--flag=value` formats are accepted.
+- Duplicate singleton flags: reject with `INVALID_CLI_REQUEST` / exit 2.
+- Missing required value for a key-value flag: reject with exit 2.
+- Unknown flag for a given command: reject with exit 2.
+- Unexpected positional argument after command: reject with exit 2.
+- `--help` / `-h` / `help`: emit help JSON listing allowed commands, exit 0.
 
 ### 4.3. Input string bounds
 
 | Input | Validation rule |
 |---|---|
 | `--project-id` | Required. Must match `^[a-z0-9][a-z0-9._-]{0,127}$`. Max 128 UTF-8 bytes. |
-| `--confirm` (retire-legacy only) | Boolean presence flag. No value. Presence = operator consent. |
-
-No other string inputs are accepted. No file inputs. No arbitrary JSON inputs.
+| `--confirm` (retire-legacy only) | Boolean presence flag. No value allowed. Presence = operator consent. |
 
 ---
 
 ## 5. Exit-Code Matrix
 
-Exit codes are derived from the `status` or `code` field of the lifecycle result object, or from structured error codes. Exit codes are NEVER derived by parsing `reason`, `error`, or `message` string content.
+Exit codes are derived exclusively from `result.status` or `err.code`. Exit codes are NEVER derived by parsing `reason`, `error`, or `message` string content.
 
-| Exit | Classification | Semantic |
-|---|---|---|
-| `0` | Success | Command completed successfully (including NO_ACTIVE_BOOTSTRAP idempotent) |
-| `1` | (intentionally unused) | Reserved for unhandled Node.js process exception; not assigned by CLI logic |
-| `2` | CLI/process error | Invalid CLI request: unknown command, unknown flag, duplicate flag, forbidden flag, missing required flag, unexpected positional, bounds violation |
-| `3` | Lifecycle error | Project not found in Registry (for commands that require Registry confirmation) |
-| `4` | Lifecycle error | No active recovery — project has no active bootstrap (for commands that require one) |
-| `5` | **Semantic uncertain** | Command completed; result is AUDIT_UNCERTAIN. Recovery store is stable. Human intervention required. Includes provider inspection failure that safely preserves uncertainty. |
-| `6` | Lifecycle error | Precondition failure — drift detected, authority mismatch, Registry unbound check failed |
-| `8` | Lifecycle error | Recovery corruption — decision hash mismatch, invalid state, broken history chain |
-| `9` | Lifecycle error | Resume verification failure — thread/resume returned wrong ID or threw |
-| `10` | Lifecycle error | Registry bind failure — bindAuditorThread rejected or threw |
-| `11` | Lifecycle error | Runtime initialization failure — could not open recovery store or Registry |
+| Exit | Classification | Semantic | Trigger Condition |
+|---|---|---|---|
+| `0` | Success | Command completed successfully | Success outcome; `recover` returns `NO_ACTIVE_BOOTSTRAP` |
+| `1` | Reserved | Unhandled Node.js process exception | Intentionally unused by CLI logic (signals uncaught crash) |
+| `2` | CLI/process error | Invalid CLI request | Unknown command, unknown/duplicate/forbidden flag, bounds failure |
+| `3` | **RESERVED** | `RESERVED_NOT_CURRENTLY_EMITTED` | No lifecycle path emits structured code at CLI boundary (wrapped as PRECONDITION_FAILED exit 6) |
+| `4` | **RESERVED** | `RESERVED_NOT_CURRENTLY_EMITTED` | No lifecycle path emits structured code at CLI boundary (resolve/retire throw PRECONDITION_FAILED exit 6; recover returns exit 0) |
+| `5` | **Semantic uncertain** | Semantic hold — AUDIT_UNCERTAIN | Result status `AUDIT_UNCERTAIN` (including provider inspection failure) |
+| `6` | Lifecycle error | Precondition failure | `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (no active bootstrap in resolve/retire; project missing in recover/resolve/retire; drift/unbound mismatch) |
+| `7` | **RESERVED** | `RESERVED_NOT_CURRENTLY_EMITTED` | Provider readThread failure returns status `AUDIT_UNCERTAIN` (exit 5), not thrown error |
+| `8` | Lifecycle error | Recovery corrupt | `AUDITOR_RECOVERY_CORRUPT` |
+| `9` | Lifecycle error | Resume verification failure | `AUDITOR_LIFECYCLE_RESUME_VERIFY_FAILED` |
+| `10` | Lifecycle error | Registry bind failure | `AUDITOR_LIFECYCLE_REGISTRY_BIND_FAILED` |
+| `11` | Lifecycle error | Runtime initialization failure | CLI cannot initialize SQLite recovery store or Registry |
+| `12` | **Runtime fallback** | Unmapped structured error (`CLI_RUNTIME_FAILURE`) | Unmapped `.code` (e.g. `AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT`) |
 
-**Exit 1 is intentionally unused** by CLI logic so that it unambiguously signals an unhandled process exception (Node.js default behavior). This allows operators to distinguish "uncertainty preserved — human intervention required" (exit 5) from "CLI bug / crash" (exit 1).
-
-**Exit 7 is absent** because provider inspection failure in `resolveAuditorBootstrapUncertainty` returns `AUDIT_UNCERTAIN` (exit 5), not a thrown error. No separate exit for provider unavailability is assigned until the lifecycle API is enhanced with a machine-readable classification field.
+**Clarifications on Reserved Exits**:
+- **Exit 3 & 4**: Neither the recovery store nor the lifecycle module exposes distinct machine-readable error codes `PROJECT_NOT_FOUND` or `NO_ACTIVE_BOOTSTRAP` as thrown exceptions across the CLI boundary. In `resolve-uncertainty` and `retire-legacy`, missing active records throw `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (exit 6). In `recover`, missing active records return `{ ok: true, status: 'NO_ACTIVE_BOOTSTRAP' }` (exit 0). In `recover`, `resolve-uncertainty`, and `retire-legacy`, missing projects throw `AUDITOR_LIFECYCLE_PRECONDITION_FAILED` (exit 6). Exits 3 and 4 are therefore designated `RESERVED_NOT_CURRENTLY_EMITTED`.
+- **Exit 7**: Provider inspection failure in `resolveAuditorBootstrapUncertainty` returns `{ ok: false, status: 'AUDIT_UNCERTAIN' }` (exit 5), not a thrown error. Exit 7 is designated `RESERVED_NOT_CURRENTLY_EMITTED`.
 
 ---
 
 ## 6. Mutation Matrix
 
-| Command | Recovery-store mutates | Registry mutates | Provider call type |
-|---|---|---|---|
-| `inspect` | NO | NO | none |
-| `recover` (PROVISIONAL_THREAD) | YES — delete active row | NO | none |
-| `recover` (FIRST_TURN_STARTING / IN_FLIGHT) | YES — transition to AUDIT_UNCERTAIN | NO | none |
-| `recover` (AUDIT_UNCERTAIN already) | NO | NO | none |
-| `recover` (AUDIT_TERMINAL_NO_DECISION) | YES — delete active row | NO | none (Registry read only) |
-| `recover` (DECISION_VALIDATED / RESUME_VERIFYING) | YES — transitions + final delete | NO | resumeThread (non-model) |
-| `recover` (RESUME_VERIFIED) | YES — REGISTRY_BINDING + delete | NO | none (Registry read + bind) |
-| `recover` (REGISTRY_BINDING) | YES — delete active row | YES — bindAuditorThread | none |
-| `resolve-uncertainty` (no turn_id) | NO | NO | none |
-| `resolve-uncertainty` (provider failure / mismatch / non-terminal) | NO | NO | readThread (non-model) |
-| `resolve-uncertainty` (interrupted / failed turn) | YES — AUDIT_TERMINAL_NO_DECISION | NO | readThread (non-model) |
-| `resolve-uncertainty` (completed + valid decision) | YES — DECISION_VALIDATED | NO | readThread (non-model) |
-| `retire-legacy` | YES — retire history + delete active row | NO | none (Registry read only) |
+| Command | State / Condition | Recovery-Store Mutation | Registry Mutation | Provider Call |
+|---|---|---|---|---|
+| `inspect` | Any | NO | NO | none |
+| `recover` | `NO_ACTIVE_BOOTSTRAP` | NO | NO | none |
+| `recover` | `PROVISIONAL_THREAD` | YES (`deleteActiveBootstrap`) | NO | none |
+| `recover` | `FIRST_TURN_STARTING` / `IN_FLIGHT` | YES (`transitionBootstrap` to `AUDIT_UNCERTAIN`) | NO | none |
+| `recover` | `AUDIT_UNCERTAIN` (already) | NO | NO | none |
+| `recover` | `AUDIT_TERMINAL_NO_DECISION` | YES (`deleteActiveBootstrap`) | NO | none (Registry read only) |
+| `recover` | `DECISION_VALIDATED` | YES (transitions + `deleteActiveBootstrap`) | **YES, CONDITIONAL** | `resumeThread` (non-model) |
+| `recover` | `RESUME_VERIFYING` | YES (transitions + `deleteActiveBootstrap`) | **YES, CONDITIONAL** | `resumeThread` (non-model) |
+| `recover` | `RESUME_VERIFIED` | YES (transition + `deleteActiveBootstrap`) | **YES, CONDITIONAL** | none |
+| `recover` | `REGISTRY_BINDING` | YES (`deleteActiveBootstrap`) | **YES, CONDITIONAL** | none |
+| `resolve-uncertainty` | `turn_id` missing | NO | NO | none |
+| `resolve-uncertainty` | provider failure / mismatch / non-terminal | NO | NO | `readThread` (non-model) |
+| `resolve-uncertainty` | turn `interrupted` / `failed` | YES (transition to `AUDIT_TERMINAL_NO_DECISION`) | NO | `readThread` (non-model) |
+| `resolve-uncertainty` | turn `completed` + valid decision | YES (transition to `DECISION_VALIDATED`) | NO | `readThread` (non-model) |
+| `retire-legacy` | `authority_version === 0` | YES (`retireLegacyBootstrap` -> history + delete active) | NO | none (Registry read only) |
+
+**Definition of `Registry YES, CONDITIONAL`**:
+`bindAuditorThread` executes if the Registry is not already bound to the exact same thread. If the Registry is already bound to the exact same thread, the Registry write is skipped idempotently, but active recovery cleanup (`deleteActiveBootstrap`) still occurs.
 
 ---
 
 ## 7. Security Invariants
 
 ### 7.1. Parsing
-
 1. Parser rejects unknown commands with exact error message listing allowed commands.
 2. Parser rejects unknown flags for a given command.
 3. Parser rejects duplicate singleton flags.
@@ -603,8 +672,7 @@ Exit codes are derived from the `status` or `code` field of the lifecycle result
 7. `--project-id` must match `^[a-z0-9][a-z0-9._-]{0,127}$` before any IO.
 
 ### 7.2. Output allowlists
-
-8. CLI output is an explicit projection — no spread of raw lifecycle result objects (`...lifecycleResult` patterns are forbidden in the implementation).
+8. CLI output is an explicit projection — no spread of raw lifecycle result objects (`{ ...lifecycleResult }` is forbidden).
 9. `decision_json` is NEVER emitted on stdout under any command or error path.
 10. `validated_decision` is NEVER emitted.
 11. `decision` (the AuditDecisionV1 object) is NEVER emitted.
@@ -613,34 +681,34 @@ Exit codes are derived from the `status` or `code` field of the lifecycle result
 14. Exit codes are derived from `result.status` or `err.code` — never from parsing `reason`, `error`, or `message` text.
 15. No secrets (API tokens, environment variables, registry `worker.session_id`) appear in any output.
 
-### 7.3. Execution surface
-
-16. No shell execution. CLI invokes lifecycle functions directly; `adapterFactory` encapsulates all provider process spawning.
+### 7.3. Execution surface & runtime composition
+16. No shell execution. CLI invokes lifecycle functions directly; `adapterFactory` encapsulates provider process spawning.
 17. No arbitrary file input.
 18. No "latest thread discovery": `project_id` is the sole lookup key; the lifecycle derives all IDs internally.
 19. No automatic resend of `turn/start`. `bootstrapAuditorThread` is never called from the recovery CLI.
 20. No replacement thread creation.
 21. No automatic legacy retirement from `recover`. `retire-legacy` is always an explicit operator action.
+22. Runtime is composed directly from `createProjectRegistry()`, `createSqliteAuditorRecoveryStore()`, and `CodexAuditorAdapter`. `createBrokerRuntime` is NOT used.
 
 ---
 
 ## 8. Integration-Test Design
 
-All tests are deterministic. No real model turns, no real provider connections, no real Registry mutations. Injection pattern from ATL test suite applies throughout.
+All tests are deterministic. No real model turns, no real provider connections, no real Registry mutations.
 
 ### 8.1. Proposed test file
 
 `pipeline-ui/test/refactor/auditor-recover-cli.test.js`
 
-### 8.2. Test matrix (ARC-001..ARC-053)
+### 8.2. Test matrix (ARC-001..ARC-054)
 
-| Test ID | Scenario | Expected exit | Expected status / code |
+| Test ID | Scenario | Expected Exit | Expected Status / Code / Assertion |
 |---|---|---|---|
 | ARC-001 | inspect — no active bootstrap | 0 | `active_bootstrap: null` |
 | ARC-002 | inspect — PROVISIONAL_THREAD | 0 | `state: PROVISIONAL_THREAD` |
 | ARC-003 | inspect — AUDIT_UNCERTAIN | 0 | `state: AUDIT_UNCERTAIN` |
 | ARC-004 | inspect — DECISION_VALIDATED, has_decision: true | 0 | `has_decision: true`, `decision_sha256` present |
-| ARC-005 | inspect — `decision_json` absent at every depth of JSON output | 0 | no `decision_json` key |
+| ARC-005 | inspect — `decision_json` absent at every depth of JSON output | 0 | no `decision_json` key in output |
 | ARC-006 | inspect — Registry read failure mapped to `PROJECT_NOT_FOUND` | 0 | `registry_binding_state: PROJECT_NOT_FOUND` (exit 0, best-effort) |
 | ARC-007 | inspect — unknown flag | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-008 | inspect — missing `--project-id` | 2 | `code: INVALID_CLI_REQUEST` |
@@ -648,39 +716,39 @@ All tests are deterministic. No real model turns, no real provider connections, 
 | ARC-010 | inspect — duplicate `--project-id` | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-011 | inspect — forbidden flag `--thread-id` | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-012 | inspect — positional arg after command | 2 | `code: INVALID_CLI_REQUEST` |
-| ARC-013 | recover — NO_ACTIVE_BOOTSTRAP | 0 | `status: NO_ACTIVE_BOOTSTRAP` |
+| ARC-013 | recover — NO_ACTIVE_BOOTSTRAP | 0 | `status: NO_ACTIVE_BOOTSTRAP` (idempotent success) |
 | ARC-014 | recover — PROVISIONAL_THREAD cleared | 0 | `status: RECOVERED_CLEARED` |
 | ARC-015 | recover — FIRST_TURN_STARTING -> AUDIT_UNCERTAIN | 5 | `status: AUDIT_UNCERTAIN` |
 | ARC-016 | recover — FIRST_TURN_IN_FLIGHT -> AUDIT_UNCERTAIN | 5 | `status: AUDIT_UNCERTAIN` |
 | ARC-017 | recover — AUDIT_UNCERTAIN already -> preserved | 5 | `status: AUDIT_UNCERTAIN` |
-| ARC-018 | recover — DECISION_VALIDATED -> DURABLE_BOUND (resume succeeds) | 0 | `status: DURABLE_BOUND` |
-| ARC-019 | recover — RESUME_VERIFYING -> DURABLE_BOUND (resume succeeds) | 0 | `status: DURABLE_BOUND` |
-| ARC-020 | recover — RESUME_VERIFIED -> DURABLE_BOUND | 0 | `status: DURABLE_BOUND` |
-| ARC-021 | recover — REGISTRY_BINDING already bound same thread (idempotent) | 0 | `status: DURABLE_BOUND` |
+| ARC-018 | recover — DECISION_VALIDATED -> DURABLE_BOUND | 0 | `status: DURABLE_BOUND`, asserts `bindAuditorThread` invoked when Registry begins unbound |
+| ARC-019 | recover — RESUME_VERIFYING -> DURABLE_BOUND | 0 | `status: DURABLE_BOUND`, asserts `bindAuditorThread` invoked when Registry begins unbound |
+| ARC-020 | recover — RESUME_VERIFIED -> DURABLE_BOUND | 0 | `status: DURABLE_BOUND`, asserts `bindAuditorThread` invoked when Registry begins unbound |
+| ARC-021 | recover — REGISTRY_BINDING already bound same thread | 0 | `status: DURABLE_BOUND`, asserts NO Registry write invoked |
 | ARC-022 | recover — AUDIT_TERMINAL_NO_DECISION cleared | 0 | `status: RECOVERED_TERMINAL_NO_DECISION_CLEARED` |
 | ARC-023 | recover — `authority_version === 0` in DECISION_VALIDATED -> precondition failure | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-024 | recover — authority drift (project_root changed) -> precondition failure | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-025 | recover — resume verification fails (wrong thread ID returned) | 9 | `code: AUDITOR_LIFECYCLE_RESUME_VERIFY_FAILED` |
 | ARC-026 | recover — Registry bind fails | 10 | `code: AUDITOR_LIFECYCLE_REGISTRY_BIND_FAILED` |
 | ARC-027 | recover — corrupt recovery (decision hash mismatch) | 8 | `code: AUDITOR_RECOVERY_CORRUPT` |
-| ARC-028 | recover — project not found (AUDIT_TERMINAL_NO_DECISION path) | 3 | `code: PROJECT_NOT_FOUND` |
+| ARC-028 | recover — terminal-no-decision, project missing | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-029 | recover — forbidden flag `--operation-id` | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-030 | resolve-uncertainty — not in AUDIT_UNCERTAIN state | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
-| ARC-031 | resolve-uncertainty — no active bootstrap | 4 | `code: NO_ACTIVE_BOOTSTRAP` |
+| ARC-031 | resolve-uncertainty — no active bootstrap | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-032 | resolve-uncertainty — AUDIT_UNCERTAIN, no turn_id -> preserved | 5 | `status: AUDIT_UNCERTAIN`, `reason` contains `TURN_HISTORY_INVALID` |
 | ARC-033 | resolve-uncertainty — provider readThread fails -> AUDIT_UNCERTAIN preserved (NOT exit 7) | 5 | `status: AUDIT_UNCERTAIN`, `reason` contains `PROVIDER_INSPECTION_FAILED` |
 | ARC-034 | resolve-uncertainty — thread ID mismatch from provider -> preserved | 5 | `reason` contains `THREAD_ID_MISMATCH` |
 | ARC-035 | resolve-uncertainty — turn count != 1 -> preserved | 5 | `reason` contains `TURN_HISTORY_INVALID` |
 | ARC-036 | resolve-uncertainty — turn interrupted -> AUDIT_TERMINAL_NO_DECISION | 0 | `status: AUDIT_TERMINAL_NO_DECISION` |
 | ARC-037 | resolve-uncertainty — turn failed -> AUDIT_TERMINAL_NO_DECISION | 0 | `status: AUDIT_TERMINAL_NO_DECISION` |
-| ARC-038 | resolve-uncertainty — turn completed, valid decision -> DECISION_VALIDATED; no `decision` field in output | 0 | `status: DECISION_VALIDATED`, `decision_sha256` present, no `decision` key |
+| ARC-038 | resolve-uncertainty — turn completed, valid decision -> DECISION_VALIDATED | 0 | `status: DECISION_VALIDATED`, `decision_sha256` present, no `decision` key |
 | ARC-039 | resolve-uncertainty — turn completed, invalid decision -> preserved | 5 | `reason` contains `DECISION_VALIDATION_FAILED` |
 | ARC-040 | resolve-uncertainty — turn non-terminal (inProgress) -> preserved | 5 | `reason` contains `TURN_NONTERMINAL` |
 | ARC-041 | resolve-uncertainty — `authority_version === 0` -> precondition failure | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-042 | resolve-uncertainty — authority drift -> precondition failure | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-043 | resolve-uncertainty — forbidden flag `--turn-id` | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-044 | retire-legacy — `authority_version === 0`, unbound -> success | 0 | `status: RETIRED_LEGACY_AUTHORITY_UNAVAILABLE` |
-| ARC-045 | retire-legacy — no active bootstrap | 4 | `code: NO_ACTIVE_BOOTSTRAP` |
+| ARC-045 | retire-legacy — no active bootstrap | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-046 | retire-legacy — `authority_version === 1` (not legacy) | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-047 | retire-legacy — Registry auditor bound (`thread_id !== null`) | 6 | `code: AUDITOR_LIFECYCLE_PRECONDITION_FAILED` |
 | ARC-048 | retire-legacy — missing `--confirm` | 2 | `code: INVALID_CLI_REQUEST` |
@@ -689,61 +757,74 @@ All tests are deterministic. No real model turns, no real provider connections, 
 | ARC-051 | Unknown command | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-052 | No command at all | 2 | `code: INVALID_CLI_REQUEST` |
 | ARC-053 | inspect — no `decision_json` field in `history` entries | 0 | verified by output key inspection |
+| ARC-054 | unmapped structured error fallback | 12 | `code: AUDITOR_RECOVERY_BOOTSTRAP_CONFLICT` preserved, no stack trace, classification `CLI_RUNTIME_FAILURE` |
+
+Total planned count: **54 tests** (ARC-001 .. ARC-054).
 
 ### 8.3. Test infrastructure requirements
 
-- All lifecycle functions are injected via the options pattern used in the ATL suite (no direct process invocation of lifecycle).
-- `adapterFactory` is a controlled stub returning fake provider clients.
-- `registryPort` is a controlled stub with configurable project fixture and binding state.
-- `recoveryStore` uses `createSqliteAuditorRecoveryStore` with tmpdir file backing (no production SQLite path).
-- No real process spawning. No real provider connections. No production Registry reads.
-- Each test suite emits `ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-053: 53/53 PASS)` on success.
+- Lifecycle functions injected via programmatic `options` object pattern.
+- `adapterFactory` is a controlled stub returning mock provider clients.
+- `registryPort` is a controlled stub with configurable project fixtures and call recording.
+- `recoveryStore` uses `createSqliteAuditorRecoveryStore` with temporary directory file backing.
+- Each test suite run emits `ALL AUDITOR RECOVER CLI TESTS PASSED (ARC-001 .. ARC-054: 54/54 PASS)` on success.
 
 ---
 
 ## 9. Implementation File Plan
 
-No production code is modified in WO-V4-07A. The following files will be created or modified in WO-V4-07B:
+No production code is modified in WO-V4-07A-R1. The following files will be created or modified in WO-V4-07B:
 
 | File | Action | Purpose |
 |---|---|---|
-| `pipeline-ui/auditor-recover-cli.js` | NEW | CLI entry point: arg parser, explicit output projections, command dispatch, exit codes |
-| `pipeline-ui/test/refactor/auditor-recover-cli.test.js` | NEW | Deterministic test suite ARC-001..ARC-053 |
+| `pipeline-ui/auditor-recover-cli.js` | NEW | CLI entry point: strict parser, runtime composition (`createAuditorRecoveryCliRuntime`), adapter factory, explicit output projection, exit mapping, command dispatch, guaranteed runtime close |
+| `pipeline-ui/test/refactor/auditor-recover-cli.test.js` | NEW | Deterministic test suite ARC-001..ARC-054 |
 | `pipeline-ui/package.json` | MODIFY `scripts.test` | Append `auditor-recover-cli.test.js` to the test chain |
 | `docs/.../15-IMPLEMENTATION-PLAN.md` | MODIFY | Update to reflect WP-V4-07B scope |
 
-No modifications to:
+Explicit non-modification boundary:
 - `pipeline-ui/lib/relay/auditor-thread-lifecycle.js`
 - `pipeline-ui/lib/relay/sqlite-auditor-recovery-store.js`
 - `pipeline-ui/lib/broker/registry.js`
+- `pipeline-ui/lib/broker/runtime.js`
 - `pipeline-ui/agent-broker-cli.js`
+
+If implementation in 07B requires changes to any of the above files, STOP immediately: `WP_V4_07B_SCOPE_EXPANSION_REQUIRED`.
 
 ---
 
 ## 10. Open Questions
 
-All questions are classified as `RESOLVED_FOR_07B` or `BLOCKS_07B`.
+All questions are classified as `RESOLVED_FOR_07B`.
 
-### Q1 — adapterFactory injection in production
+### Q1 — Auditor recovery runtime composition and adapterFactory in production
 
 **Status**: `RESOLVED_FOR_07B`
 
-**Resolution**: The CLI will use `createBrokerRuntime` (the same factory used by `agent-broker-cli.js`) for its runtime initialization. `createBrokerRuntime` already creates and exposes `recoveryStore` and `registryPort`. `adapterFactory` will be constructed in a new `createAuditorAdapterFactory(options)` helper in `auditor-recover-cli.js` using the project's existing Codex App Server adapter pattern. This follows the established precedent and requires no new factory module. The injection point for tests remains the `options` object pattern from the ATL suite.
+**Resolution**:
+`createBrokerRuntime` (`pipeline-ui/lib/broker/runtime.js`) is NOT used as the auditor recovery runtime. Its `lifecycleStore` is the worker/broker lifecycle store, not `sqlite-auditor-recovery-store`.
+
+Instead, the recovery CLI directly composes:
+1. `createProjectRegistry()` (default `~/.orchestrator/projects.json`)
+2. `createSqliteAuditorRecoveryStore()` (default `~/.orchestrator/auditor-recovery.sqlite3`)
+3. `createAuditorAdapterFactory()`: creates fresh `CodexAuditorAdapter` instances passing lifecycle-supplied canonical `cwd`. Default command: `codex app-server --listen stdio://`.
+
+Factory `createAuditorRecoveryCliRuntime(options)` will live in `pipeline-ui/auditor-recover-cli.js`. Its `close()` method closes the recovery store. The generic broker and worker lifecycle store are not instantiated. Test-only dependency injection is supported via the `options` argument.
 
 ### Q2 — registry_binding_state vocabulary
 
 **Status**: `RESOLVED_FOR_07B`
 
-**Resolution**: The exhaustive vocabulary is now verified from `registry.js` source (L83-L86) and documented in §1.3. The five possible values are: `AUDITOR_REGISTRATION_REQUIRED`, `AUDITOR_BOUND_READY`, `AUDITOR_BOUND_DISABLED`, `PROJECT_NOT_FOUND`, `UNKNOWN`. These are the exact strings the JSON output schema uses. No additional discovery required.
+**Resolution**: Verified from `registry.js` (L83-L86) and lifecycle inspect wrapper: `AUDITOR_REGISTRATION_REQUIRED`, `AUDITOR_BOUND_READY`, `AUDITOR_BOUND_DISABLED`, `PROJECT_NOT_FOUND`, `UNKNOWN`.
 
 ### Q3 — retire-legacy --confirm gate
 
 **Status**: `RESOLVED_FOR_07B`
 
-**Resolution**: `--confirm` is a boolean presence flag (no value). Presence = operator consent. Absence = `INVALID_CLI_REQUEST` / exit 2. This follows POSIX conventions and keeps parsing unambiguous. No `--confirm=RETIRE_LEGACY` value is required or accepted (a value would make `--confirm` a key-value flag, adding parsing complexity for no benefit). ARC-048 covers the missing-confirm case.
+**Resolution**: `--confirm` is a boolean presence flag (no value). Presence = operator consent. Absence = `INVALID_CLI_REQUEST` / exit 2.
 
 ### Q4 — recover AUDIT_UNCERTAIN with turn_id === null
 
 **Status**: `RESOLVED_FOR_07B`
 
-**Resolution**: When `recoverAuditorBootstrap` returns `{ ok: false, status: 'AUDIT_UNCERTAIN' }` (including the turn_id-missing case), the CLI maps this to exit 5. The CLI does NOT automatically invoke `resolve-uncertainty`. The operator must call `resolve-uncertainty` explicitly after `recover` returns exit 5. ARC-017 verifies that `recover` on an already-uncertain bootstrap exits 5. ARC-032 verifies `resolve-uncertainty` on a bootstrap with no `turn_id` also exits 5. The distinction between these two cases is observable from the exit-5 JSON output (`recover` includes `message`; `resolve-uncertainty` includes `reason`). No further ambiguity.
+**Resolution**: When `recoverAuditorBootstrap` returns `{ ok: false, status: 'AUDIT_UNCERTAIN' }`, CLI exits 5. The CLI never automatically invokes `resolve-uncertainty`. The operator must call `resolve-uncertainty` explicitly.
