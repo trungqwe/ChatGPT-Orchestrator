@@ -2,13 +2,14 @@
 
 ## RUNTIME MODEL CATALOG AUTHORITY / LOGICAL POLICY RESOLUTION / FIRST-TURN MODEL+EFFORT PINNING
 
-- **Work Order**: WO-V4-06A
+- **Work Order**: WO-V4-06A & WO-V4-06A-R1
 - **Repository**: `https://github.com/trungqwe/ChatGPT-Orchestrator`
-- **Parent Commit**: `f6237a73b7db8dbba324d7416df52a10792be1d0`
-- **Branch**: `impl/v4-wp06a-model-policy-resolver`
-- **Status**: `READY_FOR_WP_V4_06A_EXTERNAL_REVIEW`
+- **Correction Parent**: `6c883bf053b33dad83115418cd1ecf0f29f9ec76`
+- **06A Parent**: `f6237a73b7db8dbba324d7416df52a10792be1d0`
+- **Branch**: `fix/v4-wp06a-r1-model-resolution-freshness`
+- **Status**: `READY_FOR_WP_V4_06A_R1_EXTERNAL_REVIEW`
 - **WP-V4-05 Status**: `APPROVED_CLOSED`
-- **WP-V4-06 Status**: `IN_PROGRESS` (06A Complete, 06B Pending)
+- **WP-V4-06 Status**: `IN_PROGRESS` (06A-R1 Complete, 06B Pending)
 - **WP-V4-07 Status**: `NOT_STARTED`
 
 ---
@@ -16,6 +17,11 @@
 ## 1. Executive Summary
 
 WO-V4-06A establishes runtime model catalog authority for Native Codex auditor threads without hard-coding any concrete model names or assumptions into the production codebase. Logical auditor policies (`auditor_fast`, `auditor_standard`, `auditor_deep`, `architecture_deep`) are dynamically resolved against the provider's visible runtime catalog (`model/list`). The exact resolved wire `model` selector and `reasoning_effort` are pinned and forwarded to the first meaningful audit turn (`turn/start`).
+
+WO-V4-06A-R1 seals the post-catalog freshness window:
+1. **Post-Catalog Freshness Seal (Gate B)**: In addition to Gate A before catalog I/O, Gate B is executed immediately after model resolution and immediately before writing `FIRST_TURN_STARTING`. Gate B re-reads fresh Registry state, asserting strict UNBOUND and full persisted authority match. Any drift results in 0 `startTurn` calls, `FIRST_TURN_STARTING` NOT written, state remaining `PROVISIONAL_THREAD`, and client1 closed.
+2. **Exact Pagination Boundary**: Corrected page limit boundary logic in adapter: a catalog terminating at page 50 (`nextCursor === null`) succeeds with 50 provider calls; if page 50 returns a non-null `nextCursor` (page 51 required), it fails closed with `CODEX_APP_SERVER_INVALID_RESPONSE` without issuing a page-51 request.
+3. **Cursor Bound Normalization**: Aligned documentation and reports with production source authority: `MAX_CURSOR_BYTES = 512`.
 
 ---
 
@@ -36,19 +42,24 @@ WO-V4-06A establishes runtime model catalog authority for Native Codex auditor t
 - Finite Safety Bounds:
   - `MAX_MODEL_LIST_PAGES = 50`
   - `MAX_MODEL_CATALOG_ENTRIES = 1000`
-  - `MAX_CURSOR_BYTES = 4096`
+  - `MAX_CURSOR_BYTES = 512` (source authority)
+- Pagination Boundary Semantics:
+  - Exactly 1 to 50 pages consumable when page 50 terminates (`nextCursor === null`).
+  - If page 50 returns another non-null cursor (page 51 required), fails closed without requesting page 51.
 - Strictly rejects pagination cycles, repeated cursors, malformed cursor strings, and catalog overflows fail-closed.
 - Extended `startTurn({ threadId, input, outputSchema, model, effort })` with client-side bounds and control-character validation, forwarding exact values to provider stdio JSONL.
 
-### 2.3 First-Turn Pinning Boundary (`pipeline-ui/lib/relay/auditor-thread-lifecycle.js`)
-- Integrated in `bootstrapAuditorThread` strictly between the R3 Registry freshness gate and `FIRST_TURN_STARTING`.
-- Resolver consumes `persistedBootstrap.expected_auditor_model_policy` and the complete runtime catalog.
-- Fail-Closed Semantics:
-  - If `model/list`, catalog validation, or policy resolution fails, execution halts immediately before `FIRST_TURN_STARTING`.
-  - Zero model turns are dispatched (`startTurn` called 0 times).
-  - Recovery state remains in `PROVISIONAL_THREAD` (never transitioning to `AUDIT_UNCERTAIN`).
+### 2.3 Double Freshness Seal & First-Turn Pinning Boundary (`pipeline-ui/lib/relay/auditor-thread-lifecycle.js`)
+- **Fresh Registry Gate A** (pre-catalog): Ensures catalog I/O is never initiated under already-stale authority.
+- **Resolver**: Consumes `persistedBootstrap.expected_auditor_model_policy` and complete catalog. Locally freezes resolved model and reasoning effort.
+- **Fresh Registry Gate B** (post-catalog pre-turn): Re-reads fresh Registry state and re-executes `assertBootstrapAuthorityMatchesRegistry()`. Prevents turn dispatch if Registry drifted during catalog I/O.
+- **Zero-Turn Failure Semantics**:
+  - `startTurn` called: 0 times.
+  - Model turns: 0.
+  - `FIRST_TURN_STARTING`: NOT written.
+  - Recovery state remains `PROVISIONAL_THREAD` (never transitioning to `AUDIT_UNCERTAIN`).
   - Registry remains unbound (`auditor.thread_id === null`).
-  - Client 1 is closed cleanly.
+  - Client 1 closed cleanly.
 - Historical Recovery Invariant: `recoverAuditorBootstrap` and `resolveAuditorBootstrapUncertainty` make zero `model/list` calls, preserving historical thread authority.
 
 ---
@@ -60,8 +71,8 @@ All 14 deterministic test suites pass with exit code 0 (`npm test`):
 | Test Suite | Identifier | Tests | Status |
 |---|---|---|---|
 | Model Policy Resolver | MPR-001 .. MPR-021 | 21 | PASS |
-| Codex App Server Client & Adapter | CAS-001 .. CAS-094 | 94 | PASS |
-| Auditor Thread Lifecycle | ATL-001 .. ATL-129 | 129 | PASS |
+| Codex App Server Client & Adapter | CAS-001 .. CAS-096 | 96 | PASS |
+| Auditor Thread Lifecycle | ATL-001 .. ATL-133 | 133 | PASS |
 | Audit Decision | AD-001 .. AD-122 | 122 | PASS |
 | Auditor Recovery Store | ARS-001 .. ARS-082 | 82 | PASS |
 | Registry V2 Core & Migration | RG / RV2 | 91 | PASS |
@@ -71,7 +82,9 @@ All 14 deterministic test suites pass with exit code 0 (`npm test`):
 ### Key Test Ranges Added
 - **MPR-001 .. MPR-021**: Pure resolver test coverage (standard, fast, deep, architecture_deep, worker policies rejected, malformed catalog, duplicate selectors, multiple defaults, unknown efforts, tie-break rules, zero hardcoded models).
 - **CAS-085 .. CAS-094**: Catalog pagination (`data` response, multi-page cursor forwarding, repeated cursor rejection, malformed cursor rejection, catalog size bound, `startTurn` model/effort validation and wire forwarding).
-- **ATL-123 .. ATL-129**: Lifecycle order verification (listModels after R3 gate, before FIRST_TURN_STARTING, fail-closed leaves PROVISIONAL_THREAD with 0 turns, resolved model+effort forwarded to startTurn, drift rejected before catalog call, recovery path makes 0 catalog calls).
+- **CAS-095 .. CAS-096**: Exact 50-page terminal catalog succeeds (50 provider calls); page 51 required fails closed without page-51 request.
+- **ATL-123 .. ATL-129**: Lifecycle order verification (listModels after Gate A, before FIRST_TURN_STARTING, fail-closed leaves PROVISIONAL_THREAD with 0 turns, resolved model+effort forwarded to startTurn, drift rejected before catalog call, recovery path makes 0 catalog calls).
+- **ATL-130 .. ATL-133**: Gate B freshness verification (policy drift during model/list rejected by Gate B, binding drift during model/list rejected by Gate B, Gate B read failure rejected with 0 turns, exact execution order: Gate A < listModels < Gate B < FIRST_TURN_STARTING < startTurn reaching DURABLE_BOUND).
 
 ---
 
@@ -100,10 +113,14 @@ A real read-only probe was performed against the active Native Codex App Server:
 
 ## 5. Scope & Boundary Conformance
 
-- **Production Files Modified**: Exactly 3 files:
-  1. `pipeline-ui/lib/auditor/model-policy-resolver.js` (NEW)
-  2. `pipeline-ui/lib/auditor/codex-auditor-adapter.js` (MODIFIED)
-  3. `pipeline-ui/lib/relay/auditor-thread-lifecycle.js` (MODIFIED)
+- **Production Files Modified in R1**: Exactly 2 files:
+  1. `pipeline-ui/lib/auditor/codex-auditor-adapter.js` (MODIFIED)
+  2. `pipeline-ui/lib/relay/auditor-thread-lifecycle.js` (MODIFIED)
+- **Production Files Untouched**:
+  - `pipeline-ui/lib/auditor/model-policy-resolver.js` (UNTOUCHED)
+  - `pipeline-ui/lib/broker/registry.js` (UNTOUCHED)
+  - `pipeline-ui/lib/relay/sqlite-auditor-recovery-store.js` (UNTOUCHED)
+  - `package.json` (UNTOUCHED)
 - **Registry / Recovery Schemas**: Completely untouched (Registry schema v2, Recovery store user_version 2).
 - **Token Observability**: Explicitly omitted, reserved for WO-V4-06B.
 - **Worker Policies**: Explicitly rejected by Codex resolver as out-of-scope.

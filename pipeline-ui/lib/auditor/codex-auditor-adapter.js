@@ -169,6 +169,8 @@ class CodexAuditorAdapter {
     let currentCursor = null;
     let pageCount = 0;
 
+    let isTerminated = false;
+
     while (pageCount < MAX_MODEL_LIST_PAGES) {
       pageCount++;
       const requestParams = {
@@ -232,6 +234,7 @@ class CodexAuditorAdapter {
       // Check nextCursor validity
       if (!hasNextCursorField || nextCursor === null || nextCursor === undefined) {
         // Single page or terminal page reached
+        isTerminated = true;
         break;
       }
 
@@ -256,11 +259,19 @@ class CodexAuditorAdapter {
         );
       }
 
+      // If pageCount reached MAX_MODEL_LIST_PAGES and nextCursor is non-null, a 51st page would be required
+      if (pageCount >= MAX_MODEL_LIST_PAGES) {
+        throw createError(
+          'CODEX_APP_SERVER_INVALID_RESPONSE',
+          `model/list exceeded maximum page limit (${MAX_MODEL_LIST_PAGES} pages)`
+        );
+      }
+
       seenCursors.add(nextCursor);
       currentCursor = nextCursor;
     }
 
-    if (pageCount >= MAX_MODEL_LIST_PAGES && currentCursor !== null) {
+    if (!isTerminated) {
       throw createError(
         'CODEX_APP_SERVER_INVALID_RESPONSE',
         `model/list exceeded maximum page limit (${MAX_MODEL_LIST_PAGES} pages)`

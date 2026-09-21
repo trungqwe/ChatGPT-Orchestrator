@@ -234,6 +234,104 @@ function assertBootstrapAuthorityMatchesRegistry(active, project) {
  * @param {number} [options.turnTimeoutMs]
  * @returns {Promise<Object>}
  */
+/**
+ * Validate that fresh Registry state matches persisted bootstrap authority
+ * and is strictly UNBOUND (thread_id === null, enabled === false).
+ * Used at Gate A (pre-catalog) and Gate B (post-catalog pre-turn).
+ * Closes client1 on failure and throws AUDITOR_LIFECYCLE_PRECONDITION_FAILED or drift error.
+ *
+ * @param {Object} params
+ * @param {Object} params.registryPort
+ * @param {string} params.projectId
+ * @param {Object} params.persistedBootstrap
+ * @param {Object} [params.client1]
+ * @param {string} [params.stageDescription='before first turn']
+ * @returns {Promise<Object>} fresh project record
+ */
+async function assertFreshRegistryGate({
+  registryPort,
+  projectId,
+  persistedBootstrap,
+  client1,
+  stageDescription = 'before first turn'
+}) {
+  let freshProject;
+  try {
+    freshProject = await registryPort.getProject(projectId);
+  } catch (err) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Failed to read fresh registry state ${stageDescription} for project '${projectId}': ${err.message}`
+    );
+  }
+
+  if (!freshProject) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' missing in registry ${stageDescription}`
+    );
+  }
+
+  const freshProjId = freshProject.project_id || freshProject.id;
+  if (freshProjId !== projectId) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project ID mismatch in registry ${stageDescription}: expected '${projectId}', got '${freshProjId}'`
+    );
+  }
+
+  if (!freshProject.auditor || typeof freshProject.auditor !== 'object') {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' auditor configuration missing in registry ${stageDescription}`
+    );
+  }
+
+  if (freshProject.auditor.thread_id !== null) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' auditor became bound ${stageDescription} (thread_id='${freshProject.auditor.thread_id}')`
+    );
+  }
+
+  if (freshProject.auditor.enabled !== false) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw new AuditorLifecycleError(
+      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
+      `Project '${projectId}' auditor became enabled ${stageDescription} (enabled=${freshProject.auditor.enabled})`
+    );
+  }
+
+  // Self-verify persisted authority against fresh Registry project record
+  try {
+    assertBootstrapAuthorityMatchesRegistry(persistedBootstrap, freshProject);
+  } catch (err) {
+    if (client1) {
+      try { await client1.close(); } catch {}
+    }
+    throw err;
+  }
+
+  return freshProject;
+}
+
 async function bootstrapAuditorThread(options) {
   if (!options || typeof options !== 'object') {
     throw new AuditorLifecycleError(
@@ -504,80 +602,14 @@ async function bootstrapAuditorThread(options) {
     );
   }
 
-  // R3: Fresh post-persistence Registry read before first turn (Sections 2 & 3)
-  let freshProjectBeforeFirstTurn;
-  try {
-    freshProjectBeforeFirstTurn = await registryPort.getProject(projectId);
-  } catch (err) {
-    if (client1) {
-      try { await client1.close(); } catch {}
-    }
-    throw new AuditorLifecycleError(
-      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      `Failed to read fresh registry state before first turn for project '${projectId}': ${err.message}`
-    );
-  }
-
-  if (!freshProjectBeforeFirstTurn) {
-    if (client1) {
-      try { await client1.close(); } catch {}
-    }
-    throw new AuditorLifecycleError(
-      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      `Project '${projectId}' missing in registry before first turn`
-    );
-  }
-
-  const freshProjId = freshProjectBeforeFirstTurn.project_id || freshProjectBeforeFirstTurn.id;
-  if (freshProjId !== projectId) {
-    if (client1) {
-      try { await client1.close(); } catch {}
-    }
-    throw new AuditorLifecycleError(
-      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      `Project ID mismatch in registry before first turn: expected '${projectId}', got '${freshProjId}'`
-    );
-  }
-
-  if (!freshProjectBeforeFirstTurn.auditor || typeof freshProjectBeforeFirstTurn.auditor !== 'object') {
-    if (client1) {
-      try { await client1.close(); } catch {}
-    }
-    throw new AuditorLifecycleError(
-      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      `Project '${projectId}' auditor configuration missing in registry before first turn`
-    );
-  }
-
-  if (freshProjectBeforeFirstTurn.auditor.thread_id !== null) {
-    if (client1) {
-      try { await client1.close(); } catch {}
-    }
-    throw new AuditorLifecycleError(
-      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      `Project '${projectId}' auditor became bound before first turn (thread_id='${freshProjectBeforeFirstTurn.auditor.thread_id}')`
-    );
-  }
-
-  if (freshProjectBeforeFirstTurn.auditor.enabled !== false) {
-    if (client1) {
-      try { await client1.close(); } catch {}
-    }
-    throw new AuditorLifecycleError(
-      LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED,
-      `Project '${projectId}' auditor became enabled before first turn (enabled=${freshProjectBeforeFirstTurn.auditor.enabled})`
-    );
-  }
-
-  // Self-verify persisted authority against fresh Registry project record
-  try {
-    assertBootstrapAuthorityMatchesRegistry(persistedBootstrap, freshProjectBeforeFirstTurn);
-  } catch (err) {
-    if (client1) {
-      try { await client1.close(); } catch {}
-    }
-    throw err;
-  }
+  // 5. Gate A: Fresh post-persistence Registry read before model catalog query (WP-V4-05AG-R3 / WO-V4-06A-R1)
+  await assertFreshRegistryGate({
+    registryPort,
+    projectId,
+    persistedBootstrap,
+    client1,
+    stageDescription: 'before first turn'
+  });
 
   const expectedContext = Object.freeze({
     project_id: projectId,
@@ -601,6 +633,19 @@ async function bootstrapAuditorThread(options) {
     throw err;
   }
 
+  // Freeze resolved model + effort locally (WO-V4-06A-R1)
+  const resolvedModel = resolvedPolicy.model;
+  const resolvedEffort = resolvedPolicy.reasoning_effort;
+
+  // 5.6 Gate B: Fresh post-catalog Registry read immediately before FIRST_TURN_STARTING (WO-V4-06A-R1)
+  await assertFreshRegistryGate({
+    registryPort,
+    projectId,
+    persistedBootstrap,
+    client1,
+    stageDescription: 'before first turn'
+  });
+
   // 6. Precommit FIRST_TURN_STARTING before calling turn/start
   recoveryStore.transitionBootstrap({
     project_id: projectId,
@@ -618,8 +663,8 @@ async function bootstrapAuditorThread(options) {
       threadId,
       input: turnPrompt,
       outputSchema,
-      model: resolvedPolicy.model,
-      effort: resolvedPolicy.reasoning_effort
+      model: resolvedModel,
+      effort: resolvedEffort
     });
   } catch (err) {
     // Failure to start first turn leaves execution state uncertain

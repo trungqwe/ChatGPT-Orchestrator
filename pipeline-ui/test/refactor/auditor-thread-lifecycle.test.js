@@ -8029,7 +8029,416 @@ async function runAllTests() {
     }
   }
 
-  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-129: 129/129 PASS)');
+  // ATL-130: Policy drift during model/list rejected by Gate B
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-130');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-130', projDir, {
+        auditor: {
+          enabled: false,
+          thread_id: null,
+          model_policy: 'auditor_standard',
+          cwd: projDir
+        }
+      }));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      let listModelsCalls = 0;
+      let startTurnCalls = 0;
+      let client1Closed = false;
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-130' }),
+            listModels: async () => {
+              listModelsCalls++;
+              // Mutate Registry policy during model/list
+              const proj = await registryPort.getProject('proj-atl-130');
+              proj.auditor.model_policy = 'auditor_deep';
+              await registryPort.putProject(proj);
+              return DEFAULT_MOCK_MODELS;
+            },
+            startTurn: async () => {
+              startTurnCalls++;
+              return { turnId: 'turn-atl-130' };
+            },
+            close: async () => {
+              client1Closed = true;
+            }
+          };
+        }
+      };
+
+      await assert.rejects(
+        async () => {
+          await bootstrapAuditorThread({
+            projectId: 'proj-atl-130',
+            registryPort,
+            recoveryStore,
+            adapterFactory,
+            awaitAuditDecision: async () => {},
+            workspacePort: createMockWorkspacePort('ws-130'),
+            auditSubjectId: 'sub-130',
+            auditPrompt: DEFAULT_AUDIT_PROMPT
+          });
+        },
+        (err) => {
+          assert.strictEqual(err.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+          assert.ok(err.message.includes('Auditor model policy drift detected') || err.message.includes('model policy drift'));
+          return true;
+        }
+      );
+
+      assert.strictEqual(listModelsCalls, 1, 'listModels must have been called once');
+      assert.strictEqual(startTurnCalls, 0, 'startTurn must not be called when drift occurs during listModels');
+      assert.strictEqual(client1Closed, true, 'client1 must be closed');
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-130');
+      assert.ok(active, 'active recovery record must remain');
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD,
+        'state must remain PROVISIONAL_THREAD (FIRST_TURN_STARTING must not be written)');
+      assert.strictEqual(active.turn_id, null);
+
+      console.log('PASS: ATL-130 — policy drift during model/list rejected by Gate B');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-131: Binding drift during model/list rejected by Gate B
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-131');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const registryPort = createProjectRegistry({ registryFilePath: regFile });
+      await registryPort.putProject(makeValidProject('proj-atl-131', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      let listModelsCalls = 0;
+      let startTurnCalls = 0;
+      let client1Closed = false;
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-131' }),
+            listModels: async () => {
+              listModelsCalls++;
+              // Mutate Registry to bound state during model/list
+              const proj = await registryPort.getProject('proj-atl-131');
+              proj.auditor.thread_id = 'thr-foreign-131';
+              proj.auditor.enabled = true;
+              await registryPort.putProject(proj);
+              return DEFAULT_MOCK_MODELS;
+            },
+            startTurn: async () => {
+              startTurnCalls++;
+              return { turnId: 'turn-atl-131' };
+            },
+            close: async () => {
+              client1Closed = true;
+            }
+          };
+        }
+      };
+
+      await assert.rejects(
+        async () => {
+          await bootstrapAuditorThread({
+            projectId: 'proj-atl-131',
+            registryPort,
+            recoveryStore,
+            adapterFactory,
+            awaitAuditDecision: async () => {},
+            workspacePort: createMockWorkspacePort('ws-131'),
+            auditSubjectId: 'sub-131',
+            auditPrompt: DEFAULT_AUDIT_PROMPT
+          });
+        },
+        (err) => {
+          assert.strictEqual(err.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+          assert.ok(err.message.includes('auditor became bound before first turn'));
+          return true;
+        }
+      );
+
+      assert.strictEqual(listModelsCalls, 1);
+      assert.strictEqual(startTurnCalls, 0);
+      assert.strictEqual(client1Closed, true);
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-131');
+      assert.ok(active);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD);
+      assert.strictEqual(active.turn_id, null);
+
+      // Verify Registry remains bound to the foreign thread, not bound by lifecycle
+      const projAfter = await registryPort.getProject('proj-atl-131');
+      assert.strictEqual(projAfter.auditor.thread_id, 'thr-foreign-131');
+
+      console.log('PASS: ATL-131 — binding drift during model/list rejected by Gate B');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-132: Post-resolution registry read failure
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-132');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const realRegistry = createProjectRegistry({ registryFilePath: regFile });
+      await realRegistry.putProject(makeValidProject('proj-atl-132', projDir));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      let getProjectCalls = 0;
+      const registryPort = {
+        getProject: async (pid) => {
+          getProjectCalls++;
+          if (getProjectCalls === 3) {
+            // Call 1: initial getProject before thread/start
+            // Call 2: Gate A fresh read
+            // Call 3: Gate B fresh read -> throw!
+            throw new Error('Registry storage I/O error at Gate B');
+          }
+          return realRegistry.getProject(pid);
+        },
+        bindAuditorThread: (...args) => realRegistry.bindAuditorThread(...args),
+        putProject: async (p) => realRegistry.putProject(p)
+      };
+
+      let startTurnCalls = 0;
+      let client1Closed = false;
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => ({ threadId: 'thr-atl-132' }),
+            listModels: async () => DEFAULT_MOCK_MODELS,
+            startTurn: async () => {
+              startTurnCalls++;
+              return { turnId: 'turn-atl-132' };
+            },
+            close: async () => {
+              client1Closed = true;
+            }
+          };
+        }
+      };
+
+      await assert.rejects(
+        async () => {
+          await bootstrapAuditorThread({
+            projectId: 'proj-atl-132',
+            registryPort,
+            recoveryStore,
+            adapterFactory,
+            awaitAuditDecision: async () => {},
+            workspacePort: createMockWorkspacePort('ws-132'),
+            auditSubjectId: 'sub-132',
+            auditPrompt: DEFAULT_AUDIT_PROMPT
+          });
+        },
+        (err) => {
+          assert.strictEqual(err.code, LIFECYCLE_ERROR_CODES.AUDITOR_LIFECYCLE_PRECONDITION_FAILED);
+          assert.ok(err.message.includes('Failed to read fresh registry state before first turn'));
+          assert.ok(err.message.includes('Registry storage I/O error at Gate B'));
+          return true;
+        }
+      );
+
+      assert.strictEqual(startTurnCalls, 0, 'startTurn must not be called when Gate B read throws');
+      assert.strictEqual(client1Closed, true, 'client1 must be closed');
+
+      const active = recoveryStore.getActiveBootstrap('proj-atl-132');
+      assert.ok(active);
+      assert.strictEqual(active.state, AUDITOR_BOOTSTRAP_STATES.PROVISIONAL_THREAD,
+        'state must remain PROVISIONAL_THREAD, AUDIT_UNCERTAIN must NOT be written');
+      assert.strictEqual(active.turn_id, null);
+
+      console.log('PASS: ATL-132 — post-resolution registry read failure rejected before turn');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  // ATL-133: Exact success order with Gate A, model resolution, Gate B, and first-turn pinning
+  {
+    const sandbox = createTestSandbox();
+    let recoveryStore = null;
+    try {
+      const regFile = path.join(sandbox.dir, 'projects.json');
+      const dbFile = path.join(sandbox.dir, 'recovery.db');
+      const projDir = path.join(sandbox.dir, 'proj-atl-133');
+      fs.mkdirSync(projDir, { recursive: true });
+
+      const realRegistry = createProjectRegistry({ registryFilePath: regFile });
+      await realRegistry.putProject(makeValidProject('proj-atl-133', projDir, {
+        auditor: {
+          enabled: false,
+          thread_id: null,
+          model_policy: 'auditor_fast',
+          cwd: projDir
+        }
+      }));
+
+      recoveryStore = createSqliteAuditorRecoveryStoreRaw({ dbPath: dbFile });
+
+      const eventSequence = [];
+      let getProjectCount = 0;
+      const registryPort = {
+        getProject: async (pid) => {
+          getProjectCount++;
+          if (getProjectCount === 1) eventSequence.push('getProject_initial');
+          else if (getProjectCount === 2) eventSequence.push('getProject_gateA');
+          else if (getProjectCount === 3) eventSequence.push('getProject_gateB');
+          else eventSequence.push('getProject_' + getProjectCount);
+          return realRegistry.getProject(pid);
+        },
+        bindAuditorThread: (...args) => realRegistry.bindAuditorThread(...args),
+        putProject: async (p) => realRegistry.putProject(p)
+      };
+
+      const origTransition = recoveryStore.transitionBootstrap;
+      recoveryStore.transitionBootstrap = function(record) {
+        eventSequence.push('transition_' + record.next_state);
+        return origTransition.call(recoveryStore, record);
+      };
+
+      let capturedStartTurnParams = null;
+      let gateBCompletedBeforeStartTurn = false;
+
+      const testModels = [
+        {
+          id: 'cat-std-133',
+          model: 'mock-std-133',
+          hidden: false,
+          isDefault: true,
+          defaultReasoningEffort: 'high',
+          supportedReasoningEfforts: [{ reasoningEffort: 'high' }]
+        },
+        {
+          id: 'cat-fast-133',
+          model: 'mock-fast-133',
+          hidden: false,
+          isDefault: false,
+          defaultReasoningEffort: 'low',
+          supportedReasoningEfforts: [{ reasoningEffort: 'low' }]
+        }
+      ];
+
+      const adapterFactory = async ({ phase }) => {
+        if (phase === 'provisional') {
+          return {
+            initialize: async () => {},
+            startThread: async () => {
+              eventSequence.push('startThread');
+              return { threadId: 'thr-atl-133' };
+            },
+            listModels: async () => {
+              eventSequence.push('listModels');
+              return testModels;
+            },
+            startTurn: async (params) => {
+              eventSequence.push('startTurn');
+              gateBCompletedBeforeStartTurn = eventSequence.includes('getProject_gateB');
+              capturedStartTurnParams = params;
+              return { turnId: 'turn-atl-133' };
+            },
+            close: async () => {}
+          };
+        }
+        if (phase === 'resume_verify') {
+          return {
+            initialize: async () => {},
+            resumeThread: async () => ({ threadId: 'thr-atl-133' }),
+            close: async () => {}
+          };
+        }
+      };
+
+      const result = await bootstrapAuditorThread({
+        projectId: 'proj-atl-133',
+        registryPort,
+        recoveryStore,
+        adapterFactory,
+        awaitAuditDecision: async () => ({
+          schema_version: 1,
+          decision: 'APPROVE_WORK_PACKAGE',
+          project_id: 'proj-atl-133',
+          audit_subject_id: 'sub-133',
+          auditor_thread_id: 'thr-atl-133',
+          workspace_state_observed: 'ws-133',
+          summary: 'Decision valid',
+          independent_verification: [{ kind: 'SOURCE_INSPECTION', result: 'PASS', evidence: 'OK' }],
+          work_order: null,
+          requested_evidence: [],
+          blocker: null
+        }),
+        workspacePort: createMockWorkspacePort('ws-133'),
+        auditSubjectId: 'sub-133',
+        auditPrompt: DEFAULT_AUDIT_PROMPT
+      });
+
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.status, 'DURABLE_BOUND');
+
+      assert.strictEqual(gateBCompletedBeforeStartTurn, true, 'Gate B must have completed before startTurn');
+      assert.strictEqual(capturedStartTurnParams.model, 'mock-fast-133');
+      assert.strictEqual(capturedStartTurnParams.effort, 'low');
+
+      const idxGateA = eventSequence.indexOf('getProject_gateA');
+      const idxListModels = eventSequence.indexOf('listModels');
+      const idxGateB = eventSequence.indexOf('getProject_gateB');
+      const idxFTS = eventSequence.indexOf('transition_FIRST_TURN_STARTING');
+      const idxStartTurn = eventSequence.indexOf('startTurn');
+
+      assert.ok(idxGateA !== -1, 'Gate A must occur');
+      assert.ok(idxListModels !== -1, 'listModels must occur');
+      assert.ok(idxGateB !== -1, 'Gate B must occur');
+      assert.ok(idxFTS !== -1, 'transition to FIRST_TURN_STARTING must occur');
+      assert.ok(idxStartTurn !== -1, 'startTurn must occur');
+
+      // Assert exact ordering: Gate A < listModels < Gate B < FIRST_TURN_STARTING < startTurn
+      assert.ok(idxGateA < idxListModels, 'Gate A must precede listModels');
+      assert.ok(idxListModels < idxGateB, 'listModels must precede Gate B');
+      assert.ok(idxGateB < idxFTS, 'Gate B must precede FIRST_TURN_STARTING');
+      assert.ok(idxFTS < idxStartTurn, 'FIRST_TURN_STARTING must precede startTurn');
+
+      console.log('PASS: ATL-133 — exact success order: Gate A < listModels < Gate B < FIRST_TURN_STARTING < startTurn');
+    } finally {
+      if (recoveryStore) recoveryStore.close();
+      sandbox.cleanup();
+    }
+  }
+
+  console.log('ALL AUDITOR THREAD LIFECYCLE TESTS PASSED (ATL-001 .. ATL-133: 133/133 PASS)');
   console.log('======================================================================\n');
 }
 

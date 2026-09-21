@@ -1957,8 +1957,89 @@ async function runTests() {
     }
   }
 
+  // CAS-095: exact maximum page count succeeds
+  {
+    let callCount = 0;
+    const requestedCursors = [];
+    const mockClient = {
+      on: () => {},
+      sendRequest: async (method, params) => {
+        assert.strictEqual(method, 'model/list');
+        callCount++;
+        requestedCursors.push(params.cursor || null);
+        const pageIdx = callCount;
+        const modelEntry = {
+          id: `mod-page-${pageIdx}`,
+          model: `mod-page-${pageIdx}`,
+          hidden: false,
+          isDefault: pageIdx === 1,
+          defaultReasoningEffort: 'low',
+          supportedReasoningEfforts: [{ reasoningEffort: 'low' }]
+        };
+        if (pageIdx < 50) {
+          return {
+            data: [modelEntry],
+            nextCursor: `cursor_page_${pageIdx + 1}`
+          };
+        } else {
+          return {
+            data: [modelEntry],
+            nextCursor: null
+          };
+        }
+      }
+    };
+    const adapter = new CodexAuditorAdapter({ client: mockClient });
+    const models = await adapter.listModels();
+    assert.strictEqual(callCount, 50, 'provider model/list must be called exactly 50 times');
+    assert.strictEqual(models.length, 50, 'all 50 models must be returned');
+    assert.strictEqual(models[0].id, 'mod-page-1');
+    assert.strictEqual(models[49].id, 'mod-page-50');
+    assert.strictEqual(requestedCursors[0], null);
+    assert.strictEqual(requestedCursors[1], 'cursor_page_2');
+    assert.strictEqual(requestedCursors[49], 'cursor_page_50');
+    console.log('PASS: CAS-095 — exact maximum page count succeeds');
+  }
+
+  // CAS-096: page 51 required fails closed
+  {
+    let callCount = 0;
+    const mockClient = {
+      on: () => {},
+      sendRequest: async (method, params) => {
+        assert.strictEqual(method, 'model/list');
+        callCount++;
+        const pageIdx = callCount;
+        const modelEntry = {
+          id: `mod-page-${pageIdx}`,
+          model: `mod-page-${pageIdx}`,
+          hidden: false,
+          isDefault: pageIdx === 1,
+          defaultReasoningEffort: 'low',
+          supportedReasoningEfforts: [{ reasoningEffort: 'low' }]
+        };
+        return {
+          data: [modelEntry],
+          nextCursor: `cursor_page_${pageIdx + 1}`
+        };
+      }
+    };
+    const adapter = new CodexAuditorAdapter({ client: mockClient });
+    let caught = null;
+    try {
+      await adapter.listModels();
+    } catch (err) {
+      caught = err;
+    }
+    assert.notStrictEqual(caught, null);
+    assert.strictEqual(caught.code, 'CODEX_APP_SERVER_INVALID_RESPONSE');
+    assert.strictEqual(caught.message.includes('exceeded maximum page limit'), true);
+    assert.strictEqual(callCount, 50, 'must not issue page-51 request');
+    console.log('PASS: CAS-096 — page 51 required fails closed');
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-094: 94/94 PASS)');
+  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-096: 96/96 PASS)');
   console.log('======================================================================');
 }
 
