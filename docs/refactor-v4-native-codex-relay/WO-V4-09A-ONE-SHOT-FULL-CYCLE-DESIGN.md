@@ -1,17 +1,20 @@
-# WO-V4-09A-R1: One-Shot Full-Cycle Coordinator & Real Acceptance Design Seal (Corrected)
+# WO-V4-09A-R2: One-Shot Full-Cycle Coordinator & Real Acceptance Design Seal (R2)
 
 ## 1. Document & Work Package Identity
 
 - **Work Package**: WP-V4-09 (One-Shot Full Cycle)
-- **Phase**: Design Seal Revision 1 (WO-V4-09A-R1)
+- **Phase**: Design Seal Revision 2 (WO-V4-09A-R2)
 - **Status**: DESIGN_COMPLETE / EXTERNAL_REVIEW_PENDING
-- **Parent Commit**: `c1ce796bf4f8648f845b0c19da553dbe0835b8e5`
+- **Parent Commit**: `1e9db50049b5d270a8a14857539b17f4931e6d0f`
 - **Canonical Branch**: `dev/v4-clean`
 - **Scope**: Documentation only (no production code, no test modifications, no registry modifications, no runtime execution)
-- **Purpose**: Correct three categories of design ambiguity found during external review of WO-V4-09A:
-  1. Source-reality method names (broker surface vs CLI command names; workspace port API)
-  2. Audit decision execution helpers and model resolver call shape
-  3. Registry authority gate sequence (A/B/C/D/final), coordinator input signature, auditor factory contract, adapter cleanup authority, turn uncertainty classification, and OSC test matrix expansion to 42 minimum
+- **Purpose**: Correct remaining design ambiguities found during external review of WO-V4-09A-R1:
+  1. Canonical project root authority (use `canonicalizeProjectRoot`, not raw string comparison)
+  2. `policy.max_active_dispatches === 1` as explicit Gate A requirement
+  3. Exact `awaitAuditDecisionV1` error-boundary mapping (`AUDIT_DECISION_ITEMS_INCOMPLETE` → `DECISION_INVALID`, `AUDIT_DECISION_TURN_NOT_COMPLETED` → `AUDITOR_TURN_FAILED`)
+  4. Remove contradictory rule claiming hydration read failure is separately recoverable by coordinator
+  5. Auditor close failure overrides approved result
+  6. Full-cycle pass invariant count corrected to 14
 
 ---
 
@@ -23,16 +26,7 @@ Authoritative closed packages:
 - `WP-V4-08B`: `APPROVED_CLOSED`
 - `WP-V4-08`: `APPROVED_CLOSED` (closure commit `0fbf614f976ba6f184254620077b2d38baa30689`)
 
-The target V4 architecture:
-```text
-Operator
-  ↓
-Thin Relay
-  ├── Native Codex Auditor (Thread-backed, AuditDecisionV1 authority)
-  └── Worker Adapter Registry (WorkerPortV1 facade: dispatch + wait)
-```
-
-**Identified Source Reality**:
+**Source Reality** (verified canonical source):
 
 1. **Broker surface** (`pipeline-ui/lib/broker/broker.js`):
    ```text
@@ -42,63 +36,57 @@ Thin Relay
    broker.getProject(projectId)
    broker.getWorkspaceState(projectId)
    ```
-   Note: `snapshot` is an `agent-broker-cli.js` command that delegates to `broker.getWorkspaceState(projectId)`. CLI command names must not be conflated with broker method names.
+   `snapshot` is a CLI command in `agent-broker-cli.js` that delegates to `broker.getWorkspaceState()`. CLI names must not be conflated with broker method names.
 
-2. **Workspace Port API**: Every workspace snapshot calculation uses:
+2. **Workspace Port API**: Every snapshot uses:
    ```js
    await workspacePort.getWorkspaceState(project)
    ```
-   There is no production `computeWorkspaceState()` port method.
+   No production `computeWorkspaceState()` exists.
 
-3. **Audit Decision Execution** uses the existing helpers:
+3. **Canonical Root Authority**: `pipeline-ui/lib/broker/registry.js` exports:
+   ```js
+   canonicalizeProjectRoot(rawPath) → { canonicalRoot, identityKey }
+   ```
+   This function performs runtime filesystem resolution. All path identity comparisons must use its `identityKey`, not raw string or lexical normalization alone.
+
+4. **Audit Decision Execution** uses existing helpers:
    ```js
    buildAuditDecisionV1OutputSchema(expectedContext)
    auditor.startTurn({ threadId, input, outputSchema, model, effort })
    awaitAuditDecisionV1(auditor, { threadId, turnId, expectedContext, timeoutMs })
    ```
-   There is no generic `validateAuditDecision(rawDecision, expectedContext)`.
 
-4. **Model Policy Resolver** call shape:
+5. **Model Policy Resolver** call shape:
    ```js
    resolveAuditorModelPolicy({ policy: project.auditor.model_policy, models: catalog })
    ```
-   Not `resolveAuditorModelPolicy(catalog, policyDescriptor)`.
 
-5. **Absence of Production Composite Commands**: No `one-shot-cycle`, `full-cycle`, or `audit-and-dispatch` in production source.
-
-6. **Auditor Lifecycle Scope**: `auditor-thread-lifecycle.js` is strictly for unbound auditor bootstrapping. Normal WP09 operation uses an already-bound thread from Registry.
+6. **Absence of Production Composite Commands**: No `one-shot-cycle`, `full-cycle`, or `audit-and-dispatch` in production source. The coordinator is a new module.
 
 ---
 
 ## 3. Core One-Shot Coordinator Contract
 
-The coordinator will be introduced in WP09B as pure orchestration logic:
-
 ```js
 runOneShotCycle({
-  projectId,           // valid non-empty project ID string
-  auditSubjectId,      // non-empty bounded identifier (same for Turn A and Turn B)
-  auditPrompt,         // non-empty adapter-compatible input array (Turn A)
-  reviewPrompt,        // non-empty adapter-compatible input array (Turn B; explicit caller input)
+  projectId,            // valid non-empty project ID string
+  auditSubjectId,       // non-empty bounded identifier; SAME for Turn A and Turn B
+  auditPrompt,          // non-empty adapter-compatible input array (Turn A)
+  reviewPrompt,         // non-empty adapter-compatible input array (Turn B; explicit caller input)
 
-  registryPort,        // existing Registry authority
-  workspacePort,       // workspace state authority
-  broker,              // existing broker
-  auditorFactory,      // factory: async ({ phase, cwd }) => adapter
+  registryPort,         // existing Registry authority
+  workspacePort,        // workspace state authority
+  broker,               // existing broker
+  auditorFactory,       // factory: async ({ phase, cwd }) => adapter
 
-  turnTimeoutMs,       // bounded Turn A / Turn B timeout
+  turnTimeoutMs,        // bounded Turn A / Turn B timeout
   workerWaitTimeoutSecs // bounded worker wait timeout
 })
 ```
 
-### Caller Input Requirements
-- `auditSubjectId`: shared audit subject identity for both turns. One cycle audits one logical work package.
-- `auditPrompt`: explicit caller input for Turn A. The coordinator must not invent it.
-- `reviewPrompt`: explicit caller input for Turn B. The coordinator must not invent a post-worker prompt from worker prose.
-- Turn A and Turn B differ by `prompt`, `workspace_state_observed`, and `turn ID` — **not** by `audit_subject_id`.
-
 ### Separation of Ownership
-The coordinator orchestrates existing domain authorities and explicitly does **not** own:
+The coordinator orchestrates existing domain authorities and does **not** own:
 - Registry persistence or validation logic (`registry.js`)
 - Worker lifecycle store persistence
 - Auditor thread creation or recovery store (`auditor-thread-lifecycle.js`, `sqlite-auditor-recovery-store.js`)
@@ -111,24 +99,19 @@ The coordinator orchestrates existing domain authorities and explicitly does **n
 
 ## 4. auditorFactory Contract
 
-The injected factory is called exactly once:
-
+Called exactly once:
 ```js
 const auditor = await auditorFactory({
   phase: 'one_shot_cycle',
-  cwd: canonicalProjectRoot
+  cwd: canonicalProjectRoot   // MUST be the canonical root from canonicalizeProjectRoot
 })
 ```
 
+The `cwd` must be derived from `canonicalizeProjectRoot(projectA.project_root).canonicalRoot` — not from raw `project_root`, raw `auditor.cwd`, `path.normalize` alone, `computeRootIdentityKey` alone, or caller input.
+
 The returned adapter instance must support:
 ```text
-initialize
-resumeThread
-listModels
-startTurn
-waitForTurnCompletion
-readThread
-close
+initialize, resumeThread, listModels, startTurn, waitForTurnCompletion, readThread, close
 ```
 
 Required initialization sequence:
@@ -152,26 +135,48 @@ Once an auditor adapter has been created, the coordinator **must** close it thro
 close attempts: exactly 1
 ```
 
-This applies on every terminal path after successful factory creation, including:
+This applies on every terminal path after successful factory creation.
+
+### Close Failure Overrides Result
+
+If the cycle body computed any candidate result:
 ```text
-resume mismatch, catalog failure, authority drift, Turn A terminal branch,
-stale S1, worker policy mismatch, worker dispatch failure, worker pending,
-Turn B terminal branch, approval, stale S3
+APPROVED, APPROVED_WITHOUT_DISPATCH, EVIDENCE_REQUIRED,
+BLOCKED, STOPPED, WORKER_PENDING, CYCLE_LIMIT_REACHED, FAILED
+```
+but the subsequent `await auditor.close()` fails, the externally returned result becomes:
+```text
+status: FAILED
+code: AUDITOR_CLOSE_FAILED
 ```
 
-A close failure must be surfaced as:
-```text
-AUDITOR_CLOSE_FAILED
-```
-The coordinator must not report full-cycle PASS if close fails. It must never trigger another turn or dispatch as a result of close failure.
+- Do not return `APPROVED`.
+- Do not perform another turn or worker action.
+- Preserve already-known bounded execution metadata (dispatch_id, workspace snapshots, etc.) where safe.
 
 ---
 
-## 6. Required Starting State & Pre-Execution Gate
+## 6. Registry Gate A — Cycle Start
 
-### Registry Gate A — Cycle Start
 ```js
-projectA = await registryPort.getProject(projectId)
+const projectA = await registryPort.getProject(projectId)
+```
+
+Obtain canonical root authority using the production helper:
+```js
+const rootAuthorityA = canonicalizeProjectRoot(projectA.project_root)
+const cwdAuthorityA  = canonicalizeProjectRoot(projectA.auditor.cwd)
+```
+
+Require:
+```text
+rootAuthorityA.identityKey === cwdAuthorityA.identityKey
+```
+
+Capture immutable cycle authority:
+```text
+canonicalProjectRoot         = rootAuthorityA.canonicalRoot
+canonicalProjectRootIdentity = rootAuthorityA.identityKey
 ```
 
 Validate all of:
@@ -179,48 +184,34 @@ Validate all of:
 project exists
 auditor.thread_id: non-null, non-empty, valid string
 auditor.enabled === true
-auditor.cwd canonical identity === project_root canonical identity
 auditor.model_policy: valid registered policy descriptor
 worker.enabled === true
 worker.engine === "antigravity"
 worker.session_id: present and non-empty
 policy.require_workspace_state === true
+policy.max_active_dispatches === 1
 ```
 
-Then immediately call:
+Then immediately:
 ```js
-broker.getWorkerStatus(projectId)
+const workerStatus = await broker.getWorkerStatus(projectId)
 ```
 
 Require:
 ```text
-ok === true
-worker_state === "IDLE"
-active_dispatch_id === null
-active_work_order_id === null
+workerStatus.ok === true
+workerStatus.worker_state === "IDLE"
+workerStatus.active_dispatch_id === null
+workerStatus.active_work_order_id === null
 ```
 
-If worker is not IDLE:
+Failures at Gate A:
 ```text
-WORKER_BUSY
-0 auditor turns
-0 worker dispatches
+Missing project or schema violation → STARTING_STATE_INVALID (0 turns, 0 dispatches)
+Auditor unbound or disabled → AUDITOR_UNAVAILABLE (0 turns, 0 dispatches)
+Worker not IDLE → WORKER_BUSY (0 turns, 0 dispatches)
+Root/cwd identity mismatch → STARTING_STATE_INVALID (0 turns, 0 dispatches)
 ```
-
-If any Gate A precondition fails:
-```text
-STARTING_STATE_INVALID (auditor unbound/disabled) or AUDITOR_UNAVAILABLE
-0 auditor turns
-0 worker dispatches
-```
-
-### Fail-Closed Starting Invariants
-The coordinator MUST NOT:
-- Start a replacement or provisional auditor thread
-- Auto-bootstrap an unbound project
-- Modify `auditor.thread_id`
-- Enable a disabled auditor or worker
-- Perform silent repairs on Registry records
 
 ---
 
@@ -229,11 +220,11 @@ The coordinator MUST NOT:
 Thread ID authority is exclusively `fresh Registry project.auditor.thread_id`.
 
 - Callers cannot provide `threadId`, `auditorThreadId`, `taskId`, or session overrides.
-- The coordinator calls:
+- After `auditor.initialize()`:
   ```js
   const resumed = await auditor.resumeThread({ threadId: exactRegistryThreadId })
   ```
-- The returned thread ID must match `exactRegistryThreadId` byte-for-byte.
+- The returned thread ID must match `exactRegistryThreadId` byte-for-byte. On mismatch: `THREAD_RESUME_MISMATCH`.
 - Heuristic fallback, latest-thread discovery, fuzzy matching, and `startThread()` are forbidden.
 
 ---
@@ -243,14 +234,20 @@ Thread ID authority is exclusively `fresh Registry project.auditor.thread_id`.
 After `initialize()`, `resumeThread()`, `listModels()`, and `resolveAuditorModelPolicy()`, perform a **new** fresh Registry read:
 
 ```js
-projectB = await registryPort.getProject(projectId)
+const projectB = await registryPort.getProject(projectId)
+const rootAuthorityB = canonicalizeProjectRoot(projectB.project_root)
+const cwdAuthorityB  = canonicalizeProjectRoot(projectB.auditor.cwd)
 ```
 
-Require unchanged authority from Gate A:
+Require:
+```text
+rootAuthorityB.identityKey === canonicalProjectRootIdentity
+cwdAuthorityB.identityKey  === canonicalProjectRootIdentity
+```
+
+And unchanged from Gate A:
 ```text
 project_id
-canonical project-root identity
-auditor.cwd identity
 auditor.thread_id
 auditor.enabled === true
 auditor.model_policy
@@ -258,17 +255,16 @@ worker.engine
 worker.session_id
 worker.enabled
 worker.model_policy
-policy.require_workspace_state
+policy.require_workspace_state === true
+policy.max_active_dispatches === 1
 ```
 
-If anything drifted:
+Any drift or canonicalization failure:
 ```text
 AUTHORITY_DRIFT
 0 auditor turns
 0 worker dispatches
 ```
-
-This prevents stale authority accumulated during `listModels()`.
 
 ---
 
@@ -282,16 +278,11 @@ const resolved = resolveAuditorModelPolicy({
 })
 ```
 
-Pins `resolved.model` and `resolved.reasoning_effort` for the entire cycle (both Turn A and Turn B).
-
-Rules:
-- The auditor cannot self-select its model.
-- Worker model policy is completely isolated and never used in the Codex auditor resolver.
-- Gate B re-confirms `auditor.model_policy` has not drifted since Gate A.
+Pins `resolved.model` and `resolved.reasoning_effort` for the entire cycle (both Turn A and Turn B). The auditor cannot self-select its model or reasoning effort. Worker model policy is completely isolated from the Codex auditor resolver.
 
 ---
 
-## 10. S0 and Turn A
+## 10. S0 and Turn A Context
 
 Compute snapshot using Gate B project:
 ```js
@@ -303,7 +294,7 @@ Validate returned snapshot:
 object
 workspace_state_id: non-empty string
 project_id === projectId
-project_root canonical identity === expected project root
+project_root canonical identity === canonicalProjectRootIdentity
 ```
 
 Build Turn A context:
@@ -337,21 +328,54 @@ const decisionA = await awaitAuditDecisionV1(auditor, {
 
 ---
 
-## 11. Auditor Turn Uncertainty — Mandatory Classification
+## 11. Auditor Turn Error Classification
 
-`startTurn()` is side-effecting. The transport can return a distinct uncertain state when bytes were sent but outcome is unknown.
+A shared classification policy applies to both Turn A and Turn B. Implementation may use a private helper `classifyAuditTurnError(err, stage)` local to `one-shot-cycle.js` — no shared-contract changes.
 
-**Classification rules** (MANDATORY — these are distinct, non-conflatable):
+### A. `startTurn()` errors
 
-### AUDITOR_TURN_UNCERTAIN
-Return this when:
-- `startTurn()` throws with `err.code === "CODEX_APP_SERVER_REQUEST_UNCERTAIN"`, OR
-- `startTurn()` returned a `turnId` but subsequent completion/transport waiting cannot prove a terminal authoritative decision (e.g., `WAIT_TURN_TIMEOUT`, transport loss, thread read unavailable).
+**Uncertain** — if `startTurn()` throws with:
+```text
+err.code === "CODEX_APP_SERVER_REQUEST_UNCERTAIN"
+```
+Return:
+```text
+status: FAILED
+code: AUDITOR_TURN_UNCERTAIN
+```
+Never resend.
 
-Do NOT resend. Do NOT start a replacement turn. Do NOT dispatch worker.
+**Definitive start failure** — any other definitive failure from `startTurn()` (e.g., `CODEX_APP_SERVER_WRITE_FAILED` with notSent, `CODEX_APP_SERVER_NOT_READY`, `CODEX_APP_SERVER_PROVIDER_ERROR`, `INVALID_ARGUMENT`, etc.):
+```text
+status: FAILED
+code: AUDITOR_TURN_FAILED
+```
+No retry. Do not treat an unsent definitive failure as uncertainty.
 
-### DECISION_INVALID
-Return this when a terminal turn produces a structurally invalid decision:
+### B. `awaitAuditDecisionV1()` errors
+
+**Important source reality**: `awaitAuditDecisionV1` wraps `readThread` hydration failures as `AUDIT_DECISION_ITEMS_INCOMPLETE`. WP09B must not bypass the helper to recover the underlying hydration transport failure separately.
+
+**Raw completion/wait uncertainty** — if the helper propagates an operational wait/transport error that does NOT carry an `AUDIT_DECISION_*` code (e.g., `WAIT_TURN_TIMEOUT`, transport/process loss while awaiting completion):
+```text
+status: FAILED
+code: AUDITOR_TURN_UNCERTAIN
+```
+No resend.
+
+**Non-completed turn** — if `err.code === "AUDIT_DECISION_TURN_NOT_COMPLETED"`:
+```text
+status: FAILED
+code: AUDITOR_TURN_FAILED
+```
+No retry.
+
+**Strict decision-authority failures** — all `AUDIT_DECISION_*` validation errors map to:
+```text
+status: FAILED
+code: DECISION_INVALID
+```
+Including:
 ```text
 AUDIT_DECISION_INVALID_JSON
 AUDIT_DECISION_DUPLICATE_KEY
@@ -359,12 +383,14 @@ AUDIT_DECISION_TOO_LARGE
 AUDIT_DECISION_SCHEMA_INVALID
 AUDIT_DECISION_CONTEXT_MISMATCH
 AUDIT_DECISION_BRANCH_INVALID
+AUDIT_DECISION_ITEMS_INCOMPLETE    ← wraps hydration failure; DECISION_INVALID at coordinator boundary
 AUDIT_DECISION_OUTPUT_MISSING
 AUDIT_DECISION_OUTPUT_AMBIGUOUS
-AUDIT_DECISION_ITEMS_INCOMPLETE
 ```
 
-No retry in either category.
+**Correction from R1**: `AUDIT_DECISION_ITEMS_INCOMPLETE` must be treated as `DECISION_INVALID` at the coordinator boundary even when its internal cause was a failed hydration `readThread()`. `awaitAuditDecisionV1` has intentionally collapsed that underlying cause into its bounded decision-authority error. WP09B must not bypass the helper to recover a lower-level distinction. The erroneous R1 rule claiming "thread read unavailable → AUDITOR_TURN_UNCERTAIN" when that read occurs inside `awaitAuditDecisionV1` hydration is hereby deleted and replaced by this classification.
+
+No retry in any category.
 
 ---
 
@@ -381,24 +407,27 @@ All five standard `AuditDecisionV1` decisions are valid:
 | `STOP` | Terminate | **0** | `STOPPED` | No |
 
 The coordinator must never coerce or prompt-hack the auditor into `DISPATCH_WORKER`.
-
 `DISPATCH_WORKER` requires non-null `decisionA.work_order` with valid `work_order_id` and `directive`.
 
 ---
 
 ## 13. Registry Gate C — Before Worker Dispatch
 
-Turn A `DISPATCH_WORKER` authority alone is insufficient. Immediately before S1 and dispatch:
-
 ```js
-projectC = await registryPort.getProject(projectId)
+const projectC = await registryPort.getProject(projectId)
+const rootAuthorityC = canonicalizeProjectRoot(projectC.project_root)
+const cwdAuthorityC  = canonicalizeProjectRoot(projectC.auditor.cwd)
 ```
 
-Require unchanged from Gate B:
+Require:
+```text
+rootAuthorityC.identityKey === canonicalProjectRootIdentity
+cwdAuthorityC.identityKey  === canonicalProjectRootIdentity
+```
+
+And unchanged from Gate B:
 ```text
 project_id
-canonical project root
-auditor.cwd identity
 auditor.thread_id
 auditor.enabled
 auditor.model_policy
@@ -406,11 +435,11 @@ worker.enabled
 worker.engine
 worker.session_id
 worker.model_policy
-policy.require_workspace_state
-policy.max_active_dispatches
+policy.require_workspace_state === true
+policy.max_active_dispatches === 1
 ```
 
-If anything drifted:
+Any drift or canonicalization failure:
 ```text
 AUTHORITY_DRIFT
 worker dispatch count = 0
@@ -420,9 +449,9 @@ worker dispatch count = 0
 
 ## 14. Worker Model Policy Consistency Gate
 
-`AuditDecisionV1.work_order.worker_model_policy` is required by the schema. However, `broker.dispatchWorker()` does not accept a `worker_model_policy` field, and the worker adapter does not expose a per-dispatch model override.
+`AuditDecisionV1.work_order.worker_model_policy` is required by the schema. However, `broker.dispatchWorker()` does not accept `worker_model_policy`, and the worker adapter does not expose a per-dispatch model override.
 
-Before dispatch, require:
+Require before dispatch:
 ```text
 decisionA.work_order.worker_model_policy === projectC.worker.model_policy
 ```
@@ -439,7 +468,6 @@ When equal, it acts as an authorization consistency check — NOT a CLI/runtime/
 
 ## 15. S1 Pre-Dispatch Freshness Gate
 
-Compute using Gate C project:
 ```js
 const S1 = await workspacePort.getWorkspaceState(projectC)
 ```
@@ -461,7 +489,6 @@ Physical re-hashing is mandatory. The model's echoed state string is never suffi
 
 ## 16. Worker Dispatch
 
-Call existing broker exactly:
 ```js
 const dispatchResult = await broker.dispatchWorker({
   schema_version: 1,
@@ -478,17 +505,7 @@ Maximum `broker.dispatchWorker` calls per cycle: **1** (including uncertain atte
 
 ---
 
-## 17. Exactly One Worker Dispatch Maximum
-
-In a one-shot cycle, the maximum successful dispatch attempts is strictly **1**. The coordinator MUST NOT:
-- Issue a second work order
-- Retry after `DISPATCH_UNCERTAIN`, transport timeout, or provenance ambiguity
-
-All ambiguous outcomes fail closed immediately.
-
----
-
-## 18. Worker Wait
+## 17. Worker Wait
 
 ```js
 const waitResult = await broker.waitWorker({
@@ -500,56 +517,40 @@ const waitResult = await broker.waitWorker({
 
 Called at most once. Only `READY_FOR_REVIEW` permits Turn B.
 
-### Transition Mapping
+Transitions:
 - `READY_FOR_REVIEW` → proceed to Gate D, S2, Turn B
-- `DISPATCH_ACCEPTED` / `RUNNING` (timeout) → `WORKER_PENDING`; stop (no second wait loop)
-- `DISPATCH_FAILED` → fail closed
-- `DISPATCH_UNCERTAIN` → fail closed (no retry)
-- `PROVENANCE_AMBIGUOUS` → fail closed
-- `WORKER_WAIT_UNAVAILABLE` → fail closed
+- `DISPATCH_ACCEPTED` / `RUNNING` (timeout) → `WORKER_PENDING`; no Turn B, no retry
+- `DISPATCH_FAILED` / `DISPATCH_UNCERTAIN` / `PROVENANCE_AMBIGUOUS` / `WORKER_WAIT_UNAVAILABLE` → fail closed
+
+`READY_FOR_REVIEW` does not constitute approval. Worker completion metadata from `broker.waitWorker()` is bounded (`state`, `dispatch_id`, `work_order_id`) and does not expose a raw worker report or transcript.
 
 ---
 
-## 19. READY_FOR_REVIEW Is Not Approval
-
-```text
-READY_FOR_REVIEW ≠ approved
-READY_FOR_REVIEW ≠ tests passed
-READY_FOR_REVIEW ≠ work package complete
-```
-
-Worker completion data from `broker.waitWorker()` exposes only bounded semantic metadata (`state`, `dispatch_id`, `work_order_id`). It does NOT expose a raw worker report.
-
-The coordinator must NOT:
-- Fetch or parse the raw Antigravity transcript
-- Inject raw worker prose into Turn B
-- Treat any WorkerReport as authority
-
-The existing same-thread auditor history already contains Turn A context. The reviewer independently inspects the actual workspace.
-
----
-
-## 20. Registry Gate D + S2
+## 18. Registry Gate D + S2
 
 After `READY_FOR_REVIEW`:
-
 ```js
 const projectD = await registryPort.getProject(projectId)
+const rootAuthorityD = canonicalizeProjectRoot(projectD.project_root)
+const cwdAuthorityD  = canonicalizeProjectRoot(projectD.auditor.cwd)
 ```
 
-Require same authority as Gate C. Then:
+Require:
+```text
+rootAuthorityD.identityKey === canonicalProjectRootIdentity
+cwdAuthorityD.identityKey  === canonicalProjectRootIdentity
+```
 
+And unchanged from Gate C. Then:
 ```js
 const S2 = await workspacePort.getWorkspaceState(projectD)
 ```
 
 Validate returned snapshot. Do not reuse S0.
 
-While typical worker modifications produce `S2 !== S0`, the coordinator does not assert divergence as a semantic prerequisite.
-
 ---
 
-## 21. Same-Thread Invariant
+## 19. Same-Thread Invariant
 
 ```text
 thread_A === project.auditor.thread_id
@@ -561,44 +562,25 @@ Zero new auditor threads are created during the cycle. Worker output cannot alte
 
 ---
 
-## 22. Turn B — Same-Thread Independent Review
+## 20. Turn B — Same-Thread Independent Review
 
-Before Turn B, the Gate D Registry read must confirm that all authority is unchanged from Gate C:
-```text
-same project_id
-same canonical root identity
-same auditor.cwd identity
-same auditor.thread_id
-auditor.enabled === true
-same auditor.model_policy
-worker still maps to same project authority
-```
+Gate D re-canonicalization confirms authority unchanged (§18). Use same adapter instance, same logical thread:
 
-If authority drifted:
-```text
-AUTHORITY_DRIFT
-0 Turn B
-```
-
-Build Turn B context:
 ```js
 const expectedContextB = {
   project_id: projectId,
-  audit_subject_id: auditSubjectId,          // SAME as Turn A
-  auditor_thread_id: exactRegistryThreadId,  // SAME adapter/thread
+  audit_subject_id: auditSubjectId,          // SAME as Turn A — not a different post-worker subject
+  auditor_thread_id: exactRegistryThreadId,  // SAME thread
   workspace_state_observed: S2.workspace_state_id
 }
 const outputSchemaB = buildAuditDecisionV1OutputSchema(expectedContextB)
-```
 
-Execute Turn B using same adapter instance, same pinned model/effort:
-```js
 const startB = await auditor.startTurn({
   threadId: exactRegistryThreadId,
-  input: reviewPrompt,           // explicit caller input
+  input: reviewPrompt,                        // explicit caller input; NOT derived from worker prose
   outputSchema: outputSchemaB,
-  model: resolved.model,         // same pinned model
-  effort: resolved.reasoning_effort  // same pinned effort
+  model: resolved.model,                      // same pinned model
+  effort: resolved.reasoning_effort           // same pinned effort
 })
 
 const decisionB = await awaitAuditDecisionV1(auditor, {
@@ -609,16 +591,25 @@ const decisionB = await awaitAuditDecisionV1(auditor, {
 })
 ```
 
-Turn B uncertainty classification follows the same rules as Turn A (§11).
+Turn B uses the same shared error classification policy as Turn A (§11).
+
+The coordinator must NOT: fetch or parse the raw Antigravity transcript; inject raw worker prose into Turn B; treat any WorkerReport as authority. The existing same-thread auditor history already contains Turn A context. The reviewer independently inspects the actual workspace.
 
 ---
 
-## 23. Turn B Decision Semantics & Final Freshness Gate (S3)
+## 21. Turn B Decision Semantics & Final Freshness Gate (S3)
 
 ### `APPROVE_WORK_PACKAGE`
-Before accepting approval, perform final fresh Registry authority check (same as Gate D). Then:
+Perform final fresh Registry authority check:
 ```js
-const S3 = await workspacePort.getWorkspaceState(freshProject)
+const projectFinal = await registryPort.getProject(projectId)
+const rootAuthorityFinal = canonicalizeProjectRoot(projectFinal.project_root)
+const cwdAuthorityFinal  = canonicalizeProjectRoot(projectFinal.auditor.cwd)
+```
+
+Require identity unchanged from Gate D. Then:
+```js
+const S3 = await workspacePort.getWorkspaceState(projectFinal)
 ```
 
 Require:
@@ -626,60 +617,47 @@ Require:
 S3.workspace_state_id === S2.workspace_state_id
 ```
 
-If `S3 !== S2`:
-```text
-STALE_AUDIT_STATE
-```
-Do not return approved full-cycle result.
+If `S3 !== S2`: return `STALE_AUDIT_STATE`.
 
-### `REQUEST_EVIDENCE`
-Return `EVIDENCE_REQUIRED`. Zero additional dispatches.
-
-### `BLOCKED`
-Return `BLOCKED`. Zero additional dispatches.
-
-### `STOP`
-Return `STOPPED`. Zero additional dispatches.
-
-### `DISPATCH_WORKER`
-Structurally valid under `AuditDecisionV1`, but the one-shot cycle has exhausted its dispatch allowance.
-Return `CYCLE_LIMIT_REACHED`. Include the validated decision payload for operator review or future WP12.
-**Never dispatch a second work order.**
+### `REQUEST_EVIDENCE` → `EVIDENCE_REQUIRED` (0 dispatches)
+### `BLOCKED` → `BLOCKED` (0 dispatches)
+### `STOP` → `STOPPED` (0 dispatches)
+### `DISPATCH_WORKER` → `CYCLE_LIMIT_REACHED` with validated decision payload, **never dispatch a second work order**
 
 ---
 
-## 24. Full-Cycle Acceptance Pass Condition
+## 22. Full-Cycle Acceptance Pass Condition
 
-WP09 real acceptance passes if and only if a single continuous execution verifies all 12 invariants:
+WP09 real acceptance passes if and only if a single continuous execution verifies **all 14 invariants**:
 
 ```text
  1. Registered auditor starts already bound and enabled in Registry V2.
- 2. Exact Registry thread_id is resumed without fallback or heuristic.
- 3. Turn A completes with authoritative DISPATCH_WORKER decision.
- 4. Gate C authority is confirmed unchanged before dispatch.
- 5. Worker model policy matches Registry exactly.
- 6. Freshness gate S1 matches S0 immediately before worker dispatch.
- 7. Exactly one real worker dispatch is accepted by the broker.
- 8. Worker reaches READY_FOR_REVIEW with exact project and dispatch identities.
- 9. Post-worker snapshot S2 is computed after Gate D authority confirmation.
-10. Same exact logical auditor thread performs Turn B with explicit reviewPrompt.
-11. Turn B returns authoritative APPROVE_WORK_PACKAGE decision.
-12. Final freshness gate S3 matches S2 immediately before final approval.
-13. Exactly zero second worker dispatches occur.
-14. Auditor adapter closed exactly once in finally block.
+ 2. canonicalizeProjectRoot establishes cycle-wide canonical identity at Gate A.
+ 3. Exact Registry thread_id is resumed without fallback or heuristic.
+ 4. Turn A completes with authoritative DISPATCH_WORKER decision.
+ 5. Gate C authority is confirmed (re-canonicalized) unchanged before dispatch.
+ 6. Worker model policy matches Registry exactly (consistency check, not override).
+ 7. Freshness gate S1 matches S0 immediately before worker dispatch.
+ 8. Exactly one real worker dispatch is accepted by the broker.
+ 9. Worker reaches READY_FOR_REVIEW with exact project and dispatch identities.
+10. Post-worker snapshot S2 is computed after Gate D authority confirmation.
+11. Same exact logical auditor thread performs Turn B with explicit reviewPrompt.
+12. Turn B returns authoritative APPROVE_WORK_PACKAGE decision.
+13. Final freshness gate S3 matches S2 immediately before final approval.
+14. Auditor adapter closed exactly once in finally block; close failure overrides APPROVED.
 ```
 
 Any divergence constitutes `NOT_FULL_CYCLE_PASS`.
 
 ---
 
-## 25. Stable Result Envelope
+## 23. Stable Result Envelope
 
 ```js
 {
   ok,               // boolean
-  status,           // terminal status string (see §26)
-  code,             // operational error code (see §28)
+  status,           // terminal status string
+  code,             // operational error code
   project_id,
   audit_subject_id,
   auditor_thread_id,
@@ -704,21 +682,19 @@ Must NOT include: raw provider response, raw worker transcript, full Registry do
 
 ### Terminal `status` Values
 ```text
-APPROVED                 — full-cycle Turn B approval after S3 gate (EXCLUSIVE)
+APPROVED                  — full-cycle Turn B approval after S3 gate (EXCLUSIVE; overridden by close failure)
 APPROVED_WITHOUT_DISPATCH — Turn A APPROVE_WORK_PACKAGE (no dispatch)
-EVIDENCE_REQUIRED        — Turn A or Turn B REQUEST_EVIDENCE
-BLOCKED                  — Turn A or Turn B BLOCKED
-STOPPED                  — Turn A or Turn B STOP
-WORKER_PENDING           — worker did not reach READY_FOR_REVIEW within timeout
-CYCLE_LIMIT_REACHED      — Turn B DISPATCH_WORKER (second dispatch refused)
-FAILED                   — operational failure (see code)
+EVIDENCE_REQUIRED         — Turn A or Turn B REQUEST_EVIDENCE
+BLOCKED                   — Turn A or Turn B BLOCKED
+STOPPED                   — Turn A or Turn B STOP
+WORKER_PENDING            — worker did not reach READY_FOR_REVIEW within timeout
+CYCLE_LIMIT_REACHED       — Turn B DISPATCH_WORKER (second dispatch refused)
+FAILED                    — operational failure (see code)
 ```
-
-`APPROVED` is reserved exclusively for the full-cycle Turn-B approval path after S3.
 
 ---
 
-## 26. Operational Error Codes (local to one-shot-cycle.js)
+## 24. Operational Error Codes (local to one-shot-cycle.js)
 
 ```text
 STARTING_STATE_INVALID
@@ -744,70 +720,23 @@ PROVENANCE_AMBIGUOUS
 WORKER_WAIT_UNAVAILABLE
 ```
 
-No new shared `broker/contracts.js` error codes are required. One-shot codes remain local to `one-shot-cycle.js`.
+No new shared `broker/contracts.js` error codes required.
 
 ---
 
-## 27. Recovery-Store Preflight Boundary
+## 25. Recovery-Store Preflight Boundary
 
-The WP09B coordinator does NOT receive `recoveryStore` and does not own auditor bootstrap recovery.
+WP09B coordinator does NOT receive `recoveryStore` and does not own auditor bootstrap recovery.
 
 WP09C real-acceptance harness must separately prove, before the first real auditor turn:
 ```text
 auditor recovery inspect: no active bootstrap requiring recovery/resolution
 ```
-using existing WP07 inspection authority (`agy-recover inspect`).
-
-Do NOT silently add recovery-store ownership to WP09B.
+using existing WP07 inspection authority. Do NOT add recovery-store ownership to WP09B.
 
 ---
 
-## 28. Acceptance Project Selection Criteria
-
-- **No Hard-Coded Identities**: No machine-local paths, project IDs, session IDs, or thread IDs in committed docs or code.
-- **Operator Selection**: Explicitly designated by operator in WP09C.
-- **Eligibility**:
-  - Registered in Registry V2
-  - Auditor bound and enabled
-  - Worker enabled with valid `session_id`
-  - Clean Git status
-  - Disposable environment (safe small edit)
-  - No automatic "first project" selection or fuzzy matching
-
----
-
-## 29. Acceptance Workspace Safety Rules
-
-Prior to Turn A in real acceptance:
-1. Git working tree is clean.
-2. `broker.getWorkerStatus()` returns `worker_state === "IDLE"`.
-3. No active worker dispatches in lifecycle store.
-4. No active auditor recovery bootstraps (via WP07 inspect).
-
-If any safety check fails: halt before any model turn or worker dispatch. No destructive Git commands against user workspace.
-
----
-
-## 30. Acceptance Task Shape
-
-Must be:
-- **Small & Bounded** — e.g., single fixture/artifact file
-- **Reversible** — clean revert via targeted deletion
-- **Non-Sensitive** — zero contact with credentials, deployment, network publishing
-- **Independently Verifiable** — workspace files accessible to auditor
-
----
-
-## 31. Post-Acceptance Cleanup Protocol
-
-1. Capture full acceptance evidence (S2, S3 hashes, approved decisions) before any cleanup.
-2. Cleanup is an explicit operator action targeting only the dedicated acceptance artifact.
-3. Never use `git reset --hard` or `git clean -fd` against unverified workspace.
-4. Cleanup is strictly separated from auditor approval authority.
-
----
-
-## 32. Planned WP09B Implementation Scope
+## 26. Planned WP09B Implementation Scope
 
 **New Production Module**: `pipeline-ui/lib/relay/one-shot-cycle.js`
 **New Deterministic Suite**: `pipeline-ui/test/refactor/one-shot-cycle.test.js`
@@ -830,12 +759,15 @@ pipeline-ui/lib/auditor/codex-app-server-client.js
 pipeline-ui/lib/auditor/model-policy-resolver.js
 ```
 
+The purpose of R2 is specifically to make WP09B implementable without modifying these protected modules.
+
 ---
 
-## 33. Planned WP09B Deterministic Test Matrix (OSC)
+## 27. Planned WP09B Deterministic Test Matrix (OSC)
 
-Test prefix: `OSC` (One-Shot Coordinator). **Minimum 42 test cases**.
+Test prefix: `OSC`. **Minimum 42 test cases** covering all the following (existing cases refined with R2 corrections; new cases added as needed):
 
+**Gate and Starting State:**
 - `OSC-001`: Missing project fails closed before adapter creation (`STARTING_STATE_INVALID`; 0 factory calls).
 - `OSC-002`: Unbound auditor (`auditor.thread_id === null`) fails closed before model/worker.
 - `OSC-003`: Disabled auditor (`auditor.enabled === false`) fails closed before model/worker.
@@ -843,51 +775,72 @@ Test prefix: `OSC` (One-Shot Coordinator). **Minimum 42 test cases**.
 - `OSC-005`: `auditorFactory` called exactly once with `{ phase: 'one_shot_cycle', cwd: canonicalProjectRoot }`.
 - `OSC-006`: `auditor.initialize()` occurs before `auditor.resumeThread()`.
 - `OSC-007`: Exact Registry `auditor.thread_id` is resumed — no heuristic or latest-thread fallback.
-- `OSC-008`: Resume mismatch (returned ID != Registry ID) fails closed with `THREAD_RESUME_MISMATCH`.
+- `OSC-008`: Resume mismatch fails closed with `THREAD_RESUME_MISMATCH`.
 - `OSC-009`: Catalog resolved with correct shape `resolveAuditorModelPolicy({ policy, models })`.
-- `OSC-010`: Registry Gate B detects authority drift after catalog retrieval and before Turn A (`AUTHORITY_DRIFT`; 0 turns, 0 dispatches).
+- `OSC-010`: Registry Gate B detects authority drift after catalog retrieval and before Turn A.
 - `OSC-011`: Model and effort resolved once at cycle start and pinned for both Turn A and Turn B.
-- `OSC-012`: S0 computed via `workspacePort.getWorkspaceState(projectB)` (uses Gate B project).
+- `OSC-012`: S0 computed via `workspacePort.getWorkspaceState(projectB)`.
+
+**Canonical Root Authority (OSC-CANON):**
+- `OSC-CANON-01` (integrates into OSC-001/005 area): Gate A obtains `canonicalProjectRoot` through `canonicalizeProjectRoot(project.project_root)` — not raw string, not `path.normalize` alone.
+- `OSC-CANON-02`: Gate A detects `auditor.cwd` canonical identity mismatch with `project_root` identity fails closed before factory.
+- `OSC-CANON-03`: Gate B, Gate C, Gate D, and final gate each re-canonicalize `project_root` and `auditor.cwd`; identity drift at any gate returns `AUTHORITY_DRIFT`.
+
+**Turn A Decisions:**
 - `OSC-013`: Turn A uses exact `auditSubjectId` and `auditPrompt` from caller input.
-- `OSC-014`: Turn A `REQUEST_EVIDENCE` terminates with 0 dispatches and result `EVIDENCE_REQUIRED`.
-- `OSC-015`: Turn A `BLOCKED` terminates with 0 dispatches and result `BLOCKED`.
-- `OSC-016`: Turn A `STOP` terminates with 0 dispatches and result `STOPPED`.
+- `OSC-014`: Turn A `REQUEST_EVIDENCE` terminates with 0 dispatches, result `EVIDENCE_REQUIRED`.
+- `OSC-015`: Turn A `BLOCKED` terminates with 0 dispatches, result `BLOCKED`.
+- `OSC-016`: Turn A `STOP` terminates with 0 dispatches, result `STOPPED`.
 - `OSC-017`: Turn A `APPROVE_WORK_PACKAGE` terminates with `APPROVED_WITHOUT_DISPATCH` (0 dispatches).
-- `OSC-018`: Turn A `startTurn` uncertain transport maps to `AUDITOR_TURN_UNCERTAIN` with zero resend.
-- `OSC-019`: Post-start Turn A completion uncertainty (timeout/transport loss) maps to `AUDITOR_TURN_UNCERTAIN`.
-- `OSC-020`: Strict invalid Turn A decision structure maps to `DECISION_INVALID`.
-- `OSC-021`: Registry Gate C drift before dispatch returns `AUTHORITY_DRIFT` (0 dispatches).
-- `OSC-022`: `decisionA.work_order.worker_model_policy !== projectC.worker.model_policy` returns `WORKER_POLICY_MISMATCH` (0 dispatches).
-- `OSC-023`: S1 computed via `workspacePort.getWorkspaceState(projectC)` (uses Gate C project).
-- `OSC-024`: S1 drift (`S1.workspace_state_id !== S0.workspace_state_id`) returns `STALE_AUDIT_STATE` (0 dispatches).
-- `OSC-025`: Dispatch uses exact broker request shape: `{ schema_version:1, project_id, work_order_id, expected_workspace_state_id, directive }` — no extra fields.
-- `OSC-026`: `broker.dispatchWorker` called at most once per cycle (including on uncertain attempt).
-- `OSC-027`: `DISPATCH_UNCERTAIN` terminates without retry (`DISPATCH_UNCERTAIN` result, 0 second dispatches).
-- `OSC-028`: Worker pending (`DISPATCH_ACCEPTED`/`RUNNING` after timeout) stops cycle with `WORKER_PENDING` — no Turn B.
-- `OSC-029`: `READY_FOR_REVIEW` alone never constitutes approval — Turn B is required.
-- `OSC-030`: Registry Gate D detects authority drift before Turn B — `AUTHORITY_DRIFT` (no Turn B).
-- `OSC-031`: S2 computed via `workspacePort.getWorkspaceState(projectD)` using fresh Gate D project.
-- `OSC-032`: Turn B uses same `auditSubjectId` as Turn A (not a different post-worker subject).
-- `OSC-033`: Turn B uses explicit `reviewPrompt` from caller input (not derived from worker prose).
-- `OSC-034`: Turn B uses same adapter instance, same logical thread, same pinned model and effort.
-- `OSC-035`: Raw worker output/transcript is NOT passed to Turn B by coordinator.
-- `OSC-036`: Turn B transport uncertainty maps to `AUDITOR_TURN_UNCERTAIN` — no resend.
-- `OSC-037`: Turn B `DISPATCH_WORKER` returns `CYCLE_LIMIT_REACHED` with zero second dispatch.
-- `OSC-038`: Turn B `APPROVE_WORK_PACKAGE` requires final fresh Registry gate + S3 computation before APPROVED.
-- `OSC-039`: S3 drift (`S3.workspace_state_id !== S2.workspace_state_id`) prevents `APPROVED`, returns `STALE_AUDIT_STATE`.
-- `OSC-040`: `auditor.close()` attempted exactly once on every post-factory terminal path (happy and failing).
-- `OSC-041`: `AUDITOR_CLOSE_FAILED` prevents reporting full-cycle PASS; no additional turn or dispatch.
-- `OSC-042`: Happy-path exact ordering verified:
+
+**Turn Error Classification (OSC-TURN):**
+- `OSC-TURN-01`: `startTurn` throws `CODEX_APP_SERVER_REQUEST_UNCERTAIN` → `AUDITOR_TURN_UNCERTAIN`; zero resend.
+- `OSC-TURN-02`: `startTurn` throws definitive failure (e.g., `CODEX_APP_SERVER_NOT_READY`) → `AUDITOR_TURN_FAILED`; no retry.
+- `OSC-TURN-03`: `awaitAuditDecisionV1` propagates raw `WAIT_TURN_TIMEOUT` (no `AUDIT_DECISION_*` code) → `AUDITOR_TURN_UNCERTAIN`; no resend.
+- `OSC-TURN-04`: `awaitAuditDecisionV1` throws `AUDIT_DECISION_TURN_NOT_COMPLETED` → `AUDITOR_TURN_FAILED`; no retry.
+- `OSC-TURN-05`: `awaitAuditDecisionV1` throws `AUDIT_DECISION_ITEMS_INCOMPLETE` → `DECISION_INVALID` at coordinator boundary (hydration cause not separately recoverable).
+- `OSC-TURN-06`: Other strict `AUDIT_DECISION_*` validation failures → `DECISION_INVALID`; no retry.
+- `OSC-018`: Same classification policy applies to Turn A and Turn B.
+
+**Dispatch Gate:**
+- `OSC-019` (was 021): Registry Gate C drift before dispatch returns `AUTHORITY_DRIFT` (0 dispatches).
+- `OSC-020` (was 022): `decisionA.work_order.worker_model_policy !== projectC.worker.model_policy` returns `WORKER_POLICY_MISMATCH` (0 dispatches).
+- `OSC-021` (was 023): S1 computed via `workspacePort.getWorkspaceState(projectC)`.
+- `OSC-022` (was 024): S1 drift returns `STALE_AUDIT_STATE` (0 dispatches).
+- `OSC-023` (was 025): Dispatch uses exact broker request shape with no extra fields.
+- `OSC-024` (was 026): `broker.dispatchWorker` called at most once per cycle.
+- `OSC-025` (was 027): `DISPATCH_UNCERTAIN` terminates without retry.
+- `OSC-026` (was 028): Worker pending stops cycle with `WORKER_PENDING` — no Turn B.
+- `OSC-027` (was 029): `READY_FOR_REVIEW` alone never constitutes approval.
+
+**Turn B:**
+- `OSC-028` (was 030): Registry Gate D detects authority drift — `AUTHORITY_DRIFT` (no Turn B).
+- `OSC-029` (was 031): S2 computed via `workspacePort.getWorkspaceState(projectD)` using fresh Gate D project.
+- `OSC-030` (was 032): Turn B uses same `auditSubjectId` as Turn A.
+- `OSC-031` (was 033): Turn B uses explicit `reviewPrompt` from caller input.
+- `OSC-032` (was 034): Turn B uses same adapter instance, same logical thread, same pinned model and effort.
+- `OSC-033` (was 035): Raw worker output/transcript is NOT passed to Turn B by coordinator.
+- `OSC-034` (was 036): Turn B transport uncertainty maps to `AUDITOR_TURN_UNCERTAIN` — no resend.
+- `OSC-035` (was 037): Turn B `DISPATCH_WORKER` returns `CYCLE_LIMIT_REACHED` with zero second dispatch.
+- `OSC-036` (was 038): Turn B `APPROVE_WORK_PACKAGE` requires final fresh Registry gate + S3 computation.
+- `OSC-037` (was 039): S3 drift prevents `APPROVED`, returns `STALE_AUDIT_STATE`.
+
+**Close:**
+- `OSC-CLOSE-01` (was 040): `auditor.close()` attempted exactly once on every post-factory terminal path.
+- `OSC-CLOSE-02` (was 041): `AUDITOR_CLOSE_FAILED` overrides any candidate result including `APPROVED`; no additional turn or dispatch.
+
+**Happy Path:**
+- `OSC-042`: Happy-path exact ordering verified end-to-end:
   ```text
   Gate A → worker IDLE check → factory → initialize → resume → listModels
   → resolveAuditorModelPolicy → Gate B → S0 → Turn A → Gate C
   → worker_model_policy check → S1 → dispatchWorker → waitWorker
-  → Gate D → S2 → Turn B → final Registry gate → S3 → APPROVED → close
+  → Gate D → S2 → Turn B → final Registry gate + S3 → APPROVED → close
   ```
 
 ---
 
-## 34. Planned Regression Baselines
+## 28. Planned Regression Baselines
 
 Following WP09B implementation:
 - **Suite Count**: 18 deterministic suites passing
@@ -909,22 +862,23 @@ Following WP09B implementation:
 
 ---
 
-## 35. WP09C Real Acceptance Boundary
+## 29. WP09C Real Acceptance Boundary
 
-Real execution side effects are strictly confined to `WP-V4-09C`.
+Real execution side effects strictly confined to `WP-V4-09C`.
 
 ### Acceptance Ceilings:
 ```text
-real auditor turns:           maximum 2
-real worker dispatch attempts: maximum 1
-real worker completions:       maximum 1
-logical auditor threads:       exactly 1 (existing bound thread)
-new auditor threads:           0
-real model/list calls:         maximum 1 (coordinator catalog resolution)
-real thread/resume calls:      maximum 1
+real auditorFactory calls:      maximum 1
+real model/list calls:          maximum 1
+real thread/resume calls:       maximum 1
+real auditor turns:             maximum 2
+real worker dispatch attempts:  maximum 1
+real worker completions:        maximum 1
+logical auditor threads:        exactly 1 (existing bound thread)
+new auditor threads:            0
 ```
 
-### WP09A-R1 Execution Facts:
+### WP09A-R2 Execution Facts:
 ```text
 real auditor turns:    0
 real worker dispatches: 0
@@ -935,11 +889,19 @@ Registry mutations:    NO
 
 ---
 
-## 16. External Review & Approval Gate
+## 30. Acceptance Project Selection Criteria
 
-This design document (Revision 1) seals the corrected technical specification of the One-Shot Full-Cycle Coordinator.
+- **No Hard-Coded Identities**: No machine-local paths, project IDs, session IDs, or thread IDs in committed docs or code.
+- **Operator Selection**: Explicitly designated by operator in WP09C.
+- **Eligibility**: Registered in Registry V2; auditor bound and enabled; worker enabled with valid `session_id`; clean Git status; disposable environment (safe small edit); no automatic "first project" selection.
+
+---
+
+## 31. External Review & Approval Gate
+
+This design document (Revision 2) seals the corrected technical specification of the One-Shot Full-Cycle Coordinator.
 
 Before proceeding to WP09B implementation:
 - The corrected design must be reviewed and approved by the external operator.
-- The parent commit must remain `c1ce796bf4f8648f845b0c19da553dbe0835b8e5`.
+- The parent commit must remain `1e9db50049b5d270a8a14857539b17f4931e6d0f`.
 - No implementation work may start until explicit authorization is received.
