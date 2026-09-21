@@ -3,6 +3,7 @@
 const path = require('path');
 const { EventEmitter } = require('events');
 const { CodexAppServerClient, createError } = require('./codex-app-server-client');
+const { createTokenUsageObserver, validateTokenUsageNotification } = require('./token-usage-observer');
 
 const ALLOWED_REVIEW_TARGET_TYPES = new Set([
   'uncommittedChanges',
@@ -53,11 +54,14 @@ class CodexAuditorAdapter {
     this._turnOwnership = new Map(); // turnId -> threadId (max 4,096)
     this._turnCompletionCache = new Map(); // turnId -> { threadId, turnId, status, turn } (max 4,096)
     this._reviewEvidenceCache = new Map(); // turnId -> item (max 4,096)
+    this._pendingTokenUsage = new Map(); // turnId -> pendingNotification (max 4,096)
+    this._tokenUsageObserver = createTokenUsageObserver(options.tokenUsageOptions || {});
     this._emitter = new EventEmitter();
 
-    // Listen to client notifications for early completion / evidence caching
+    // Listen to client notifications for early completion / evidence caching / token usage
     this._client.on('turn/completed', (notifParams) => this._onTurnCompleted(notifParams));
     this._client.on('item/completed', (itemParams) => this._onItemCompleted(itemParams));
+    this._client.on('thread/tokenUsage/updated', (notifParams) => this._onTokenUsageUpdated(notifParams));
   }
 
   /**
@@ -119,6 +123,151 @@ class CodexAuditorAdapter {
 
     this._recordBounded(this._turnCompletionCache, turnId, record);
     this._emitter.emit('turn_completed_' + turnId, record);
+  }
+
+  /**
+   * Event subscription helpers delegating to internal emitter.
+   */
+  on(event, listener) {
+    this._emitter.on(event, listener);
+    return this;
+  }
+
+  once(event, listener) {
+    this._emitter.once(event, listener);
+    return this;
+  }
+
+  removeListener(event, listener) {
+    this._emitter.removeListener(event, listener);
+    return this;
+  }
+
+  off(event, listener) {
+    this._emitter.removeListener(event, listener);
+    return this;
+  }
+
+  /**
+   * Centralized turn ownership registration.
+   * Reconciles any pending token usage notifications for early-notification race (Section 10).
+   * @param {string} turnId
+   * @param {string} threadId
+   */
+  recordTurnOwnership(turnId, threadId) {
+    this._recordBounded(this._turnOwnership, turnId, threadId, 4096);
+
+    // Reconcile pending token usage notification if present
+    if (this._pendingTokenUsage.has(turnId)) {
+      const pending = this._pendingTokenUsage.get(turnId);
+      this._pendingTokenUsage.delete(turnId);
+      if (pending.threadId === threadId) {
+        try {
+          const snapshot = this._tokenUsageObserver.record(pending);
+          this._emitTokenUsage(snapshot);
+        } catch (err) {
+          this._emitter.emit('token_usage_error', err);
+        }
+      } else {
+        // Mismatched pending evidence must NOT become valid observability data
+        this._surfaceTokenUsageMismatch(turnId, pending.threadId, threadId);
+      }
+    }
+  }
+
+  /**
+   * Surface token usage thread mismatch without poisoning audit authority.
+   * @private
+   */
+  _surfaceTokenUsageMismatch(turnId, notifThreadId, localThreadId) {
+    const err = createError(
+      'TOKEN_USAGE_THREAD_MISMATCH',
+      `Token usage notification threadId '${notifThreadId}' does not match local threadId '${localThreadId}' for turn '${turnId}'`,
+      { turnId, notifThreadId, localThreadId }
+    );
+    this._emitter.emit('token_usage_mismatch', err);
+    this._emitter.emit('tokenUsageMismatch', err);
+    return err;
+  }
+
+  /**
+   * Emit detached token usage observability events.
+   * @private
+   */
+  _emitTokenUsage(snapshot) {
+    const detached = deepDetach(snapshot);
+    this._emitter.emit('token_usage', detached);
+    this._emitter.emit('tokenUsage', detached);
+    if (detached && detached.threadId) {
+      this._emitter.emit(`token_usage_${detached.threadId}`, detached);
+      if (detached.turnId) {
+        this._emitter.emit(`token_usage_${detached.threadId}_${detached.turnId}`, detached);
+      }
+    }
+  }
+
+  /**
+   * Handle thread/tokenUsage/updated notification from transport client.
+   * @private
+   */
+  _onTokenUsageUpdated(notifParams) {
+    if (!notifParams || typeof notifParams !== 'object') return;
+
+    const threadId = notifParams.threadId;
+    const turnId = notifParams.turnId;
+
+    if (typeof threadId !== 'string' || typeof turnId !== 'string') {
+      // Malformed notification IDs; rejected from observability state
+      return;
+    }
+
+    const localThreadId = this._turnOwnership.get(turnId);
+
+    if (localThreadId) {
+      // Turn ownership is already known locally
+      if (localThreadId !== threadId) {
+        // Mismatch! Do not overwrite valid usage state, surface mismatch
+        this._surfaceTokenUsageMismatch(turnId, threadId, localThreadId);
+        return;
+      }
+      try {
+        const snapshot = this._tokenUsageObserver.record(notifParams);
+        this._emitTokenUsage(snapshot);
+      } catch (err) {
+        // Malformed usage rejected from observability state without poisoning audit authority
+        this._emitter.emit('token_usage_error', err);
+      }
+    } else {
+      // Early-notification race: turn ownership not yet recorded locally.
+      // Validate notification first before buffering as pending evidence.
+      try {
+        validateTokenUsageNotification(notifParams);
+        this._recordBounded(this._pendingTokenUsage, turnId, deepDetach(notifParams), 4096);
+      } catch (err) {
+        // Malformed usage rejected from observability state
+        this._emitter.emit('token_usage_error', err);
+      }
+    }
+  }
+
+  /**
+   * Get latest token usage snapshot for a thread.
+   * @param {string} threadId
+   * @returns {Object|null} Detached snapshot or null
+   */
+  getLatestTokenUsageForThread(threadId) {
+    return this._tokenUsageObserver.getLatestForThread(threadId);
+  }
+
+  /**
+   * Get latest token usage snapshot for an exact thread and turn.
+   * @param {Object} params
+   * @param {string} params.threadId
+   * @param {string} params.turnId
+   * @returns {Object|null} Detached snapshot or null
+   */
+  getLatestTokenUsageForTurn(params = {}) {
+    return this._tokenUsageObserver.getLatestForTurn(params);
   }
 
   /**
@@ -552,7 +701,7 @@ class CodexAuditorAdapter {
     }
 
     // Record local turn ownership (Section 12)
-    this._recordBounded(this._turnOwnership, turnId, threadId);
+    this.recordTurnOwnership(turnId, threadId);
 
     const status = turnObj.status || 'inProgress';
 
@@ -687,7 +836,7 @@ class CodexAuditorAdapter {
       isSideEffecting: true
     });
 
-    this._turnOwnership.set(turnId, threadId);
+    this.recordTurnOwnership(turnId, threadId);
 
     return deepDetach(result);
   }
@@ -807,7 +956,7 @@ class CodexAuditorAdapter {
     }
 
     // Record turn ownership
-    this._recordBounded(this._turnOwnership, turnId, threadId);
+    this.recordTurnOwnership(turnId, threadId);
 
     return {
       turnId,
@@ -937,6 +1086,8 @@ class CodexAuditorAdapter {
   async close() {
     this._initialized = false;
     this._emitter.removeAllListeners();
+    this._pendingTokenUsage.clear();
+    this._tokenUsageObserver.clear();
     await this._client.close();
   }
 }

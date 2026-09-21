@@ -555,6 +555,36 @@ rl.on('line', (line) => {
         turnStatus = 'completed';
       }
 
+      // Early token usage notification before turn/start response (Section 10 race test)
+      if (scenario === 'early_token_usage') {
+        writeLine({
+          method: 'thread/tokenUsage/updated',
+          params: {
+            threadId: params.threadId || 'thr_fake_001',
+            turnId: turnId,
+            tokenUsage: {
+              total: {
+                totalTokens: 12000,
+                inputTokens: 10000,
+                cachedInputTokens: 5000,
+                cacheWriteInputTokens: 0,
+                outputTokens: 2000,
+                reasoningOutputTokens: 500
+              },
+              last: {
+                totalTokens: 12000,
+                inputTokens: 10000,
+                cachedInputTokens: 5000,
+                cacheWriteInputTokens: 0,
+                outputTokens: 2000,
+                reasoningOutputTokens: 500
+              },
+              modelContextWindow: 258400
+            }
+          }
+        });
+      }
+
       // Step 1: Write turn/start response (status: inProgress)
       writeLine({
         id,
@@ -590,6 +620,104 @@ rl.on('line', (line) => {
             item: { id: 'item_fake_001', type: 'message', text: 'Processing turn...' }
           }
         });
+
+        if (scenario === 'turn_with_token_usage' || scenario === 'repeated_token_usage' || scenario === 'token_usage_thread_mismatch' || scenario === 'malformed_token_usage') {
+          if (scenario === 'malformed_token_usage') {
+            writeLine({
+              method: 'thread/tokenUsage/updated',
+              params: {
+                threadId: params.threadId || 'thr_fake_001',
+                turnId: turnId,
+                tokenUsage: {
+                  total: { totalTokens: -50, inputTokens: 'not_a_number' }
+                }
+              }
+            });
+          } else if (scenario === 'token_usage_thread_mismatch') {
+            writeLine({
+              method: 'thread/tokenUsage/updated',
+              params: {
+                threadId: 'thr_mismatch_other',
+                turnId: turnId,
+                tokenUsage: {
+                  total: {
+                    totalTokens: 15650,
+                    inputTokens: 12000,
+                    cachedInputTokens: 8000,
+                    cacheWriteInputTokens: 0,
+                    outputTokens: 3650,
+                    reasoningOutputTokens: 1500
+                  },
+                  last: {
+                    totalTokens: 4632,
+                    inputTokens: 3200,
+                    cachedInputTokens: 2000,
+                    cacheWriteInputTokens: 0,
+                    outputTokens: 1432,
+                    reasoningOutputTokens: 500
+                  },
+                  modelContextWindow: 258400
+                }
+              }
+            });
+          } else {
+            writeLine({
+              method: 'thread/tokenUsage/updated',
+              params: {
+                threadId: params.threadId || 'thr_fake_001',
+                turnId: turnId,
+                tokenUsage: {
+                  total: {
+                    totalTokens: 15650,
+                    inputTokens: 12000,
+                    cachedInputTokens: 8000,
+                    cacheWriteInputTokens: 0,
+                    outputTokens: 3650,
+                    reasoningOutputTokens: 1500
+                  },
+                  last: {
+                    totalTokens: 4632,
+                    inputTokens: 3200,
+                    cachedInputTokens: 2000,
+                    cacheWriteInputTokens: 0,
+                    outputTokens: 1432,
+                    reasoningOutputTokens: 500
+                  },
+                  modelContextWindow: 258400
+                }
+              }
+            });
+
+            if (scenario === 'repeated_token_usage') {
+              writeLine({
+                method: 'thread/tokenUsage/updated',
+                params: {
+                  threadId: params.threadId || 'thr_fake_001',
+                  turnId: turnId,
+                  tokenUsage: {
+                    total: {
+                      totalTokens: 19800,
+                      inputTokens: 14000,
+                      cachedInputTokens: 9000,
+                      cacheWriteInputTokens: 0,
+                      outputTokens: 5800,
+                      reasoningOutputTokens: 2000
+                    },
+                    last: {
+                      totalTokens: 4150,
+                      inputTokens: 2000,
+                      cachedInputTokens: 1000,
+                      cacheWriteInputTokens: 0,
+                      outputTokens: 2150,
+                      reasoningOutputTokens: 500
+                    },
+                    modelContextWindow: 258400
+                  }
+                }
+              });
+            }
+          }
+        }
 
         const completedParams = {
           turn: {

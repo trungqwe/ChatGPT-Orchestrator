@@ -11,8 +11,8 @@
 | V4-05A | Durability / Recovery Core | COMPLETE / SEALED (51 ARS + 55 RG + 60 ATL tests pass; SQLite fail-closed store, atomic bindAuditorThread, lazy rollout fixture, cross-process resume gate, 13 deterministic suites pass) |
 | V4-05AG | Explicit Uncertainty Resolution & Registry Gate | APPROVED / CLOSED (WO-V4-05AG-R2 / R3 / R3-R1: 82 ARS + 122 ATL tests pass; V2 migration atomic rollback, bootstrap authority self-verification, post-persistence Registry freshness gate before first turn, 13 deterministic suites pass) |
 | V4-05B | Real First Audit Acceptance | COMPLETE / ACCEPTED (WO-V4-05B-R9: real V1→V2 migration, legacy retirement, 1 real model turn, hydration, DURABLE_BOUND, cross-process resume verified; substantive DISPATCH_WORKER finding closed by R3/R3-R1; WP-V4-05 COMPLETE) |
-| V4-06 | Model resolver & usage observability | IN_PROGRESS (WO-V4-06A complete: pure resolver, pagination hardening, first-turn pinning, 21 MPR + 10 CAS + 7 ATL tests pass; WO-V4-06B token usage observability pending) |
-| V4-07 | Audit/recover CLI | integration tests |
+| V4-06 | Model resolver & usage observability | COMPLETE (WO-V4-06A complete: pure resolver, pagination hardening, first-turn pinning; WO-V4-06B complete: pure token usage observer, exact turn correlation, early race resolution, snapshot preservation, bounded storage; 23 TUO + 104 CAS + 21 MPR + 133 ATL + 122 AD + 82 ARS tests pass; 15 deterministic suites pass; no budget enforcement by design, reserved for V4-12) |
+| V4-07 | Audit/recover CLI | NOT_STARTED (integration tests) |
 | V4-08 | Generic worker boundary | Antigravity regression |
 | V4-09 | One-shot full cycle | real workspace acceptance |
 | V4-10 | Recovery/provenance | fault matrix |

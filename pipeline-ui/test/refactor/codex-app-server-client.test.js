@@ -2038,8 +2038,254 @@ async function runTests() {
     console.log('PASS: CAS-096 — page 51 required fails closed');
   }
 
+  // CAS-097: valid usage notification captured
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=turn_with_token_usage'] });
+    try {
+      await adapter.initialize();
+      let captured = null;
+      adapter.on('token_usage', (snapshot) => {
+        captured = snapshot;
+      });
+
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+
+      assert.notStrictEqual(captured, null, 'token_usage event must be emitted');
+      assert.strictEqual(captured.threadId, th.threadId);
+      assert.strictEqual(captured.turnId, tu.turnId);
+      assert.strictEqual(captured.total.totalTokens, 15650);
+      assert.strictEqual(captured.total.inputTokens, 12000);
+      assert.strictEqual(captured.total.cachedInputTokens, 8000);
+      assert.strictEqual(captured.total.cacheWriteInputTokens, 0);
+      assert.strictEqual(captured.total.outputTokens, 3650);
+      assert.strictEqual(captured.total.reasoningOutputTokens, 1500);
+      assert.strictEqual(captured.last.totalTokens, 4632);
+      assert.strictEqual(captured.modelContextWindow, 258400);
+      console.log('PASS: CAS-097 — valid usage notification captured');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-098: exact thread lookup
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=turn_with_token_usage'] });
+    try {
+      await adapter.initialize();
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+
+      const threadSnapshot = adapter.getLatestTokenUsageForThread(th.threadId);
+      assert.notStrictEqual(threadSnapshot, null);
+      assert.strictEqual(threadSnapshot.total.totalTokens, 15650);
+      assert.strictEqual(threadSnapshot.modelContextWindow, 258400);
+
+      // Other thread returns null
+      assert.strictEqual(adapter.getLatestTokenUsageForThread('thr_unknown_999'), null);
+      console.log('PASS: CAS-098 — exact thread lookup');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-099: exact turn lookup
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=turn_with_token_usage'] });
+    try {
+      await adapter.initialize();
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+
+      const turnSnapshot = adapter.getLatestTokenUsageForTurn({
+        threadId: th.threadId,
+        turnId: tu.turnId
+      });
+      assert.notStrictEqual(turnSnapshot, null);
+      assert.strictEqual(turnSnapshot.total.totalTokens, 15650);
+      assert.strictEqual(turnSnapshot.last.totalTokens, 4632);
+
+      // Mismatched thread with same turn returns null (no fallback)
+      assert.strictEqual(
+        adapter.getLatestTokenUsageForTurn({ threadId: 'thr_different', turnId: tu.turnId }),
+        null
+      );
+      // Mismatched turn with same thread returns null
+      assert.strictEqual(
+        adapter.getLatestTokenUsageForTurn({ threadId: th.threadId, turnId: 'turn_nonexistent' }),
+        null
+      );
+      console.log('PASS: CAS-099 — exact turn lookup');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-100: repeated snapshot replaces, does not add
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=repeated_token_usage'] });
+    try {
+      await adapter.initialize();
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+
+      const latest = adapter.getLatestTokenUsageForThread(th.threadId);
+      assert.notStrictEqual(latest, null);
+      // Second snapshot totalTokens = 19800, NOT 15650 + 19800 = 35450
+      assert.strictEqual(latest.total.totalTokens, 19800);
+      // Second snapshot last.totalTokens = 4150, NOT 4632 + 4150 = 8782
+      assert.strictEqual(latest.last.totalTokens, 4150);
+      console.log('PASS: CAS-100 — repeated snapshot replaces, does not add');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-101: malformed usage ignored/rejected from observability state
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=malformed_token_usage'] });
+    try {
+      await adapter.initialize();
+      let errorEmitted = null;
+      adapter.on('token_usage_error', (err) => {
+        errorEmitted = err;
+      });
+
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      // Audit and turn complete normally despite malformed usage notification
+      const comp = await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+      assert.strictEqual(comp.status, 'completed');
+
+      // Observability state has zero records (malformed rejected)
+      assert.strictEqual(adapter.getLatestTokenUsageForThread(th.threadId), null);
+      assert.strictEqual(adapter.getLatestTokenUsageForTurn({ threadId: th.threadId, turnId: tu.turnId }), null);
+      console.log('PASS: CAS-101 — malformed usage ignored/rejected from observability state');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-102: thread ownership mismatch rejected
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=token_usage_thread_mismatch'] });
+    try {
+      await adapter.initialize();
+      let mismatchError = null;
+      adapter.on('token_usage_mismatch', (err) => {
+        mismatchError = err;
+      });
+
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+
+      // Mismatch surfaced
+      assert.notStrictEqual(mismatchError, null);
+      assert.strictEqual(mismatchError.code, 'TOKEN_USAGE_THREAD_MISMATCH');
+
+      // Neither thread records the mismatched usage
+      assert.strictEqual(adapter.getLatestTokenUsageForThread(th.threadId), null);
+      assert.strictEqual(adapter.getLatestTokenUsageForThread('thr_mismatch_other'), null);
+      console.log('PASS: CAS-102 — thread ownership mismatch rejected');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-103: valid early notification before local ownership reconciles correctly
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=early_token_usage'] });
+    try {
+      await adapter.initialize();
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      // In early_token_usage scenario, server sends tokenUsage notification BEFORE turn/start response
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+
+      // After ownership is recorded, the early notification is reconciled
+      const snapshot = adapter.getLatestTokenUsageForTurn({
+        threadId: th.threadId,
+        turnId: tu.turnId
+      });
+      assert.notStrictEqual(snapshot, null, 'early notification must be reconciled once ownership recorded');
+      assert.strictEqual(snapshot.total.totalTokens, 12000);
+      assert.strictEqual(snapshot.modelContextWindow, 258400);
+      console.log('PASS: CAS-103 — valid early notification before local ownership reconciles correctly');
+    } finally {
+      await adapter.close();
+    }
+  }
+
+  // CAS-104: getter result mutation does not alter cached state
+  {
+    const adapter = createTestAdapter({ fixtureArgs: ['--scenario=early_token_usage'] });
+    try {
+      await adapter.initialize();
+      const th = await adapter.startThread({ cwd: process.cwd() });
+      const tu = await adapter.startTurn({
+        threadId: th.threadId,
+        input: [{ type: 'text', text: 'Analyze code' }],
+        model: 'gpt-4o',
+        effort: 'medium'
+      });
+      await adapter.waitForTurnCompletion({ threadId: th.threadId, turnId: tu.turnId });
+
+      const snap1 = adapter.getLatestTokenUsageForThread(th.threadId);
+      assert.notStrictEqual(snap1, null);
+      snap1.total.totalTokens = 999999999;
+      snap1.last.outputTokens = 888888;
+
+      const snap2 = adapter.getLatestTokenUsageForThread(th.threadId);
+      assert.strictEqual(snap2.total.totalTokens, 12000);
+      assert.strictEqual(snap2.last.outputTokens, 2000);
+      console.log('PASS: CAS-104 — getter result mutation does not alter cached state');
+    } finally {
+      await adapter.close();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-096: 96/96 PASS)');
+  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-104: 104/104 PASS)');
   console.log('======================================================================');
 }
 

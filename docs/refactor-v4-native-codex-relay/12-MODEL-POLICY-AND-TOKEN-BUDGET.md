@@ -84,11 +84,57 @@ Ngữ nghĩa thất bại tại Gate A, model resolution, hoặc Gate B (Zero-Tu
 
 Khi phục hồi operation (`recoverAuditorBootstrap`) hoặc giải quyết bất định (`resolveAuditorBootstrapUncertainty`), tuyệt đối KHÔNG gọi `model/list`. Các luồng này xử lý thread/turn đã tồn tại trong lịch sử; không được phép tái resolve để thay đổi authority của model.
 
-## 6. Token Usage Observability (Kế hoạch WO-V4-06B)
+## 6. Token Usage Observability (`token-usage-observer.js` & `codex-auditor-adapter.js`)
 
-Đo lường token, usage metadata và budget limits được bảo lưu cho package tiếp theo WO-V4-06B sau khi WO-V4-06A-R1 được review hoàn tất.
+Hoàn thành quan sát token usage từ provider thông qua notification authoritative:
+```text
+thread/tokenUsage/updated
+```
+
+### 6.1. Cấu trúc dữ liệu chuẩn từ App Server
+```javascript
+{
+  threadId,
+  turnId,
+  tokenUsage: {
+    total: {
+      totalTokens,
+      inputTokens,
+      cachedInputTokens,
+      cacheWriteInputTokens,
+      outputTokens,
+      reasoningOutputTokens
+    },
+    last: {
+      totalTokens,
+      inputTokens,
+      cachedInputTokens,
+      cacheWriteInputTokens,
+      outputTokens,
+      reasoningOutputTokens
+    },
+    modelContextWindow
+  }
+}
+```
+
+### 6.2. Các nguyên tắc bất biến (Semantic Rules)
+1. **Authoritative Snapshots**: Giá trị từ provider là snapshot chính thức. Tuyệt đối KHÔNG tái dựng usage từ text streaming, KHÔNG đếm token cục bộ, KHÔNG cộng dồn lặp lại các notification, KHÔNG ước lượng chi phí (cost), KHÔNG tự suy diễn cạn kiệt ngân sách (budget exhaustion).
+2. **Bảo tồn nguyên vẹn Total và Last**: `tokenUsage.total` là snapshot tích lũy của provider; `tokenUsage.last` là snapshot của turn gần nhất. Bảo tồn cả hai chính xác, không suy diễn trường này từ trường kia, không ép buộc các đẳng thức số học như `totalTokens == inputTokens + outputTokens` do sự khác biệt trong hạch toán caching/reasoning.
+3. **Snapshot Replacement (Không cộng dồn)**: Nhiều notification cho cùng một thread/turn là cập nhật snapshot mới thay thế snapshot cũ (`A -> B`), không bao giờ thực hiện `A + B`.
+4. **Exact Turn Correlation & Early-Notification Race**:
+   - Khi đã có local ownership (`turnId -> threadId`), notification phải khớp đúng `threadId`. Mismatch sẽ bị từ chối với `TOKEN_USAGE_THREAD_MISMATCH` và không ghi đè dữ liệu hợp lệ.
+   - Giải quyết race condition khi notification đến trước khi response của `turn/start` hoàn tất: lưu tạm vào bộ đệm bounded pending map (`_pendingTokenUsage`); sau khi local ownership được ghi nhận, pending notification hợp lệ sẽ được điều hòa (reconcile) vào observer. Nếu threadId không khớp, pending notification bị loại bỏ và phát sinh mismatch.
+5. **Giới hạn lưu trữ (Bounded Storage)**:
+   - Giới hạn lưu trữ: `threads <= 1024`, `turns <= 4096`.
+   - Cơ chế thu dọn: Oldest-insertion eviction tất định (`map.keys().next().value`).
+   - Snapshot trả về luôn được deep detach để bảo vệ tính bất biến.
+6. **Cách ly hoàn toàn với Lifecycle**: Dữ liệu observability không ảnh hưởng và không được phép làm gián đoạn hay thay đổi quyết định audit (`AuditDecisionV1`), trạng thái recovery store, hay Registry binding. Malformed notification bị loại bỏ khỏi observability state mà không làm dừng hay fail tiến trình audit.
+7. **No Budget Enforcement By Design**: WO-V4-06B tuyệt đối không áp đặt production token budgets, không có numeric budget limit, không có automatic interrupt. Toàn bộ logic kiểm soát và dừng theo ngân sách thuộc về **WP-V4-12**.
 
 Trạng thái:
-- **WP-V4-05**: `APPROVED_CLOSED`
-- **WP-V4-06**: `IN_PROGRESS` (06A-R1 hoàn tất, 06B chờ thực hiện)
+- **WP-V4-06A**: `APPROVED_CLOSED`
+- **WP-V4-06B**: `COMPLETE`
+- **WP-V4-06**: `COMPLETE`
 - **WP-V4-07**: `NOT_STARTED`
+- **WP-V4-12**: `PENDING` (Budget enforcement)

@@ -71,4 +71,7 @@ OpenAI Codex App Server protocol (qua stdio JSONL: `initialize` / `initialized`,
 - **WP-V4-05AG**: APPROVED / CLOSED (Explicit `AUDIT_UNCERTAIN` terminal-turn resolution, V1→V2 atomic migration rollback guarantee, and post-persistence pre-first-turn Registry freshness gate).
 - **WP-V4-05B**: APPROVED / CLOSED (R9 real durable lifecycle proven: V1→V2 migration, legacy retirement, single model turn, completed-turn hydration, and cross-process resume).
 - **WP-V4-05**: COMPLETE (Final external closure review passed; all production, lifecycle, and recovery contracts verified).
-- **WP-V4-06**: IN_PROGRESS (WO-V4-06A complete: pure resolver `resolveAuditorModelPolicy`, pagination hardening in `listModels()`, first-turn model+effort pinning; WO-V4-06B token usage observability pending).
+- **WP-V4-06A**: APPROVED_CLOSED (Resolved model policy authority and first-turn pinning).
+- **WP-V4-06B**: COMPLETE (Pure token usage observer `token-usage-observer.js`, adapter integration for `thread/tokenUsage/updated`, exact turn correlation, early race resolution, snapshot preservation, bounded storage).
+- **WP-V4-06**: COMPLETE (All model policy resolution and token usage observability contracts complete; budget enforcement reserved for WP-V4-12).
+- **WP-V4-07**: NOT_STARTED.

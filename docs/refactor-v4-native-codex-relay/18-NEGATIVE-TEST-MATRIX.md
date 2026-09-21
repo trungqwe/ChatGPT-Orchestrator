@@ -178,3 +178,19 @@ RV2AUTH-01: pre-lstat thiếu `dev`/`ino`, fd-fstat thiếu `dev`/`ino`, post-ls
 136. **ATL-GATEB-02** (Binding Drift During Model/List Detected at Gate B): Auditor trở thành bound trong lúc gọi `model/list` bị Gate B từ chối trước `FIRST_TURN_STARTING`, 0 `startTurn`, giữ `PROVISIONAL_THREAD`, không ghi đè binding (ATL-131).
 137. **ATL-GATEB-03** (Post-Resolution Registry Read Failure at Gate B): `getProject` tại Gate B ném lỗi bị từ chối trước `startTurn`, không ghi `FIRST_TURN_STARTING` hay `AUDIT_UNCERTAIN`, giữ `PROVISIONAL_THREAD`, đóng client 1 (ATL-132).
 138. **ATL-ORDER-02** (Exact End-to-End Success Order): Chứng minh thứ tự thực thi chuẩn: Gate A < `listModels` < Model Resolution < Gate B < `FIRST_TURN_STARTING` < `startTurn`, bảo đảm chuyển thành công sang `DURABLE_BOUND` với exact pinned model và effort (ATL-133).
+
+## Token Usage Observability & Turn Correlation Negative Matrix (WP-V4-06B: TUO-001..TUO-023, CAS-097..CAS-104)
+
+139. **TUO-CNT-01** (Negative Counter Rejection): Bất kỳ counter nào trong `total` hoặc `last` có giá trị âm bị từ chối với `TOKEN_USAGE_INVALID_COUNTER` (TUO-006).
+140. **TUO-CNT-02** (Fractional / Non-Integer Counter Rejection): Counter dạng float / số thập phân bị từ chối với `TOKEN_USAGE_INVALID_COUNTER` (TUO-007).
+141. **TUO-CNT-03** (Unsafe Integer Counter Rejection): Counter vượt quá `Number.MAX_SAFE_INTEGER` bị từ chối fail-closed với `TOKEN_USAGE_INVALID_COUNTER` (TUO-008).
+142. **TUO-NOTIF-01** (Missing Breakdown or Counter Rejection): Thiếu breakdown `total` hoặc `last`, hoặc thiếu bất kỳ counter nào trong 6 counter chuẩn bị từ chối với `TOKEN_USAGE_INVALID_NOTIFICATION` (TUO-009, TUO-010).
+143. **TUO-ID-01** (Invalid ThreadId / TurnId Rejection): `threadId` hoặc `turnId` rỗng, whitespace, vượt quá 256 bytes, hoặc chứa control characters bị từ chối với `TOKEN_USAGE_INVALID_NOTIFICATION` (TUO-011, TUO-012).
+144. **TUO-MCW-01** (Invalid ModelContextWindow Rejection): `modelContextWindow` không phải `null` hoặc không phải số nguyên không âm an toàn bị từ chối với `TOKEN_USAGE_INVALID_COUNTER` (TUO-023).
+145. **TUO-IMMUT-01** (Input / Output Immutability & Detachment): Mutate object đầu vào sau `record()` hoặc mutate kết quả getter không làm biến dạng dữ liệu lưu trữ nội bộ của observer (TUO-013, TUO-014, CAS-104).
+146. **TUO-NOACCUM-01** (Snapshot Replacement Without Summation): Các notification lặp lại cho cùng một thread/turn thay thế snapshot cũ chứ tuyệt đối không cộng dồn (TUO-015, TUO-016, TUO-017, CAS-100).
+147. **TUO-BOUND-01** (Bounded Storage Eviction): Vượt quá bound `maxThreads` (1024) hoặc `maxTurns` (4096) thực hiện eviction tất định theo thứ tự insertion cũ nhất (TUO-018, TUO-019).
+148. **TUO-LOOKUP-01** (No Cross-Thread Fallback): Lookup snapshot theo thread hoặc turn không bao giờ fallback sang thread khác khi không tìm thấy (TUO-020, TUO-021, CAS-098, CAS-099).
+149. **CAS-USAGE-01** (Malformed Usage Non-Poisoning): Notification usage malformed bị loại bỏ khỏi observability state mà không làm chết transport hoặc làm gián đoạn audit turn (CAS-101).
+150. **CAS-USAGE-02** (Thread Ownership Mismatch Rejection): Notification cho `turnId` có `threadId` sai lệch so với local turn ownership bị từ chối với `TOKEN_USAGE_THREAD_MISMATCH` và không ghi đè dữ liệu hợp lệ (CAS-102).
+151. **CAS-USAGE-03** (Early Notification Race Reconciliation): Notification đến trước khi response của `turn/start` thiết lập local ownership được lưu tạm vào pending cache và chỉ trở thành dữ liệu hợp lệ sau khi ownership được xác nhận khớp (CAS-103).
