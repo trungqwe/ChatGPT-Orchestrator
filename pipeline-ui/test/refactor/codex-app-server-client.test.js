@@ -2,7 +2,7 @@
 
 /**
  * Codex App Server Stdio Transport & Adapter Test Suite
- * CAS-001 .. CAS-084
+ * CAS-001 .. CAS-109
  */
 
 const assert = require('assert');
@@ -34,7 +34,7 @@ function createTestAdapter(options = {}) {
 }
 
 async function runTests() {
-  console.log('Starting Codex App Server Client & Adapter test suite (CAS-001 .. CAS-084)...\n');
+  console.log('Starting Codex App Server Client & Adapter test suite (CAS-001 .. CAS-109)...\n');
 
   // CAS-001: Spawns via argument array, shell: false
   {
@@ -2322,8 +2322,117 @@ async function runTests() {
     }
   }
 
+  // CAS-106: exact Antigravity brain authority propagated
+  {
+    let capturedEnv = null;
+    const customSpawn = (bin, args, opts) => {
+      capturedEnv = opts.env;
+      return spawn(bin, args, opts);
+    };
+
+    const client = createTestClient({
+      spawn: customSpawn,
+      env: {
+        ANTIGRAVITY_BRAIN_DIR: 'C:\\test\\antigravity-cli\\brain'
+      }
+    });
+    try {
+      await client.initialize();
+      assert.strictEqual(
+        capturedEnv.ANTIGRAVITY_BRAIN_DIR,
+        'C:\\test\\antigravity-cli\\brain',
+        'CAS-106: ANTIGRAVITY_BRAIN_DIR must be propagated exactly'
+      );
+      console.log('PASS: CAS-106 — exact Antigravity brain authority propagated');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-107: exact AO data authority propagated
+  {
+    let capturedEnv = null;
+    const customSpawn = (bin, args, opts) => {
+      capturedEnv = opts.env;
+      return spawn(bin, args, opts);
+    };
+
+    const client = createTestClient({
+      spawn: customSpawn,
+      env: {
+        AO_DATA_DIR: 'C:\\test\\.ao\\data'
+      }
+    });
+    try {
+      await client.initialize();
+      assert.strictEqual(
+        capturedEnv.AO_DATA_DIR,
+        'C:\\test\\.ao\\data',
+        'CAS-107: AO_DATA_DIR must be propagated exactly'
+      );
+      console.log('PASS: CAS-107 — exact AO data authority propagated');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-108: no wildcard authority expansion
+  {
+    let capturedEnv = null;
+    const customSpawn = (bin, args, opts) => {
+      capturedEnv = opts.env;
+      return spawn(bin, args, opts);
+    };
+
+    const testEnv = {
+      ANTIGRAVITY_BRAIN_DIR: 'C:\\test\\antigravity-cli\\brain',
+      AO_DATA_DIR: 'C:\\test\\.ao\\data',
+      ANTIGRAVITY_SECRET: 'must_not_pass',
+      ANTIGRAVITY_TOKEN: 'must_not_pass',
+      AO_SECRET: 'must_not_pass',
+      AO_TOKEN: 'must_not_pass',
+      SECRET_KEY: 'must_not_pass',
+      DATABASE_PASSWORD: 'must_not_pass'
+    };
+
+    const client = createTestClient({ spawn: customSpawn, env: testEnv });
+    try {
+      await client.initialize();
+      assert.strictEqual(capturedEnv.ANTIGRAVITY_SECRET, undefined, 'CAS-108: ANTIGRAVITY_SECRET must not pass');
+      assert.strictEqual(capturedEnv.ANTIGRAVITY_TOKEN, undefined, 'CAS-108: ANTIGRAVITY_TOKEN must not pass');
+      assert.strictEqual(capturedEnv.AO_SECRET, undefined, 'CAS-108: AO_SECRET must not pass');
+      assert.strictEqual(capturedEnv.AO_TOKEN, undefined, 'CAS-108: AO_TOKEN must not pass');
+      assert.strictEqual(capturedEnv.SECRET_KEY, undefined, 'CAS-108: SECRET_KEY must not pass');
+      assert.strictEqual(capturedEnv.DATABASE_PASSWORD, undefined, 'CAS-108: DATABASE_PASSWORD must not pass');
+      assert.strictEqual(capturedEnv.ANTIGRAVITY_BRAIN_DIR, 'C:\\test\\antigravity-cli\\brain', 'CAS-108: ANTIGRAVITY_BRAIN_DIR must pass');
+      assert.strictEqual(capturedEnv.AO_DATA_DIR, 'C:\\test\\.ao\\data', 'CAS-108: AO_DATA_DIR must pass');
+      console.log('PASS: CAS-108 — no wildcard authority expansion');
+    } finally {
+      await client.close();
+    }
+  }
+
+  // CAS-109: absent authority remains absent
+  {
+    let capturedEnv = null;
+    const customSpawn = (bin, args, opts) => {
+      capturedEnv = opts.env;
+      return spawn(bin, args, opts);
+    };
+
+    const client = createTestClient({ spawn: customSpawn, env: {} });
+    try {
+      await client.initialize();
+      assert.strictEqual('ANTIGRAVITY_BRAIN_DIR' in capturedEnv, false, 'CAS-109: ANTIGRAVITY_BRAIN_DIR must be absent');
+      assert.strictEqual('AO_DATA_DIR' in capturedEnv, false, 'CAS-109: AO_DATA_DIR must be absent');
+      console.log('PASS: CAS-109 — absent authority remains absent');
+    } finally {
+      await client.close();
+    }
+  }
+
   console.log('\n======================================================================');
-  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-105: 105/105 PASS)');
+  console.log('ALL CODEX APP SERVER TESTS PASSED (CAS-001 .. CAS-109: 109/109 PASS)');
   console.log('======================================================================');
 }
 

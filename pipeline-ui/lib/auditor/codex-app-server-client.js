@@ -45,6 +45,14 @@ const PLATFORM_ENV_VARS = [
 ];
 
 /**
+ * Worker-provenance environment variables preserved for child process (WO-V4-09C-P4-E1).
+ */
+const WORKER_PROVENANCE_ENV_VARS = [
+  'ANTIGRAVITY_BRAIN_DIR',
+  'AO_DATA_DIR'
+];
+
+/**
  * Helper to create typed errors.
  */
 function createError(code, message, details = {}) {
@@ -218,6 +226,12 @@ class CodexAppServerClient extends EventEmitter {
     const sourceEnv = customEnv || process.env;
 
     for (const key of PLATFORM_ENV_VARS) {
+      if (sourceEnv[key] !== undefined) {
+        cleanEnv[key] = sourceEnv[key];
+      }
+    }
+
+    for (const key of WORKER_PROVENANCE_ENV_VARS) {
       if (sourceEnv[key] !== undefined) {
         cleanEnv[key] = sourceEnv[key];
       }
@@ -920,5 +934,6 @@ module.exports = {
   CLIENT_STATES,
   SIDE_EFFECTING_METHODS,
   PLATFORM_ENV_VARS,
+  WORKER_PROVENANCE_ENV_VARS,
   createError
 };

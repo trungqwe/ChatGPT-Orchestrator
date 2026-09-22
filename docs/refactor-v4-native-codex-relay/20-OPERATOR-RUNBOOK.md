@@ -122,3 +122,11 @@ Khi cần chuyển giao tài khoản worker sang tài khoản provider mới:
 6. Sau khi terminal xác nhận đăng nhập thành công, thoát CLI bằng `/exit` hoặc tổ hợp phím `Ctrl+D`.
 7. Chạy lại `agy -p "/quota"` để kiểm chứng hạn mức mới đã sẵn sàng trước khi thực hiện bất kỳ lệnh spawn hay relay nào.
 
+### 4. Đồng bộ thẩm quyền môi trường worker-provenance (Worker-Provenance Environment Parity)
+The coordinator and Native Codex auditor child must observe the same `ANTIGRAVITY_BRAIN_DIR` and `AO_DATA_DIR` authorities when those variables are configured.
+
+`CodexAppServerClient` forwards only these exact worker-provenance keys.
+
+It does not forward arbitrary `ANTIGRAVITY_*` or `AO_*` variables.
+
+This allows independent auditor verification of the same Registry-resolved worker transcript/AO session authority used by the broker.
