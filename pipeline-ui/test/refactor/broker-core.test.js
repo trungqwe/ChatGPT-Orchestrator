@@ -11,7 +11,7 @@
 const assert = require('node:assert');
 const { createBroker } = require('../../lib/broker/broker');
 const { createMemoryLifecycleStore } = require('../../lib/broker/lifecycle-store');
-const { DISPATCH_STATES, ERROR_CODES, computeRequestFingerprint } = require('../../lib/broker/contracts');
+const { DISPATCH_STATES, ERROR_CODES, computeRequestFingerprint, LIMITS } = require('../../lib/broker/contracts');
 
 // Helper to create fresh test harness with deterministic dependencies
 function createTestHarness(custom = {}) {
@@ -508,7 +508,7 @@ async function runAllTests() {
   // -----------------------------------------------------------------------
   // BC-016: Timeout clamping
   // -----------------------------------------------------------------------
-  console.log('\n[BC-016] Testing timeout clamping to max 30 seconds...');
+  console.log('\n[BC-016] Testing timeout clamping to max bound...');
   {
     let capturedTimeout;
     const customWorkerPort = {
@@ -534,8 +534,8 @@ async function runAllTests() {
       timeout_secs: 99999
     });
 
-    assert.strictEqual(capturedTimeout, 30, 'Timeout must be clamped to max bound 30s');
-    console.log('✓ BC-016 PASSED: Excessive timeout clamped to 30 seconds.');
+    assert.strictEqual(capturedTimeout, LIMITS.MAX_TIMEOUT_SECS, 'Timeout must be clamped to max bound');
+    console.log('✓ BC-016 PASSED: Excessive timeout clamped to max bound.');
   }
 
   // -----------------------------------------------------------------------
@@ -1686,8 +1686,118 @@ async function runAllTests() {
     console.log('✓ BC-052 PASSED: workerPort.wait receives exact expected_workspace_state_id from dispatch lifecycle record.');
   }
 
+  // -----------------------------------------------------------------------
+  // WAIT-BOUND-001: Contracts authority
+  // -----------------------------------------------------------------------
+  console.log('\n[WAIT-BOUND-001] Testing contracts MAX_TIMEOUT_SECS === 300...');
+  {
+    assert.strictEqual(LIMITS.MAX_TIMEOUT_SECS, 300, 'LIMITS.MAX_TIMEOUT_SECS must be exactly 300');
+    assert.strictEqual(LIMITS.DEFAULT_TIMEOUT_SECS, 10, 'LIMITS.DEFAULT_TIMEOUT_SECS must be exactly 10');
+    assert.strictEqual(LIMITS.MIN_TIMEOUT_SECS, 1, 'LIMITS.MIN_TIMEOUT_SECS must be exactly 1');
+    console.log('✓ WAIT-BOUND-001 PASS: contracts MAX_TIMEOUT_SECS === 300, DEFAULT === 10, MIN === 1.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WAIT-BOUND-002: Broker exact 300 forwarding
+  // -----------------------------------------------------------------------
+  console.log('\n[WAIT-BOUND-002] Testing broker forwards exact timeout 300 to workerPort.wait...');
+  {
+    let capturedTimeout = null;
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => {
+        capturedTimeout = args.timeout_secs;
+        return {
+          ok: true,
+          state: DISPATCH_STATES.RUNNING,
+          dispatch_id: args.dispatch_id,
+          work_order_id: args.work_order_id
+        };
+      },
+      status: async () => ({ ok: true })
+    };
+
+    const { broker } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 300
+    });
+
+    assert.strictEqual(capturedTimeout, 300, 'Broker must forward exact timeout 300');
+    console.log('✓ WAIT-BOUND-002 PASS: broker forwards exact timeout 300 to workerPort.wait.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WAIT-BOUND-003: Broker >300 clamp
+  // -----------------------------------------------------------------------
+  console.log('\n[WAIT-BOUND-003] Testing broker clamps >300 to 300...');
+  {
+    let capturedTimeout = null;
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => {
+        capturedTimeout = args.timeout_secs;
+        return {
+          ok: true,
+          state: DISPATCH_STATES.RUNNING,
+          dispatch_id: args.dispatch_id,
+          work_order_id: args.work_order_id
+        };
+      },
+      status: async () => ({ ok: true })
+    };
+
+    const { broker } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id,
+      timeout_secs: 999
+    });
+
+    assert.strictEqual(capturedTimeout, 300, 'Broker must clamp 999 to 300');
+    console.log('✓ WAIT-BOUND-003 PASS: broker clamps >300 to 300.');
+  }
+
+  // -----------------------------------------------------------------------
+  // WAIT-BOUND-011: Default omitted timeout remains 10 (broker part)
+  // -----------------------------------------------------------------------
+  console.log('\n[WAIT-BOUND-011] Testing broker omitted timeout defaults to 10...');
+  {
+    let capturedTimeout = null;
+    const customWorkerPort = {
+      dispatch: async () => ({ ok: true, state: DISPATCH_STATES.DISPATCH_ACCEPTED }),
+      wait: async (args) => {
+        capturedTimeout = args.timeout_secs;
+        return {
+          ok: true,
+          state: DISPATCH_STATES.RUNNING,
+          dispatch_id: args.dispatch_id,
+          work_order_id: args.work_order_id
+        };
+      },
+      status: async () => ({ ok: true })
+    };
+
+    const { broker } = createTestHarness({ workerPort: customWorkerPort });
+    const dispRes = await broker.dispatchWorker(baseValidRequest());
+
+    await broker.waitWorker({
+      project_id: 'ai-multi-task',
+      dispatch_id: dispRes.dispatch_id
+    });
+
+    assert.strictEqual(capturedTimeout, 10, 'Omitted timeout must default to 10');
+    console.log('✓ WAIT-BOUND-011 PASS (broker): omitted timeout defaults to 10 seconds.');
+  }
+
   console.log('\n======================================================================');
   console.log('ALL BROKER CORE TESTS PASSED (BC-001 .. BC-052: 52/52 PASS)');
+  console.log('WAIT-BOUND-001, WAIT-BOUND-002, WAIT-BOUND-003, WAIT-BOUND-011 (broker): PASS');
   console.log('======================================================================');
 }
 

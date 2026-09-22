@@ -174,7 +174,7 @@ const LIMITS = Object.freeze({
   MAX_DIRECTIVE_BYTES: 2 * 1024 * 1024, // 2 MiB (Section 24)
   DEFAULT_TIMEOUT_SECS: 10,
   MIN_TIMEOUT_SECS: 1,
-  MAX_TIMEOUT_SECS: 30 // Section 41: Clamped bounds
+  MAX_TIMEOUT_SECS: 300 // Section 41: Clamped bounds (WO-V4-09C-WAIT-I1)
 });
 
 /**

@@ -2928,12 +2928,220 @@ async function runTests() {
     console.log('PASS: OSC-BOUND-03 — Whitespace-padded error code falls back to DISPATCH_RESULT_INVALID');
   }
 
+  // -----------------------------------------------------------------------
+  // WAIT-BOUND MATRIX (WO-V4-09C-WAIT-I1)
+  // -----------------------------------------------------------------------
+  console.log('\n======================================================================');
+  console.log('RUNNING WAIT-BOUND TEST MATRIX (ONE-SHOT CYCLE)');
+  console.log('======================================================================');
+
+  // WAIT-BOUND-006: One-shot exact 300s wait forwarding
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let waitRequest = null;
+    await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      workerWaitTimeoutSecs: 300,
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-wb-006', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async (req) => {
+          waitRequest = req;
+          return { ok: true, state: 'READY_FOR_REVIEW', dispatch_id: 'd-wb-006', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(waitRequest.timeout_secs, 300);
+    console.log('PASS: WAIT-BOUND-006 — One-shot cycle passes workerWaitTimeoutSecs 300 to broker.waitWorker');
+  }
+
+  // WAIT-BOUND-007: One-shot >300s timeout clamped to 300s
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let waitCalls = 0;
+    let waitRequest = null;
+    await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      workerWaitTimeoutSecs: 450,
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-wb-007', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async (req) => {
+          waitCalls++;
+          waitRequest = req;
+          return { ok: true, state: 'READY_FOR_REVIEW', dispatch_id: 'd-wb-007', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(waitCalls, 1);
+    assert.strictEqual(waitRequest.timeout_secs, 300);
+    console.log('PASS: WAIT-BOUND-007 — One-shot cycle clamps workerWaitTimeoutSecs 450 to 300');
+  }
+
+  // WAIT-BOUND-008: Exactly one wait call and 0 Turn B on RUNNING
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let waitCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-wb-008', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async () => {
+          waitCalls++;
+          return { ok: true, state: 'RUNNING', dispatch_id: 'd-wb-008', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(waitCalls, 1);
+    assert.strictEqual(adapter.startTurnCalls, 1);
+    assert.strictEqual(res.status, 'WORKER_PENDING');
+    console.log('PASS: WAIT-BOUND-008 — Exactly one waitWorker call on RUNNING, Turn B not called, status WORKER_PENDING');
+  }
+
+  // WAIT-BOUND-009: RUNNING at extended deadline returns WORKER_PENDING
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let waitCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      workerWaitTimeoutSecs: 300,
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-wb-009', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async () => {
+          waitCalls++;
+          return { ok: true, state: 'RUNNING', dispatch_id: 'd-wb-009', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(res.status, 'WORKER_PENDING');
+    assert.strictEqual(res.code, null);
+    assert.strictEqual(res.worker_state, 'RUNNING');
+    assert.strictEqual(adapter.startTurnCalls, 1);
+    assert.strictEqual(waitCalls, 1);
+    console.log('PASS: WAIT-BOUND-009 — Worker RUNNING at extended deadline returns WORKER_PENDING (code: null, wait calls: 1)');
+  }
+
+  // WAIT-BOUND-010: Late-but-in-bound completion (One-shot part)
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter({
+      turnBData: createValidDecisionPayload({
+        decision: AUDIT_DECISIONS.APPROVE_WORK_PACKAGE,
+        workspaceStateObserved: 'snap-002'
+      })
+    });
+    let s2Observed = false;
+    let wsCalls = 0;
+    let waitCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      workerWaitTimeoutSecs: 300,
+      registryPort: { getProject: async () => proj },
+      workspacePort: {
+        getWorkspaceState: async () => {
+          wsCalls++;
+          if (wsCalls === 3) s2Observed = true;
+          return createMockSnapshot(testDir, wsCalls <= 2 ? 'snap-001' : 'snap-002');
+        }
+      },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => ({ ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-wb-010', work_order_id: 'wo-001', project_id: 'test-proj' }),
+        waitWorker: async (req) => {
+          waitCalls++;
+          assert.strictEqual(req.timeout_secs, 300);
+          return { ok: true, state: 'READY_FOR_REVIEW', dispatch_id: 'd-wb-010', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.status, 'APPROVED');
+    assert.strictEqual(waitCalls, 1);
+    assert.strictEqual(s2Observed, true);
+    assert.strictEqual(adapter.startTurnCalls, 2);
+    console.log('PASS: WAIT-BOUND-010 (One-shot) — workerWaitTimeoutSecs 300 with READY_FOR_REVIEW reaches Gate D, S2, Turn B and completes APPROVED');
+  }
+
+  // WAIT-BOUND-012: No retry / no polling loop at coordinator
+  {
+    const testDir = createTempProjectDir();
+    const proj = createMockProject(testDir);
+    const adapter = createMockAdapter();
+    let dispatchCalls = 0;
+    let waitCalls = 0;
+    const res = await runOneShotCycle({
+      projectId: 'test-proj',
+      auditSubjectId: 'sub-01',
+      auditPrompt: textPrompt('p'),
+      reviewPrompt: textPrompt('r'),
+      registryPort: { getProject: async () => proj },
+      workspacePort: { getWorkspaceState: async () => createMockSnapshot(testDir) },
+      broker: {
+        getWorkerStatus: async () => ({ ok: true, worker_state: 'IDLE', active_dispatch_id: null, active_work_order_id: null }),
+        dispatchWorker: async () => {
+          dispatchCalls++;
+          return { ok: true, state: 'DISPATCH_ACCEPTED', dispatch_id: 'd-wb-012', work_order_id: 'wo-001', project_id: 'test-proj' };
+        },
+        waitWorker: async () => {
+          waitCalls++;
+          return { ok: true, state: 'RUNNING', dispatch_id: 'd-wb-012', work_order_id: 'wo-001' };
+        }
+      },
+      auditorFactory: async () => adapter
+    });
+    assert.strictEqual(waitCalls, 1);
+    assert.strictEqual(dispatchCalls, 1);
+    assert.strictEqual(adapter.startTurnCalls, 1);
+    assert.strictEqual(res.status, 'WORKER_PENDING');
+    console.log('PASS: WAIT-BOUND-012 — Exactly 1 dispatch, 1 wait, 0 Turn B, status WORKER_PENDING (no retry/polling loop)');
+  }
+
   // Footer dynamic count
   const testFileSrc = fs.readFileSync(__filename, 'utf8');
   const caseMatches = testFileSrc.match(/^\s*\/\/\s+(OSC[^\r\n:]*):/gm) || [];
   const totalCases = caseMatches.length;
   console.log('======================================================================');
   console.log(`ALL ONE-SHOT CYCLE TESTS PASSED (OSC ${totalCases}/${totalCases} PASS)`);
+  console.log('WAIT-BOUND (One-shot): 6/6 PASS');
   console.log('======================================================================');
 }
 

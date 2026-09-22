@@ -964,20 +964,20 @@ async function runAllTests() {
       completionSource: createMockCompletionSource([])
     });
 
-    // Request 50 seconds (exceeds max 30)
+    // Request 500 seconds (exceeds max 300)
     const res = await adapter.wait({
       project: createBaseProject(),
       project_id: 'ai-multi-task',
       dispatch_id: 'D-TIMEOUT',
       work_order_id: 'WO-1',
-      timeout_secs: 50
+      timeout_secs: 500
     });
 
     assert.strictEqual(res.ok, false);
     assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
-    // Verified clamped to 30 seconds
-    assert.ok(sleptTotal >= 30000 && sleptTotal <= 31000);
-    console.log('✓ WA-022 PASSED: timeout clamped to max 30s; missing boundary returns PROVENANCE_AMBIGUOUS.');
+    // Verified clamped to 300 seconds
+    assert.ok(sleptTotal >= 300000 && sleptTotal <= 301000);
+    console.log('✓ WA-022 PASSED: timeout clamped to max 300s; missing boundary returns PROVENANCE_AMBIGUOUS.');
   }
 
   // -----------------------------------------------------------------------
@@ -3737,12 +3737,194 @@ async function runAllTests() {
   }
 
   console.log('\n======================================================================');
+  console.log('RUNNING WAIT-BOUND TEST MATRIX (WORKER ADAPTER)');
+  console.log('======================================================================');
+
+  // WAIT-BOUND-004: Worker adapter exact 300
+  console.log('\n[WAIT-BOUND-004] Testing worker adapter exact 300s timeout accepted...');
+  {
+    let sleptTotal = 0;
+    const startTime = 1000;
+    const clock = createMockClock(startTime);
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-WB-004',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const events = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }
+    ];
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      pollIntervalMs: 1000,
+      sleep: async (ms) => {
+        sleptTotal += ms;
+        clock.advance(ms);
+      },
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-WB-004',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 300
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.RUNNING);
+    assert.strictEqual(sleptTotal, 300000);
+    assert.strictEqual(clock.monotonic(), startTime + 300000);
+    console.log('✓ WAIT-BOUND-004 PASSED: adapter accepted full 300s deadline; returned RUNNING at exactly 300000ms.');
+  }
+
+  // WAIT-BOUND-005: Worker adapter >300 clamp
+  console.log('\n[WAIT-BOUND-005] Testing worker adapter >300s clamped to 300s...');
+  {
+    let sleptTotal = 0;
+    const startTime = 1000;
+    const clock = createMockClock(startTime);
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-WB-005',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const events = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }
+    ];
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      pollIntervalMs: 1000,
+      sleep: async (ms) => {
+        sleptTotal += ms;
+        clock.advance(ms);
+      },
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-WB-005',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 500
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.RUNNING);
+    assert.strictEqual(sleptTotal, 300000);
+    assert.notStrictEqual(sleptTotal, 500000);
+    assert.strictEqual(clock.monotonic(), startTime + 300000);
+    console.log('✓ WAIT-BOUND-005 PASSED: adapter clamped 500s to 300000ms duration, returning RUNNING.');
+  }
+
+  // WAIT-BOUND-010 (Adapter part): Late-but-in-bound completion
+  console.log('\n[WAIT-BOUND-010] Testing late-but-in-bound completion (t=45s < 300s)...');
+  {
+    const startTime = 1000;
+    const clock = createMockClock(startTime);
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-WB-010',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const completion = '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-WB-010","state":"READY_FOR_REVIEW"}';
+    const boundaryRecord = { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env };
+    const completionRecord = { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: completion };
+
+    let sleptTotal = 0;
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      pollIntervalMs: 15000,
+      sleep: async (ms) => {
+        sleptTotal += ms;
+        clock.advance(ms);
+      },
+      completionSource: createMockCompletionSource(() => {
+        if (clock.monotonic() - startTime < 45000) {
+          return [boundaryRecord];
+        }
+        return [boundaryRecord, completionRecord];
+      })
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-WB-010',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 300
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    assert.strictEqual(res.dispatch_id, 'D-WB-010');
+    assert.strictEqual(res.work_order_id, 'WO-001');
+    assert.ok(clock.monotonic() - startTime >= 45000);
+    assert.ok(clock.monotonic() - startTime < 300000);
+    console.log('✓ WAIT-BOUND-010 (Adapter) PASSED: completion at t=45s resolved READY_FOR_REVIEW before 300s deadline.');
+  }
+
+  // WAIT-BOUND-011 (Adapter part): Default remains 10s
+  console.log('\n[WAIT-BOUND-011] Testing worker adapter default timeout remains 10s...');
+  {
+    assert.strictEqual(LIMITS.DEFAULT_TIMEOUT_SECS, 10);
+    let sleptTotal = 0;
+    const startTime = 1000;
+    const clock = createMockClock(startTime);
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-WB-011',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const events = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env }
+    ];
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      pollIntervalMs: 1000,
+      sleep: async (ms) => {
+        sleptTotal += ms;
+        clock.advance(ms);
+      },
+      completionSource: createMockCompletionSource(events)
+    });
+
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-WB-011',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws'
+    });
+
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.RUNNING);
+    assert.strictEqual(sleptTotal, 10000);
+    assert.strictEqual(clock.monotonic(), startTime + 10000);
+    console.log('✓ WAIT-BOUND-011 (Adapter) PASSED: omitted timeout defaults to 10s (10000ms).');
+  }
+
+  console.log('\n======================================================================');
   console.log('WORKER ADAPTER TEST SUMMARY');
   console.log('WA-001 .. WA-055: 55/55 PASS (WA 55/55)');
   console.log('ACK-001 .. ACK-012: 12/12 PASS (ACK 12/12)');
   console.log('ACK-INT-01: 1/1 PASS (ACK-INT 1/1)');
   console.log('TF-001 .. TF-019: 19/19 PASS (TF 19/19)');
-  console.log('WORKER ADAPTER TOTAL: 87/87 PASS (TOTAL 87/87)');
+  console.log('WAIT-BOUND (Adapter): 4/4 PASS');
+  console.log('WORKER ADAPTER TOTAL: 91/91 PASS (TOTAL 91/91)');
   console.log('======================================================================');
 }
 
