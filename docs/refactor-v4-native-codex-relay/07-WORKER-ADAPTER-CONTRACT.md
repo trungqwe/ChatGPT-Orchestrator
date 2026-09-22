@@ -1,4 +1,4 @@
-﻿# Worker Adapter Contract (WorkerPortV1)
+# Worker Adapter Contract (WorkerPortV1)
 
 ## 1. Architectural Scope & Purpose
 
@@ -221,11 +221,24 @@ These two methods are the **ONLY** required WorkerPortV1 methods.
 - `AO exit status 0 = transport-command acknowledgement only`.
 - Process exit 0 **MUST NOT** by itself authorize `DISPATCH_ACCEPTED`.
 - Authoritative delivery acknowledgement requires positive observation of the exact dispatch boundary in the Registry-resolved authoritative transcript.
-- Exact boundary requires:
-  - `record.source === "USER_EXPLICIT"`
-  - `record.type === "USER_INPUT"`
-  - Physical line 0: `[ORCHESTRATOR_DISPATCH_V1]`
-  - Physical line 1: JSON binding `worker_dispatch` schema v1 to current `project_id`, `work_order_id`, `dispatch_id`, and `expected_workspace_state_id`.
+- Exact boundary requires `record.source === "USER_EXPLICIT"` and `record.type === "USER_INPUT"` matching either of two sealed grammatical shapes:
+  1. **Canonical Unwrapped Grammar**:
+     - Physical line 0: `[ORCHESTRATOR_DISPATCH_V1]`
+     - Physical line 1: JSON binding `worker_dispatch` schema v1 to current `project_id`, `work_order_id`, `dispatch_id`, and `expected_workspace_state_id`.
+  2. **Sealed Antigravity Provider-Wrapped Grammar (WO-V4-09C-TF-D1-R1 / TF-I1)**:
+     - Physical line 0: strictly `<USER_REQUEST>`
+     - Physical line 1: strictly `[ORCHESTRATOR_DISPATCH_V1]`
+     - Physical line 2: JSON binding `worker_dispatch` schema v1 to current `project_id`, `work_order_id`, `dispatch_id`, and `expected_workspace_state_id`.
+     - Exact complete-record count invariant:
+       - physical lines equal to `<USER_REQUEST>` === 1 (unique index 0)
+       - physical lines equal to `</USER_REQUEST>` === 1 (unique index K >= 3)
+     - Lines after index K are opaque, provider-owned suffix data carrying zero dispatch-boundary authority.
+- **WA-047 Anti-Relaxation Invariants**:
+  - Zero leading whitespace, blank lines, or arbitrary prose prefixes permitted.
+  - Zero arbitrary regex searches, `trimStart()`, `indexOf()`, or fuzzy matching.
+  - Suffix content cannot establish, repair, or contradict dispatch identity.
+- **Dispatch/Wait Parser Parity**:
+  - `dispatchWorker()` acknowledgement and `waitWorker()` provenance rediscovery execute the exact same internal boundary classifier (`classifyDispatchBoundaryRecord`). No separate or divergent parsing logic exists.
 
 ### 9.2 Dispatch Sequence with Bounded Delivery Acknowledgement
 ```text

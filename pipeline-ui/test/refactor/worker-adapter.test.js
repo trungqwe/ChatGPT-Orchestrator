@@ -3069,12 +3069,680 @@ async function runAllTests() {
     console.log('✓ ACK-INT-01 PASSED: broker dispatchWorker transitions to DISPATCH_UNCERTAIN with 1 send and 0 retries.');
   }
 
+  // =======================================================================
+  // TRANSPORT FRAMING COMPATIBILITY DETERMINISTIC MATRIX (TF-001 .. TF-019)
+  // =======================================================================
+  console.log('\n======================================================================');
+  console.log('RUNNING TRANSPORT FRAMING COMPATIBILITY SUITE (TF-001 .. TF-019)');
+  console.log('======================================================================');
+
+  // -----------------------------------------------------------------------
+  // TF-001: Canonical unwrapped exact boundary remains accepted
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-001] Testing unwrapped exact boundary remains accepted...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const completion = '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}';
+    const events = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env },
+      { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: completion }
+    ];
+    const adapter = createAntigravityWorkerPort({
+      completionSource: createMockCompletionSource(events)
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    console.log('✓ TF-001 PASSED: unwrapped exact boundary remains accepted.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-002: Exact provider-wrapped boundary with unique close + suffix
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-002] Testing exact provider-wrapped boundary with suffix accepted...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const wrapped = `<USER_REQUEST>\n${env}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntimestamp: 2026-09-22\n</ADDITIONAL_METADATA>`;
+    const completion = '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}';
+    const events = [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrapped },
+      { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: completion }
+    ];
+    const adapter = createAntigravityWorkerPort({
+      completionSource: createMockCompletionSource(events)
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    console.log('✓ TF-002 PASSED: provider-wrapped boundary with unique close and suffix accepted.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-003: Provider-wrapped exact current contradiction rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-003] Testing provider-wrapped current contradiction rejected...');
+  {
+    const contradictoryEnv = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-CONTRADICTION',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const wrapped = `<USER_REQUEST>\n${contradictoryEnv}\n</USER_REQUEST>`;
+    const adapter = createAntigravityWorkerPort({
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrapped }
+      ]),
+      spawnSync: () => ({ status: 0, stdout: '', stderr: '' })
+    });
+    const res = await adapter.dispatch({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.ok(res.error.includes('Contradictory current-dispatch control identity'));
+    console.log('✓ TF-003 PASSED: wrapped current contradiction fails non-definitive.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-004: Arbitrary prose prefix remains rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-004] Testing arbitrary prose prefix remains rejected...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'Arbitrary prose prefix\n' + env }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ TF-004 PASSED: arbitrary prose prefix rejected as candidate.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-005: Leading whitespace remains rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-005] Testing leading whitespace remains rejected...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const leadingSpace = ` <USER_REQUEST>\n${env}\n</USER_REQUEST>`;
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: leadingSpace }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ TF-005 PASSED: leading whitespace before <USER_REQUEST> rejected.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-006: Unknown wrapper tag remains rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-006] Testing unknown wrapper tag remains rejected...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const unknownTag = `<UNKNOWN_WRAPPER>\n${env}\n</UNKNOWN_WRAPPER>`;
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: unknownTag }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ TF-006 PASSED: unknown wrapper tag rejected.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-007: Malformed provider wrapper remains rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-007] Testing malformed wrapper remains rejected...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const missingClose = `<USER_REQUEST>\n${env}`;
+    const extraOpening = `<USER_REQUEST> extra\n${env}\n</USER_REQUEST>`;
+
+    for (const malformed of [missingClose, extraOpening]) {
+      const adapter = createAntigravityWorkerPort({
+        clock,
+        sleep: async (ms) => clock.advance(ms),
+        completionSource: createMockCompletionSource([
+          { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: malformed }
+        ])
+      });
+      const res = await adapter.wait({
+        project: createBaseProject(),
+        project_id: 'ai-multi-task',
+        dispatch_id: 'D-ACT-1',
+        work_order_id: 'WO-001',
+        timeout_secs: 1
+      });
+      assert.strictEqual(res.ok, false);
+      assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    }
+    console.log('✓ TF-007 PASSED: missing close or extra text on opening tag rejected.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-008: Duplicate wrapped exact boundaries rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-008] Testing duplicate wrapped exact boundaries rejected...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const wrapped = `<USER_REQUEST>\n${env}\n</USER_REQUEST>`;
+    const adapter = createAntigravityWorkerPort({
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrapped },
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrapped }
+      ]),
+      spawnSync: () => ({ status: 0, stdout: '', stderr: '' })
+    });
+    const res = await adapter.dispatch({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.strictEqual(res.error, 'Duplicate current dispatch boundary records observed');
+    console.log('✓ TF-008 PASSED: duplicate wrapped boundaries rejected.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-009: One wrapped + one unwrapped exact boundary rejected as duplicate
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-009] Testing wrapped + unwrapped duplicate boundaries rejected...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const wrapped = `<USER_REQUEST>\n${env}\n</USER_REQUEST>`;
+    const adapter = createAntigravityWorkerPort({
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: env },
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrapped }
+      ]),
+      spawnSync: () => ({ status: 0, stdout: '', stderr: '' })
+    });
+    const res = await adapter.dispatch({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.strictEqual(res.error, 'Duplicate current dispatch boundary records observed');
+    console.log('✓ TF-009 PASSED: wrapped + unwrapped duplicates rejected with zero precedence.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-010: Foreign dispatch inside valid wrapper remains foreign
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-010] Testing foreign dispatch inside valid wrapper remains foreign...');
+  {
+    const clock = createMockClock();
+    const foreignEnv = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-FOREIGN-999',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const foreignWrapped = `<USER_REQUEST>\n${foreignEnv}\n</USER_REQUEST>`;
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      dispatchAckTimeoutMs: 1000,
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: foreignWrapped }
+      ]),
+      spawnSync: () => ({ status: 0, stdout: '', stderr: '' })
+    });
+    const res = await adapter.dispatch({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.definitive, false);
+    assert.ok(res.error.includes('not observed within acknowledgement deadline'));
+    console.log('✓ TF-010 PASSED: foreign wrapped boundary is treated as foreign history, not current boundary.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-011: Dispatch ACK observes valid wrapped boundary and performs 1 send
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-011] Testing dispatch ACK observes valid wrapped boundary and performs 1 send...');
+  {
+    let spawnCalls = 0;
+    const transcript = [];
+    const adapter = createAntigravityWorkerPort({
+      spawnSync: (bin, args) => {
+        spawnCalls++;
+        const msgIdx = args.indexOf('--message');
+        if (msgIdx !== -1) {
+          const sentContent = args[msgIdx + 1];
+          transcript.push({
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            content: `<USER_REQUEST>\n${sentContent}\n</USER_REQUEST>`
+          });
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource(transcript)
+    });
+    const res = await adapter.dispatch(createDispatchArgs());
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    assert.strictEqual(spawnCalls, 1);
+    console.log('✓ TF-011 PASSED: dispatch ACK accepts wrapped boundary with exactly 1 send.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-012: Wait rediscovery accepts the same valid wrapped boundary
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-012] Testing wait rediscovery accepts valid wrapped boundary and parses completion...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const wrapped = `<USER_REQUEST>\n${env}\n</USER_REQUEST>`;
+    const completion = '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}';
+    const adapter = createAntigravityWorkerPort({
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrapped },
+        { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: completion }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    assert.strictEqual(res.dispatch_id, 'D-ACT-1');
+    assert.strictEqual(res.work_order_id, 'WO-001');
+    console.log('✓ TF-012 PASSED: wait rediscovery accepts wrapped boundary and parses completion.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-013: Wait missing/malformed wrapper boundary yields PROVENANCE_AMBIGUOUS
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-013] Testing wait missing/malformed wrapper boundary yields PROVENANCE_AMBIGUOUS...');
+  {
+    const clock = createMockClock();
+    const earlyClose = '<USER_REQUEST>\n[ORCHESTRATOR_DISPATCH_V1]\n</USER_REQUEST>\n{"type":"worker_dispatch"}';
+    const completion = '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}';
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: earlyClose },
+        { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: completion }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ TF-013 PASSED: early closing tag / malformed wrapper boundary yields PROVENANCE_AMBIGUOUS.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-014: Completion classifier semantics remain unchanged
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-014] Testing completion classifier semantics remain unchanged...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const wrapped = `<USER_REQUEST>\n${env}\n</USER_REQUEST>`;
+    const fencedCompletion = '```\n[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}\n```';
+    const quotedCompletion = '> [ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}';
+    const realCompletion = '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}';
+
+    const clock = createMockClock();
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrapped },
+        { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: fencedCompletion },
+        { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: quotedCompletion },
+        { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: realCompletion }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    console.log('✓ TF-014 PASSED: completion parser ignores fenced and blockquoted records as before.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-015: P3 structural fixture
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-015] Testing P3 structural fixture without real directive prose...');
+  {
+    const p3Json = JSON.stringify({
+      type: 'worker_dispatch',
+      schema_version: 1,
+      project_id: 'chatgpt-orchestrator',
+      work_order_id: 'wp-v4-09c-readonly-worker-acceptance-003',
+      dispatch_id: 'D-a08ac318-2e3b-4f3a-9c8f-07e89e58da7a',
+      expected_workspace_state_id: 'sha256:e33ec2040e46b4e0faa18b78b7ee3783c86cf12774f64e7c3505aeecd90a21fb'
+    });
+    const p3Lines = [
+      '<USER_REQUEST>',
+      '[ORCHESTRATOR_DISPATCH_V1]',
+      p3Json,
+      '',
+      '[DIRECTIVE_BEGIN]',
+      'Synthetic read-only acceptance directive.',
+      '[DIRECTIVE_END]',
+      '',
+      '[REQUIRED_COMPLETION]',
+      'Output machine completion.',
+      '</USER_REQUEST>',
+      '<ADDITIONAL_METADATA>',
+      'The current local time is: 2026-09-22T04:16:12+07:00.',
+      '</ADDITIONAL_METADATA>'
+    ];
+    const p3RecordContent = p3Lines.join('\n');
+    let spawnCalls = 0;
+    const adapter = createAntigravityWorkerPort({
+      spawnSync: () => {
+        spawnCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: p3RecordContent }
+      ])
+    });
+    const res = await adapter.dispatch({
+      project: createBaseProject({ project_id: 'chatgpt-orchestrator' }),
+      project_id: 'chatgpt-orchestrator',
+      work_order_id: 'wp-v4-09c-readonly-worker-acceptance-003',
+      dispatch_id: 'D-a08ac318-2e3b-4f3a-9c8f-07e89e58da7a',
+      expected_workspace_state_id: 'sha256:e33ec2040e46b4e0faa18b78b7ee3783c86cf12774f64e7c3505aeecd90a21fb',
+      directive: 'Synthetic test directive.'
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.DISPATCH_ACCEPTED);
+    assert.strictEqual(spawnCalls, 1);
+    console.log('✓ TF-015 PASSED: P3 structural fixture accepted -> DISPATCH_ACCEPTED with 1 send.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-016: Second <USER_REQUEST> physical line rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-016] Testing second <USER_REQUEST> physical line rejected...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const doubleOpen = `<USER_REQUEST>\n${env}\n<USER_REQUEST>\n</USER_REQUEST>`;
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: doubleOpen }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ TF-016 PASSED: second <USER_REQUEST> physical line rejected by 1/1 count check.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-017: Second </USER_REQUEST> physical line rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-017] Testing second </USER_REQUEST> physical line rejected...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const doubleClose = `<USER_REQUEST>\n${env}\n</USER_REQUEST>\n</USER_REQUEST>`;
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: doubleClose }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ TF-017 PASSED: second </USER_REQUEST> physical line rejected by 1/1 count check.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-018: Valid wrapped boundary + opaque post-close provider metadata
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-018] Testing valid wrapped boundary + opaque post-close provider metadata accepted...');
+  {
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const wrappedWithMultipleSuffixes = `<USER_REQUEST>\n${env}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime: 123\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nmodel changed\n</USER_SETTINGS_CHANGE>`;
+    const completion = '[ORCHESTRATOR_COMPLETION_V1] {"type":"worker_completion","schema_version":1,"project_id":"ai-multi-task","work_order_id":"WO-001","dispatch_id":"D-ACT-1","state":"READY_FOR_REVIEW"}';
+    const adapter = createAntigravityWorkerPort({
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: wrappedWithMultipleSuffixes },
+        { source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: completion }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      expected_workspace_state_id: 'sha256:ws',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.state, DISPATCH_STATES.READY_FOR_REVIEW);
+    console.log('✓ TF-018 PASSED: opaque post-close provider metadata blocks safely accepted.');
+  }
+
+  // -----------------------------------------------------------------------
+  // TF-019: Marker/control only after close rejected
+  // -----------------------------------------------------------------------
+  console.log('\n[TF-019] Testing marker/control only in post-close suffix rejected...');
+  {
+    const clock = createMockClock();
+    const env = formatDispatchEnvelope({
+      project_id: 'ai-multi-task',
+      work_order_id: 'WO-001',
+      dispatch_id: 'D-ACT-1',
+      expected_workspace_state_id: 'sha256:ws',
+      directive: 'Work.'
+    });
+    const markerInSuffix = `<USER_REQUEST>\nplain prompt text\nmore text\n</USER_REQUEST>\n${env}`;
+    const adapter = createAntigravityWorkerPort({
+      clock,
+      sleep: async (ms) => clock.advance(ms),
+      completionSource: createMockCompletionSource([
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: markerInSuffix }
+      ])
+    });
+    const res = await adapter.wait({
+      project: createBaseProject(),
+      project_id: 'ai-multi-task',
+      dispatch_id: 'D-ACT-1',
+      work_order_id: 'WO-001',
+      timeout_secs: 1
+    });
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.code, ERROR_CODES.PROVENANCE_AMBIGUOUS);
+    console.log('✓ TF-019 PASSED: marker and control JSON in suffix carry zero authority (rejected).');
+  }
+
   console.log('\n======================================================================');
   console.log('WORKER ADAPTER TEST SUMMARY');
   console.log('WA-001 .. WA-055: 55/55 PASS (WA 55/55)');
   console.log('ACK-001 .. ACK-012: 12/12 PASS (ACK 12/12)');
   console.log('ACK-INT-01: 1/1 PASS (ACK-INT 1/1)');
-  console.log('WORKER ADAPTER TOTAL: 68/68 PASS (TOTAL 68/68)');
+  console.log('TF-001 .. TF-019: 19/19 PASS (TF 19/19)');
+  console.log('WORKER ADAPTER TOTAL: 87/87 PASS (TOTAL 87/87)');
   console.log('======================================================================');
 }
 

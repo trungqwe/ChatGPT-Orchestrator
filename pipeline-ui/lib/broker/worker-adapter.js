@@ -11,16 +11,26 @@ const MAX_DISPATCH_ACK_TIMEOUT_MS = 30000;
 /**
  * Classify a transcript record against expected current dispatch identity.
  *
- * Rules (WO-V4-09C-D1 / D2):
+ * Rules (WO-V4-09C-D1 / D2 / TF-D1-R1):
  * - Must have BOTH source === 'USER_EXPLICIT' and type === 'USER_INPUT'
- * - Line 0 must be exactly '[ORCHESTRATOR_DISPATCH_V1]' (no trimStart)
- * - Line 1 must parse as a JSON object
- * - If line 1 claims current dispatch_id:
+ * - Two valid envelope shapes:
+ *   1. Canonical unwrapped:
+ *      - rawLines[0] === '[ORCHESTRATOR_DISPATCH_V1]'
+ *      - control JSON at rawLines[1]
+ *   2. Sealed Antigravity provider-wrapped:
+ *      - rawLines[0] === '<USER_REQUEST>'
+ *      - rawLines[1] === '[ORCHESTRATOR_DISPATCH_V1]'
+ *      - control JSON at rawLines[2]
+ *      - exact complete-record '<USER_REQUEST>' line count === 1
+ *      - exact complete-record '</USER_REQUEST>' line count === 1
+ *      - unique closing '</USER_REQUEST>' index K >= 3
+ *      - lines after index K are non-authoritative opaque provider suffix
+ * - If control JSON claims current dispatch_id:
  *   must match type === 'worker_dispatch', schema_version === 1,
  *   exact project_id, exact work_order_id, exact expected_workspace_state_id (if specified)
  *   Any contradiction => isContradiction: true
  *   All match => isExact: true
- * - If line 1 claims another dispatch_id => isForeign: true (unrelated history)
+ * - If control JSON claims another dispatch_id => isForeign: true (unrelated history)
  */
 function classifyDispatchBoundaryRecord(record, expected) {
   if (!record || typeof record !== 'object') {
@@ -34,13 +44,39 @@ function classifyDispatchBoundaryRecord(record, expected) {
   }
 
   const rawLines = record.content.split(/\r?\n/);
-  if (rawLines[0] !== '[ORCHESTRATOR_DISPATCH_V1]' || !rawLines[1]) {
+  let jsonLine;
+
+  if (rawLines[0] === '[ORCHESTRATOR_DISPATCH_V1]') {
+    if (!rawLines[1]) {
+      return { isCandidate: false };
+    }
+    jsonLine = rawLines[1];
+  } else if (rawLines[0] === '<USER_REQUEST>') {
+    if (rawLines[1] !== '[ORCHESTRATOR_DISPATCH_V1]' || !rawLines[2]) {
+      return { isCandidate: false };
+    }
+    let openCount = 0;
+    let closeCount = 0;
+    let closeIndex = -1;
+    for (let i = 0; i < rawLines.length; i++) {
+      if (rawLines[i] === '<USER_REQUEST>') {
+        openCount++;
+      } else if (rawLines[i] === '</USER_REQUEST>') {
+        closeCount++;
+        closeIndex = i;
+      }
+    }
+    if (openCount !== 1 || closeCount !== 1 || closeIndex < 3) {
+      return { isCandidate: false };
+    }
+    jsonLine = rawLines[2];
+  } else {
     return { isCandidate: false };
   }
 
   let dObj;
   try {
-    dObj = JSON.parse(rawLines[1]);
+    dObj = JSON.parse(jsonLine);
   } catch (_) {
     return { isCandidate: false };
   }
