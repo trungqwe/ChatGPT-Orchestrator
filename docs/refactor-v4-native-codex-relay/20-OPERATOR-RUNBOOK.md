@@ -66,3 +66,59 @@ Ngay sau khi `beginBootstrap()` ghi nhận thẩm quyền (`authority_version = 
   3. Registry `auditor.cwd` fresh khớp canonical identity.
   4. Registry `auditor.model_policy` fresh khớp policy đã lưu.
 - Nếu có bất kỳ sai lệch nào (drift, read failure, auditor bound/enabled): fail-closed ngay lập tức, đóng client provisional, giữ nguyên trạng thái `PROVISIONAL_THREAD` trong SQLite recovery store, và tiêu thụ chính xác **0 lượt model turn**.
+
+---
+
+## 5. Quy trình Chuyển đổi và Xác thực Tài khoản Antigravity Worker (`agy` CLI)
+
+### 1. Phân tách miền xác thực (Authentication Domain Separation)
+- **Antigravity IDE UI**: Lưu trữ thông tin phiên người dùng trong storage nội bộ của Electron/IDE. Việc đăng nhập tài khoản mới trên giao diện IDE **không** tự động cập nhật hoặc làm mới chứng chỉ OAuth của CLI.
+- **Antigravity CLI (`agy`)**: Là binary thực tế mà Agent Orchestrator (AO) kích hoạt trong worker session. CLI lưu trữ OAuth token độc lập trong **Windows Credential Manager** dưới mục định danh:
+  ```text
+  Target: LegacyGeneric:target=gemini:antigravity
+  User: antigravity
+  ```
+- **Hệ quả vận hành**: Nếu chỉ đăng nhập lại trên IDE UI mà không tái xác thực CLI, toàn bộ các worker session do AO spawn vẫn sẽ tải chứng chỉ cũ từ Windows Credential Manager và lập tức gặp lỗi `429: Individual quota reached` nếu tài khoản cũ đã cạn kiệt quota.
+
+### 2. Quy trình kiểm tra danh tính và hạn mức pháp y
+1. **Kiểm tra danh tính thực tế của CLI**:
+   Đọc blob chứng chỉ từ Windows Credential Manager mục `gemini:antigravity`, bóc tách trường `id_token` và giải mã phần JWT payload (base64url) để lấy trường `email`:
+   ```powershell
+   # Giải mã JWT email từ target gemini:antigravity
+   $raw = [WinCred]::ReadCred('gemini:antigravity') | ConvertFrom-Json
+   $parts = $raw.id_token.Split('.')
+   $payload = $parts[1]
+   while ($payload.Length % 4 -ne 0) { $payload += "=" }
+   $bytes = [Convert]::FromBase64String($payload.Replace('-', '+').Replace('_', '/'))
+   $jwt = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+   Write-Output "JWT EMAIL: $($jwt.email)"
+   ```
+2. **Kiểm tra hạn mức khả dụng trực tiếp từ CLI**:
+   Sử dụng print mode để lấy thông tin quota thời gian thực:
+   ```cmd
+   agy -p "/quota"
+   ```
+   Kết quả trả về bảng chi tiết:
+   - `Gemini Models` - Weekly Limit Remaining
+   - `Gemini Models` - Five Hour Limit Remaining
+   - `Claude and GPT models` - Weekly Limit Remaining
+
+### 3. Quy trình tái xác thực tài khoản CLI (Re-authentication)
+Khi cần chuyển giao tài khoản worker sang tài khoản provider mới:
+1. Mở terminal độc lập (PowerShell hoặc CMD).
+2. Khởi chạy TUI của Antigravity CLI:
+   ```cmd
+   agy
+   ```
+3. Đăng xuất phiên hiện tại để giải phóng chứng chỉ cũ khỏi Windows Credential Manager:
+   ```text
+   /logout
+   ```
+4. Kích hoạt luồng xác thực OAuth mới:
+   ```text
+   /login
+   ```
+5. Trình duyệt mở ra trang đăng nhập Google OAuth. Chọn đúng tài khoản provider mong muốn và cấp quyền truy cập.
+6. Sau khi terminal xác nhận đăng nhập thành công, thoát CLI bằng `/exit` hoặc tổ hợp phím `Ctrl+D`.
+7. Chạy lại `agy -p "/quota"` để kiểm chứng hạn mức mới đã sẵn sàng trước khi thực hiện bất kỳ lệnh spawn hay relay nào.
+
