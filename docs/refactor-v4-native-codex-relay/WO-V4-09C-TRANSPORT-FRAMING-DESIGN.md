@@ -1,6 +1,6 @@
 # WO-V4-09C-TRANSPORT-FRAMING-DESIGN
 
-## Antigravity Transcript Framing Compatibility — Design Seal
+## Antigravity Transcript Framing Compatibility — Design Seal (Revision 1)
 
 **Authority:**
 - Gate 1 / U1: `APPROVED_CLOSED`
@@ -10,9 +10,9 @@
 - WO-V4-09C-P3: `EXECUTED_NOT_FULL_PASS`
 - WO-V4-09C-P3-F1-R1: `APPROVED_CLOSED`
 - WO-V4-09C-P3-RC: `APPROVED_CLOSED`
-- P3 retry: `FORBIDDEN`
-- Work Order: `WO-V4-09C-TF-D1`
-- Parent Commit: `046542aaff0be813eb6255282da000667022531d`
+- WO-V4-09C-TF-D1: `CHANGES_REQUIRED`
+- Work Order: `WO-V4-09C-TF-D1-R1`
+- Parent Commit: `5571c367c6e2105a7afeda68cd93f34783b0a2b4`
 - Status: `DESIGN_COMPLETE / PENDING_EXTERNAL_REVIEW`
 
 ---
@@ -51,7 +51,7 @@ if (rawLines[0] !== '[ORCHESTRATOR_DISPATCH_V1]' || !rawLines[1]) {
   return { isCandidate: false };
 }
 ```
-Because the native provider protocol automatically framed the user request within `<USER_REQUEST>`, `rawLines[0]` contained `"<USER_REQUEST>"` rather than `"[ORCHESTRATOR_DISPATCH_V1]"`. Consequently, the classifier returned `{ isCandidate: false }` across all polling intervals for 30 seconds until the acknowledgement deadline expired. This caused `dispatchWorker()` to transition the dispatch to `DISPATCH_UNCERTAIN` despite synchronous disk persistence of the exact dispatch payload at 21:16:04Z.
+Because the native provider protocol framed the user request within `<USER_REQUEST>`, `rawLines[0]` contained `"<USER_REQUEST>"` rather than `"[ORCHESTRATOR_DISPATCH_V1]"`. Consequently, the classifier returned `{ isCandidate: false }` across all polling intervals for 30 seconds until the acknowledgement deadline expired. This caused `dispatchWorker()` to transition the dispatch to `DISPATCH_UNCERTAIN` despite synchronous disk persistence of the exact dispatch payload at 21:16:04Z.
 
 ---
 
@@ -86,11 +86,15 @@ A read-only survey of all `source === 'USER_EXPLICIT' && type === 'USER_INPUT'` 
 | 0 | 9 | `"<USER_REQUEST>"` | Line 2: `"</USER_REQUEST>"` | 1 | 1 | `<ADDITIONAL_METADATA>`, `<USER_SETTINGS_CHANGE>` |
 | 64 | 19 | `"<USER_REQUEST>"` | Line 15: `"</USER_REQUEST>"` | 1 | 1 | `<ADDITIONAL_METADATA>` |
 
-### Survey Findings
-1. **Systematic Framing:** Native Antigravity / AO CLI systematically wraps the prompt body delivered by `ao.exe send` in `<USER_REQUEST>\n...\n</USER_REQUEST>`.
-2. **Deterministic Offset:** The actual user-submitted content unconditionally begins on physical line 1.
-3. **Trailing Metadata:** The provider engine may append optional metadata blocks (`<ADDITIONAL_METADATA>`, `<USER_SETTINGS_CHANGE>`) after the closing `</USER_REQUEST>` tag.
-4. **No Leading Whitespace:** Neither the opening tag nor the marker contains leading spaces or tabs.
+### Survey Findings & Claim Scope
+Across every eligible `USER_EXPLICIT` / `USER_INPUT` record observed in this authoritative session transcript, the native provider used `<USER_REQUEST>` framing.
+
+This evidence establishes the runtime shape required for compatibility with this observed production path; it does not claim every future Antigravity version or transport implementation must use the same framing.
+
+Key structural observations from this session:
+1. The user-submitted content in both observed records begins on physical line 1 immediately following line 0 `<USER_REQUEST>`.
+2. Both records contain provider-appended metadata blocks (`<ADDITIONAL_METADATA>`, `<USER_SETTINGS_CHANGE>`) after the closing `</USER_REQUEST>` tag.
+3. In both records, neither the opening tag nor the marker contains leading whitespace.
 
 ---
 
@@ -109,7 +113,7 @@ Three remediation locations were evaluated:
 - **Mechanism:** Keep `antigravity-completion-source.js` purely raw and unmutated. Extend `classifyDispatchBoundaryRecord()` in `worker-adapter.js` to recognize both canonical unwrapped and exact provider-wrapped forms.
 - **Authority Ownership:** Correct. `worker-adapter.js` is the authoritative owner of the dispatch envelope protocol and boundary semantics.
 - **Raw Transcript Preservation:** 100% preserved. The transcript reader delivers raw records untouched.
-- **Security & Provenance Risk:** Zero. Only narrowly defined, fail-closed grammars are permitted; arbitrary prefixes remain strictly rejected (`WA-047`).
+- **Security & Provenance Risk:** Bounded by the exact dual-envelope grammar and fail-closed wrapper-count requirements.
 - **Dispatch ACK & Wait Parity:** Natural and complete. Both ACK and `wait()` share `classifyDispatchBoundaryRecord()`, ensuring identical parsing.
 - **Test Surface:** Focused on unit and adapter contract tests.
 
@@ -158,20 +162,76 @@ rawLines[1] === '[ORCHESTRATOR_DISPATCH_V1]'
 rawLines[2] === <valid JSON control object>
 ...
 rawLines[K] === '</USER_REQUEST>'   (where K >= 3)
+[optional post-close provider suffix lines]
 ```
-**Strict Structural Requirements:**
+
+**Sealed Structural Requirements:**
 1. `rawLines[0]` must strictly equal `'<USER_REQUEST>'` (case-sensitive, no leading/trailing whitespace).
 2. `rawLines[1]` must strictly equal `'[ORCHESTRATOR_DISPATCH_V1]'` (no leading/trailing whitespace).
 3. `rawLines[2]` must parse as a valid JSON object.
-4. There must be exactly one line `rawLines[K]` that strictly equals `'</USER_REQUEST>'`, where `K >= 3`.
-5. If `rawLines[0] === '<USER_REQUEST>'` but no closing `'</USER_REQUEST>'` line exists in `rawLines`, the record is structurally malformed and rejected (`isCandidate: false`).
-6. If any line before line 1 contains prose or whitespace, the record is rejected.
+4. **Exact Open/Close Line Counts:**
+   - Over the complete record (`rawLines`), the count of physical lines strictly equal to `'<USER_REQUEST>'` must equal exactly `1`.
+   - Over the complete record (`rawLines`), the count of physical lines strictly equal to `'</USER_REQUEST>'` must equal exactly `1`.
+5. **Exact Wrapper Positions:**
+   - The unique opening line must be at physical index `0`.
+   - The unique closing line `rawLines[K]` must have index `K >= 3`.
+6. **Closing Wrapper Position relative to EOF:**
+   - Real runtime evidence establishes that `</USER_REQUEST>` is not required to be at EOF; optional provider suffix lines may follow `K`.
+7. **Strict Rejection:**
+   All of the following structural anomalies fail closed (`isCandidate: false`):
+   - Nested opening wrapper (`<USER_REQUEST>` appearing more than once).
+   - Second opening wrapper anywhere in the record (including in suffix).
+   - Duplicate closing wrapper (`</USER_REQUEST>` appearing more than once).
+   - Missing closing wrapper (`</USER_REQUEST>` count === 0).
+   - Opening wrapper at any index other than `0`.
+   - Closing wrapper appearing before control JSON (index `K < 3`).
+   - Marker or control JSON appearing only after the closing wrapper.
 
 ---
 
-## 7. Anti-Relaxation Guarantees (WA-047 Preservation)
+## 7. Suffix Authority and Treatment
 
-The existing `WA-047` invariant ("fail-closed dispatch boundary candidate check rejects non-dispatch records") remains intact. Under no circumstances will the implementation use:
+Real P3 evidence proves that `</USER_REQUEST>` is followed by provider-appended blocks (e.g., `<ADDITIONAL_METADATA>...</ADDITIONAL_METADATA>`).
+
+### Sealed Distinction:
+- **`USER_REQUEST` framing block (lines 0 through K):**
+  - **Authority-bearing.** Contains the dispatch boundary marker, control JSON, and directive payload.
+- **Post-`</USER_REQUEST>` suffix (lines K+1 to EOF):**
+  - **Non-authoritative for dispatch-boundary identity.**
+
+### Suffix Treatment: Opaque Provider-Owned Suffix (Option A Sealed)
+The suffix is treated as **opaque provider-owned non-authoritative data**.
+- **Rationale:** Production transcripts already exhibit multiple suffix elements (`<ADDITIONAL_METADATA>`, `<USER_SETTINGS_CHANGE>`). Enumerating an exhaustive grammar of permissible provider metadata blocks would create unnecessary fragility against benign provider runtime updates. Dispatch boundary classification has zero need for suffix semantics.
+- **Inviolable Invariant:** Even under opaque suffix handling, the complete-record count invariant (`<USER_REQUEST>` count === 1 and `</USER_REQUEST>` count === 1) strictly applies across the entire array of `rawLines`. Therefore, opaque suffix content cannot smuggle an additional opening or closing wrapper tag.
+- **No Authority Smuggling:** Content after the unique `</USER_REQUEST>` line must never:
+  - Establish a dispatch boundary.
+  - Repair an otherwise malformed boundary.
+  - Override dispatch JSON.
+  - Create contradiction authority.
+  - Create foreign-dispatch authority.
+
+---
+
+## 8. Directive-Content Fail-Closed Semantics
+
+If the user's directive content itself produces a physical line strictly equal to:
+```text
+<USER_REQUEST>
+```
+or:
+```text
+</USER_REQUEST>
+```
+such that the complete-record count of either token exceeds 1, the provider-wrapped record **fails closed** (`isCandidate: false`).
+
+- **Intentional Design Decision:** This is completely intentional. The classifier will NOT attempt nested parsing, heuristic XML tag pairing, or fuzzy guesses as to which tag "belongs" to the provider versus the directive text.
+- **Security Guarantee:** Ambiguous wrapper structure immediately yields a non-authoritative candidate. It will not be recognized as a valid boundary. Dispatch acknowledgement will time out into `DISPATCH_UNCERTAIN` rather than misinterpreting corrupted boundaries. No resend will occur.
+
+---
+
+## 9. Anti-Relaxation Guarantees (WA-047 Preservation)
+
+The existing `WA-047` invariant ("fail-closed dispatch boundary candidate check rejects non-dispatch records") remains strictly preserved. Under no circumstances will the implementation use:
 - `trimStart()` or `trim()` on lines to overlook whitespace.
 - Forward searches (`indexOf('[ORCHESTRATOR_DISPATCH_V1]')`, `search()`, regex scanning across lines).
 - Arbitrary prefix skipping or blank-line tolerance.
@@ -185,13 +245,15 @@ All of the following MUST evaluate to `{ isCandidate: false }`:
 - `"prefix\n<USER_REQUEST>\n..."` (prose preceding wrapper).
 - `"<UNKNOWN>\n[ORCHESTRATOR_DISPATCH_V1]\n..."` (unrecognized wrapper tag).
 - `"<USER_REQUEST> extra text\n[ORCHESTRATOR_DISPATCH_V1]\n..."` (non-exact opening tag).
-- `"<USER_REQUEST>\n<USER_REQUEST>\n..."` (nested wrappers).
+- `"<USER_REQUEST>\n<USER_REQUEST>\n..."` (nested/duplicate opening wrappers).
 - `"<USER_REQUEST>\n[ORCHESTRATOR_DISPATCH_V1]\n{...}"` with no closing `</USER_REQUEST>`.
+- Multiple `</USER_REQUEST>` lines anywhere in the record.
 - Marker appearing at physical line 2 or later when line 0 is not `<USER_REQUEST>`.
+- Marker and control JSON located entirely in the post-close suffix.
 
 ---
 
-## 8. Contradiction Semantics Inside Valid Framing
+## 10. Contradiction Semantics Inside Valid Framing
 
 If a record satisfies either the unwrapped or the wrapped framing grammar and its parsed control object claims the current `dispatch_id` (`dObj.dispatch_id === expected.dispatch_id`), it is subjected to exact identity verification:
 ```javascript
@@ -212,7 +274,7 @@ if (expected.expected_workspace_state_id !== undefined &&
 
 ---
 
-## 9. Duplicate Current-Boundary Semantics
+## 11. Duplicate Current-Boundary Semantics
 
 Wrapped and unwrapped forms represent the same boundary authority.
 - If a scan encounters:
@@ -227,7 +289,7 @@ Wrapped and unwrapped forms represent the same boundary authority.
 
 ---
 
-## 10. Wait Contract and Parser Parity
+## 12. Wait Contract and Parser Parity
 
 `workerPort.wait()` currently calls `classifyDispatchBoundaryRecord()` at lines 468-489:
 ```javascript
@@ -244,7 +306,7 @@ Because both `dispatchWorker()` and `waitWorker()` rely on the exact same functi
 
 ---
 
-## 11. Completion Record Scope Decision
+## 13. Completion Record Scope Decision
 
 Inspection of `worker-adapter.js` (lines 491-550) establishes that completion records require:
 - `record.source === 'MODEL'`
@@ -252,7 +314,7 @@ Inspection of `worker-adapter.js` (lines 491-550) establishes that completion re
 - `record.status === 'DONE'`
 - Standalone `[ORCHESTRATOR_COMPLETION_V1]` marker outside markdown fences and blockquotes.
 
-The native provider framing `<USER_REQUEST>` applies exclusively to user prompt inputs (`USER_EXPLICIT` / `USER_INPUT`). Model generation outputs are never wrapped in `<USER_REQUEST>`. Real runtime transcripts confirm that model responses contain pure planner outputs.
+No evidence from the inspected P3 runtime requires `USER_REQUEST` framing support for `MODEL` / `PLANNER_RESPONSE` completion records. The native provider framing `<USER_REQUEST>` applies to user prompt inputs (`USER_EXPLICIT` / `USER_INPUT`).
 
 **Sealed Decision:**
 ```text
@@ -262,13 +324,13 @@ The completion classifier remains completely untouched.
 
 ---
 
-## 12. Proposed Implementation Scope
+## 14. Proposed Implementation Scope
 
 ### Minimal File Set for Future Implementation
 1. `pipeline-ui/lib/broker/worker-adapter.js`
-   - Update `classifyDispatchBoundaryRecord()` to support the sealed grammar (unwrapped + exact wrapped).
+   - Update `classifyDispatchBoundaryRecord()` to support the sealed grammar (unwrapped + exact wrapped with strict counts and opaque suffix support).
 2. `pipeline-ui/test/refactor/worker-adapter.test.js`
-   - Add deterministic unit test coverage for TF-001..TF-015 and update ACK tests.
+   - Add deterministic unit test coverage for TF-001..TF-019 and update ACK tests.
 3. `docs/refactor-v4-native-codex-relay/07-WORKER-ADAPTER-CONTRACT.md`
    - Document the dual-envelope boundary contract.
 4. `docs/refactor-v4-native-codex-relay/15-IMPLEMENTATION-PLAN.md`
@@ -284,33 +346,37 @@ The completion classifier remains completely untouched.
 
 ---
 
-## 13. Required Future Test Matrix
+## 15. Required Future Test Matrix
 
 Deterministic unit tests to be implemented in `worker-adapter.test.js`:
 
 | Test ID | Scenario | Expected Outcome |
 |---|---|---|
 | `TF-001` | Canonical unwrapped exact boundary | `isExact: true`, `isCandidate: true` |
-| `TF-002` | Exact provider-wrapped boundary (`<USER_REQUEST>` at line 0, marker at line 1, JSON at line 2, `</USER_REQUEST>` at end) | `isExact: true`, `isCandidate: true` |
+| `TF-002` | Exact provider-wrapped boundary with unique opening at line 0, marker at line 1, control JSON at line 2, unique closing at K >= 3, and allowed provider suffix after K | `isExact: true`, `isCandidate: true` |
 | `TF-003` | Provider-wrapped current dispatch with mismatched `work_order_id` or `state_id` | `isContradiction: true`, `isCandidate: true` |
 | `TF-004` | Arbitrary prose preceding unwrapped marker (`"Prefix\n[ORCHESTRATOR_DISPATCH_V1]"`) | `isCandidate: false` |
 | `TF-005` | Leading whitespace before `<USER_REQUEST>` or marker | `isCandidate: false` |
 | `TF-006` | Unrecognized wrapper tag (e.g. `<SYSTEM_PROMPT>`, `<CUSTOM_WRAPPER>`) | `isCandidate: false` |
-| `TF-007` | Malformed wrapper (e.g. missing `</USER_REQUEST>`, extra text on `<USER_REQUEST>` line) | `isCandidate: false` |
+| `TF-007` | Malformed wrapper (missing closing tag, non-exact opening tag) | `isCandidate: false` |
 | `TF-008` | Two wrapped exact boundaries for same current dispatch | ACK returns duplicate boundary error |
 | `TF-009` | One unwrapped exact + one wrapped exact boundary for same current dispatch | ACK returns duplicate boundary error |
 | `TF-010` | Foreign dispatch ID enclosed in valid provider wrapper | `isForeign: true`, `isCandidate: true` |
 | `TF-011` | Dispatch ACK observes valid wrapped boundary in mock transcript | Emits exactly 1 AO send, returns `DISPATCH_ACCEPTED` |
 | `TF-012` | Wait rediscovery on session containing valid wrapped boundary | Discovers boundary, successfully parses subsequent completion |
-| `TF-013` | Wait on session with malformed wrapper | Yields `PROVENANCE_AMBIGUOUS` |
+| `TF-013` | Wait on session with missing/malformed wrapper boundary | Yields `PROVENANCE_AMBIGUOUS` |
 | `TF-014` | Completion classifier rejection of fenced code / blockquotes | Semantic behavior unchanged |
-| `TF-015` | P3 Record-64 structural fixture (using exact framing without copying directive prose) | Evaluates to `isExact: true` |
+| `TF-015` | P3 Record-64 structural fixture: line 0 `<USER_REQUEST>`, line 1 marker, line 2 exact synthetic control JSON, unique closing `</USER_REQUEST>`, synthetic `<ADDITIONAL_METADATA>` suffix, no real directive prose | `isCandidate: true`, `isExact: true` |
+| `TF-016` | Second `<USER_REQUEST>` physical line in record | `isCandidate: false` (rejected by count check) |
+| `TF-017` | Second `</USER_REQUEST>` physical line in record | `isCandidate: false` (rejected by count check) |
+| `TF-018` | Valid wrapped boundary + opaque post-close provider metadata | `isExact: true`, `isCandidate: true` |
+| `TF-019` | Marker / control JSON located only after closing wrapper | `isCandidate: false` (no authority in suffix) |
 
 Existing test suite `WA-047` and all baseline worker-adapter tests must continue to pass.
 
 ---
 
-## 14. Real-Acceptance Policy After Fix
+## 16. Real-Acceptance Policy After Fix
 
 1. **Retirement of P3:**
    - Cycle P3 was executed once under `WO-V4-09C-P3` and resulted in `EXECUTED_NOT_FULL_PASS`.
